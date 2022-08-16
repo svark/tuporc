@@ -13,5 +13,4 @@ tupparser = {path =  "../tuprs"}
 sha1 = "*"
 jwalk = "*"
 anyhow = "*"
-#tupinject = {path = "../tupinject"}
-#tupsetuphook = {path = "../tupsetuphook"}
+
