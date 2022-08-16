@@ -1,14 +1,8 @@
-[package]
-name = "tupparser"
-version = "0.1.0"
-authors = ["Arun Sivaramakrishnan <arun.sivaramakrishnan@gmail.com>"]
+[workspace]
 
-[lib]
-name = "tupparser"
-path = "lib/mod.rs"
-
-[dependencies]
-nom = "5.0.1"
-capturing-glob = "*"
-nom_locate = "1.0.0"
-
+members = [
+    "tuprs",
+    "tupinject",
+    "tupsetuphook",
+    "tuporc"
+]

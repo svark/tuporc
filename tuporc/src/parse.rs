@@ -13,7 +13,8 @@ use tupparser::statements::Cat;
 use tupparser::statements::Statement::Rule;
 use tupparser::transform::{load_conf_vars, parse_tup, Deps, ParsedStatements};
 
-pub fn parse_tupfiles_in_db(conn: &rusqlite::Connection, root: &Path) -> Result<Vec<ResolvedLink>> {
+// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
+pub fn parse_tupfiles_in_db(conn: &Connection, root: &Path) -> Result<Vec<ResolvedLink>> {
     let mut tupfiles = Vec::new();
     create_group_pbuf_temptable(conn)?;
     create_tup_pbuf_temptable(conn)?;
@@ -48,6 +49,8 @@ pub fn parse_tupfiles_in_db(conn: &rusqlite::Connection, root: &Path) -> Result<
                 }
                 Ok(())
             };
+    let mut outputtags = OutputTagInfo::new();
+    let mut lstats = Vec::new();
     for tupfile_node in tupfiles.iter() {
         // try fetching statements in this tupfile already in the database to avoid inserting same rules again
         let db_stmts = conn.fetch_db_rules(tupfile_node.get_pid())?;
@@ -57,6 +60,7 @@ pub fn parse_tupfiles_in_db(conn: &rusqlite::Connection, root: &Path) -> Result<
         fetch_links_in_db_for_stmt(conn, tupfile_node, &db_stmts, &mut input_links, &mut input_sticky_links, &mut output_links);
         let stmts = parse_tup(&confvars, tupfilepath.as_str())?;
         let tupdesc = TupPathDescriptor::new(tupfile_node.get_id() as usize);
+        outputtags.bins.clear();
         for statement in stmts {
             let (resolved_links, ref mut newoutputtags) =
                 statement.resolve_paths(tupfile, &outputtags, &mut bo, &tupdesc)?;
@@ -68,8 +72,6 @@ pub fn parse_tupfiles_in_db(conn: &rusqlite::Connection, root: &Path) -> Result<
                 statement.getstatement().cat(),
                 RuleType,
             ), &db_stmts[..])?;
-
-
 
             for mut rl in resolved_links {
                 rl.primary_sources.drain(..).chain(rl.secondary_sources.drain(..))
@@ -100,14 +102,11 @@ pub fn parse_tupfiles_in_db(conn: &rusqlite::Connection, root: &Path) -> Result<
                 })
             }
         }
-    }
-    let mut outputtags = OutputTagInfo::new();
-    let mut lstats = Vec::new();
-    for tupnodeid in nodes {
-        let (tupfile, statement) = statement_from_id(tupnodeid);
-        outputtags.merge_group_tags(newoutputtags)?;
+        //outputtags.merge_group_tags(newoutputtags)?;
         outputtags.merge_bin_tags(newoutputtags)?;
-        lstats.extend(resolved_links.into_iter());
+    }
+    for tupnodeid in nodes {
+        //let (tupfile, statement) = statement_from_id(tupnodeid);
     }
     Ok(lstats)
 }
