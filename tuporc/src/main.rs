@@ -1,25 +1,27 @@
 mod db;
 mod parse;
 
-use anyhow::{Result};
+use anyhow::Result;
 use db::ForEachClauses;
 use jwalk::Parallelism;
 use jwalk::WalkDir;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Error};
-use std::path::{Path};
+use std::io::Error;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 extern crate clap;
+use crate::db::{
+    create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
+    init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement,
+};
+use crate::parse::parse_tupfiles_in_db;
 use clap::Parser;
+use db::RowType::{DirType, GrpType};
 use db::{Node, RowType};
 use rusqlite::{Connection, Row};
-
-use crate::db::{create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable, init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement};
-use db::RowType::{DirType, GrpType};
-use crate::parse::parse_tupfiles_in_db;
 
 #[derive(clap::Parser)]
 #[clap(author, version="0.1", about="Tup build system", long_about = None)]
@@ -85,30 +87,35 @@ fn main() -> Result<()> {
                 let ref conn = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 if !is_initialized(conn) {
-                    return Err(anyhow::Error::msg("Tup database is not initialized, use `tup init' to initialize"));
+                    return Err(anyhow::Error::msg(
+                        "Tup database is not initialized, use `tup init' to initialize",
+                    ));
                 }
-                create_dir_path_buf_temptable(conn)?;
-                create_group_path_buf_temptable(conn)?;
                 println!("Scanning for files");
-                let root = Path::new("c:/users/aruns/tupsprites");
-                match scan_root(root, conn) {
+                let root = Path::new("c:\\users\\aruns\\tupsprites");
+                let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
+                match scan_root(root, conn, &mut present) {
                     Err(e) => eprintln!("{}", e.to_string()),
                     Ok(()) => println!("Scan was successful"),
                 };
             }
             Action::Parse => {
-                 let ref conn = Connection::open(".tup/db")
+                let ref conn = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 if !is_initialized(conn) {
-                    return Err(anyhow::Error::msg("Tup database is not initialized, use `tup init' to initialize"));
+                    return Err(anyhow::Error::msg(
+                        "Tup database is not initialized, use `tup init' to initialize",
+                    ));
                 }
                 create_dir_path_buf_temptable(conn)?;
                 create_group_path_buf_temptable(conn)?;
                 create_tup_path_buf_temptable(conn)?;
-                let root = Path::new("c:/users/aruns/tupsprites");
+                let root = Path::new("c:\\users\\aruns\\tupsprites");
                 println!("Parsing tupfiles in database");
-                scan_root(root, conn)?;
+                let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
+                scan_root(root, conn, &mut present)?;
                 parse_tupfiles_in_db(conn, root)?;
+                delete_missing(conn, &present)?;
             }
             Action::Upd { target } => {
                 println!("Updating db {}", target.join(" "));
@@ -120,32 +127,27 @@ fn main() -> Result<()> {
 }
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
-fn scan_root(root: &Path, conn: &Connection) -> Result<()> {
-    // We insert directories in node table first because we need their ids in file and subdir rows
-    let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
+fn scan_root(root: &Path, conn: &Connection, present: &mut HashSet<i64>) -> Result<()> {
+    insert_direntries(root, present, conn)
+}
 
-    insert_direntries(root, &mut present, conn)?;
+fn delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
     let mut delete_stmt = conn.delete_prepare()?;
     let mut delete_aux_stmt = conn.delete_aux_prepare()?;
 
-    conn.for_each_file_node_id(|node_id:i64| -> Result<()>
-        {
-            if !present.contains(&node_id) {
-                //TODO: delete rules and generated files derived from this id
-                delete_stmt.delete_exec(node_id)?;
-                delete_aux_stmt.delete_exec_aux(node_id)?;
-            }
-            Ok(())
+    conn.for_each_file_node_id(|node_id: i64| -> Result<()> {
+        if !present.contains(&node_id) {
+            //XTODO: delete rules and generated files derived from this id
+            delete_stmt.delete_exec(node_id)?;
+            delete_aux_stmt.delete_exec_aux(node_id)?;
         }
-    )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// return dir id either from db stored value in readstate or from newly created list in created dirs
-fn get_dir_id<P: AsRef<Path>>(
-    dirs_in_db: &mut SqlStatement,
-    path: P,
-) -> Option<i64> {
+fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
     dirs_in_db.fetch_dirid(path).ok() // check if in db already
 }
 
@@ -158,30 +160,28 @@ fn time_since_unix_epoch(curpath: &Path) -> Result<Duration, Error> {
         .unwrap_or(Duration::from_secs(0)))
 }
 
-/// insert directories into Node table if not already added.
-fn insert_direntries(
-    root: &Path,
-    present: &mut HashSet<i64>,
-    conn: &Connection,
-) -> Result<()> {
+/// insert directory entries into Node table if not already added.
+fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &Connection) -> Result<()> {
     let mut insert_new_node = conn.insert_node_prepare()?;
     let mut update_mtime = conn.update_mtime_prepare()?;
     let mut add_to_modified_list = conn.add_to_modify_prepare()?;
 
-    let mut dirs_in_db = conn.find_dirid_prepare()?;
     let mut insert_dir = conn.insert_dir_prepare()?;
-    let mut insert_dir_aux = conn.insert_dir_aux_prepare()?;
-    let mut dirid = |e: &Path| -> Option<i64> {
-        get_dir_id( &mut dirs_in_db, e)
-    };
+    //let mut insert_dir_aux = conn.insert_dir_aux_prepare()?;
+    // search parent dir id with relative path from root
     let mut dirnodes = conn.fetch_nodes_prepare()?;
     {
-        let n = dirid(root);
+        let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
+        let n = existing_node.map(|n| n.get_id());
         if n.is_none() {
-            let id = insert_dir.insert_dir_exec(root.to_string_lossy().to_string().as_str(), 0)?;
-            insert_dir_aux.insert_dir_aux_exec(id, root)?;
+            let id = insert_dir.insert_dir_exec(".", 0)?;
+            if id != 1 {
+                return Err(anyhow::Error::msg(format!("unexpected id for root dir :{} ", id)));
+            }
         }
     }
+    let mut parent_ids: VecDeque<(PathBuf, i64)> = VecDeque::new();
+    parent_ids.push_back((root.to_path_buf(), 1 as i64));
     for d in WalkDir::new(root)
         .follow_links(true)
         .parallelism(Parallelism::RayonDefaultPool)
@@ -194,25 +194,41 @@ fn insert_direntries(
         })
     {
         if let Ok(e) = d {
-            let n = dirid(e.path().as_path());
-            n.map(|i| present.insert(i));
-            let  pid = n.expect(format!("could not find a valid id for dir:{:?}", e.path()).as_str());
+            let maybe_pos = parent_ids.iter().position(|(path, _)| path == &e.path());
+            let  pid: i64;
+            if let Some(pos) = maybe_pos {
+                let (_, id) = parent_ids.get(maybe_pos.unwrap()).unwrap();
+                pid = *id;
+                parent_ids.remove(pos);
+                present.insert(pid);
+            } else {
+                return Err(anyhow::Error::msg(format!(
+                    "Could not find a valid id for dir:{:?}",
+                    e.path()
+                )));
+            }
             let existing_nodes = dirnodes.fetch_nodes([pid])?;
             println!("{}", e.path().to_string_lossy().to_string());
 
-            for file_entry in WalkDir::new(e.path()).follow_links(true).skip_hidden(true).max_depth(1)
+            let curdir = e.path();
+            for file_entry in WalkDir::new(curdir)
+                .follow_links(true)
+                .skip_hidden(true)
+                .max_depth(1)
+                .min_depth(1)
             {
                 if let Ok(f) = file_entry {
                     let path_str = f.file_name().to_string_lossy().to_string();
                     let cur_path = f.path();
-                    let n = existing_nodes.iter().find(|node| node.get_name() == path_str && node.get_pid() == pid);
+                    let n = existing_nodes
+                        .iter()
+                        .find(|node| node.get_name() == path_str && node.get_pid() == pid);
                     n.map(|node| present.insert(node.get_id()));
                     if f.path().is_file() {
                         if let Ok(mtime) = time_since_unix_epoch(cur_path.as_path()) {
                             if let Some(n) = n {
                                 // for a node already in db, check the diffs in mtime
                                 let curtime = mtime.subsec_nanos() as i64;
-                                present.insert(n.get_id());
                                 if n.get_mtime() != curtime {
                                     update_mtime.update_mtime_exec(curtime, n.get_id())?;
                                     add_to_modified_list.add_to_modify_exec(n.get_id())?;
@@ -224,17 +240,20 @@ fn insert_direntries(
                                 } else {
                                     RowType::FileType
                                 };
-                                let node = Node::new(0, pid, mtime.subsec_nanos() as i64, path_str, rtype);
+                                let node =
+                                    Node::new(0, pid, mtime.subsec_nanos() as i64, path_str, rtype);
                                 let (id, _) = insert_new_node.insert_node_exec(&node, &[])?;
                                 // add newly created nodes also into modified list
                                 add_to_modified_list.add_to_modify_exec(id)?;
                             }
                         }
-                    }else {
-                        let n = dirid(f.path().as_path());
+                    } else if f.path().is_dir() {
                         if n.is_none() {
                             let id = insert_dir.insert_dir_exec(path_str.as_str(), pid)?;
-                            insert_dir_aux.insert_dir_aux_exec(id, e.path())?;
+                            parent_ids.push_back((f.path(), id))
+                        }else {
+                            parent_ids.push_back((f.path(), n.unwrap().get_id()))
+
                         }
                     }
                 }
