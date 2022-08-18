@@ -15,7 +15,7 @@ use tupparser::statements::Cat;
 use tupparser::transform::{load_conf_vars, parse_tup};
 
 // handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
-pub fn parse_tupfiles_in_db(conn: &Connection, root: &Path) -> Result<Vec<ResolvedLink>> {
+pub fn parse_tupfiles_in_db<P:AsRef<Path>>(conn: &Connection, root: P) -> Result<Vec<ResolvedLink>> {
     let mut tupfiles = Vec::new();
     create_dir_path_buf_temptable(conn)?;
     create_group_path_buf_temptable(conn)?;
@@ -30,7 +30,7 @@ pub fn parse_tupfiles_in_db(conn: &Connection, root: &Path) -> Result<Vec<Resolv
         Ok(())
     })?;
 
-    let rootfolder = tupparser::parser::locate_file(root, "Tupfile.ini")
+    let rootfolder = tupparser::parser::locate_file(root.as_ref(), "Tupfile.ini")
         .ok_or(tupparser::errors::Error::RootNotFound)?;
     let confvars = load_conf_vars(rootfolder.as_path())?;
     let mut bo = BufferObjects::default();
@@ -61,7 +61,7 @@ pub fn parse_tupfiles_in_db(conn: &Connection, root: &Path) -> Result<Vec<Resolv
         let tupfilepath = tupfile_node.get_name();
         let stmts = parse_tup(&confvars, tupfilepath)?;
         let tupdesc = TupPathDescriptor::new(tupfile_node.get_id() as usize);
-        outputtags.bins.clear();
+        outputtags.clearbins();
         for statement in stmts {
             let (resolved_links, ref mut newoutputtags) = {
                 statement.resolve_paths(Path::new(tupfilepath), &outputtags, &mut bo, &tupdesc)?

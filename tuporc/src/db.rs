@@ -4,7 +4,7 @@ use crate::db::StatementType::{
 };
 use crate::make_node;
 use anyhow::Result;
-use rusqlite::{Connection, Params, Row, Statement};
+use rusqlite::{Connection, Params, Row, Statement, Transaction};
 use std::fs::File;
 use std::path::{Path, MAIN_SEPARATOR};
 
@@ -240,6 +240,129 @@ SELECT node.id id, node.dir, DIRPATHBUF.name || '/' || node.name name from node 
     Ok(())
 }
 
+impl LibSqlPrepare for Transaction<'_> {
+
+    fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into ModifyList(id) Values (?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: AddToMod,
+        })
+    }
+    fn insert_dir_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into Node (name, dir, type) Values (?,?,?);")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertDir,
+        })
+    }
+    fn insert_dir_aux_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into DirPathBuf (id, name) Values (?,?);")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertDirAux,
+        })
+    }
+
+    fn insert_sticky_link_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into StickyLink (from_id, to_id) Values (?,?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertStickyLink,
+        })
+    }
+    fn insert_link_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into NodeLink (from_id, to_id) Values (?,?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertLink,
+        })
+    }
+
+    fn insert_node_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into Node (dir, name, mtime_ns, type) Values (?,?,?,?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertFile,
+        })
+    }
+    fn find_dirid_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT id FROM DirPathBuf where name=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindDirId,
+        })
+    }
+
+    fn fetch_node_prepare(&self) -> Result<SqlStatement> {
+        let stmt =
+            self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNode,
+        })
+    }
+
+    fn fetch_nodes_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNodes,
+        })
+    }
+
+    fn fetch_tupfile_path_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT name from TUPPATHBUF where id=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindTupPath,
+        })
+    }
+
+    fn update_mtime_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set mtime_ns = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdMTime,
+        })
+    }
+
+    fn update_dirid_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set dir = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdDirId,
+        })
+    }
+
+    fn delete_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE FROM Node WHERE id=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: DeleteId,
+        })
+    }
+
+    fn delete_aux_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into DeleteList(id) Values (?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: DeleteIdAux,
+        })
+    }
+
+    fn delete_rule_links_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(
+            "delete from StickyLink where from_id = ? or to_id = ?;\
+            delete from NodeLink where from_id = ? or to_id = ?",
+        )?;
+        Ok(SqlStatement {
+            stmt,
+            tok: StatementType::DeleteRuleLinks,
+        })
+    }
+
+}
 impl LibSqlPrepare for Connection {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into ModifyList(id) Values (?)")?;
