@@ -1,3 +1,3 @@
 # tuporc
 
-  Bin to parse and persistent tup rules in sqlite db.
+ WIP Bin to parse and persist tup rules in database.
