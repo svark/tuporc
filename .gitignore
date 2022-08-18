@@ -3,3 +3,4 @@ target/*
 .idea/*
 .projectile
 Tupfile.ini
+.fdignore
