@@ -5,7 +5,8 @@ use anyhow::Result;
 use db::ForEachClauses;
 use jwalk::Parallelism;
 use jwalk::WalkDir;
-use std::collections::{HashSet, VecDeque};
+use std::collections::hash_map::Entry::Occupied;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Error;
@@ -176,12 +177,16 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &Connection)
         if n.is_none() {
             let id = insert_dir.insert_dir_exec(".", 0)?;
             if id != 1 {
-                return Err(anyhow::Error::msg(format!("unexpected id for root dir :{} ", id)));
+                return Err(anyhow::Error::msg(format!(
+                    "unexpected id for root dir :{} ",
+                    id
+                )));
             }
+            present.insert(id);
         }
     }
-    let mut parent_ids: VecDeque<(PathBuf, i64)> = VecDeque::new();
-    parent_ids.push_back((root.to_path_buf(), 1 as i64));
+    let mut parent_ids: HashMap<PathBuf, i64> = HashMap::new();
+    parent_ids.insert(root.to_path_buf(), 1);
     for d in WalkDir::new(root)
         .follow_links(true)
         .parallelism(Parallelism::RayonDefaultPool)
@@ -194,13 +199,11 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &Connection)
         })
     {
         if let Ok(e) = d {
-            let maybe_pos = parent_ids.iter().position(|(path, _)| path == &e.path());
-            let  pid: i64;
-            if let Some(pos) = maybe_pos {
-                let (_, id) = parent_ids.get(maybe_pos.unwrap()).unwrap();
-                pid = *id;
-                parent_ids.remove(pos);
-                present.insert(pid);
+            let maybe_id = parent_ids.entry(e.path());
+            let pid: i64;
+            if let Occupied(o) = maybe_id {
+                pid = *o.get();
+                o.remove_entry();
             } else {
                 return Err(anyhow::Error::msg(format!(
                     "Could not find a valid id for dir:{:?}",
@@ -214,8 +217,9 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &Connection)
             for file_entry in WalkDir::new(curdir)
                 .follow_links(true)
                 .skip_hidden(true)
-                .max_depth(1)
+                .max_depth(1) // walk to immediate children only
                 .min_depth(1)
+            // skip curdir
             {
                 if let Ok(f) = file_entry {
                     let path_str = f.file_name().to_string_lossy().to_string();
@@ -248,13 +252,13 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &Connection)
                             }
                         }
                     } else if f.path().is_dir() {
-                        if n.is_none() {
-                            let id = insert_dir.insert_dir_exec(path_str.as_str(), pid)?;
-                            parent_ids.push_back((f.path(), id))
-                        }else {
-                            parent_ids.push_back((f.path(), n.unwrap().get_id()))
-
-                        }
+                        let id = if let Some(node) = n {
+                            node.get_id()
+                        } else {
+                            insert_dir.insert_dir_exec(path_str.as_str(), pid)?
+                        };
+                        parent_ids.insert(f.path(), id);
+                        present.insert(id);
                     }
                 }
             }
