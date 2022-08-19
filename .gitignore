@@ -4,3 +4,4 @@ target/*
 .projectile
 Tupfile.ini
 .fdignore
+.tup/db

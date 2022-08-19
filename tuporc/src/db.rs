@@ -8,7 +8,7 @@ use rusqlite::{Connection, Params, Row, Statement, Transaction};
 use std::fs::File;
 use std::path::{Path, MAIN_SEPARATOR};
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum RowType {
     FileType = 0,
     RuleType = 1,
@@ -110,7 +110,7 @@ pub(crate) trait LibSqlExec {
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
     fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
     fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
-    fn insert_node_exec(&mut self, n: &Node, existing: &[Node]) -> Result<(i64, bool)>;
+    fn insert_node_exec(&mut self, n: &Node) -> Result<i64>;
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64>;
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
     fn fetch_nodes<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
@@ -235,7 +235,7 @@ pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TEMPORARY TABLE TUPPATHBUF AS
 SELECT node.id id, node.dir, DIRPATHBUF.name || '/' || node.name name from node inner join DIRPATHBUF ON
-(NODE.dir = DIRPATHBUF.id and node={}'))", RowType::TupFType as u8);
+(NODE.dir = DIRPATHBUF.id and node.type={})", RowType::TupFType as u8);
     conn.execute_batch(stmt.as_str())?;
     Ok(())
 }
@@ -523,20 +523,15 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
-    fn insert_node_exec(&mut self, n: &Node, existing: &[Node]) -> Result<(i64, bool)> {
+    fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
         anyhow::ensure!(self.tok == InsertFile, "wrong token for Insert file");
-        for existing_node in existing {
-            if existing_node.get_pid() == n.get_pid() && existing_node.get_name() == n.get_name() {
-                return Ok((existing_node.id, false));
-            }
-        }
         let id = self.stmt.insert([
             n.pid.to_string().as_str(),
             n.name.as_str(),
             n.mtime.to_string().as_str(),
             (n.get_type()).to_string().as_str(),
         ])?;
-        Ok((id, true))
+        Ok(id)
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
@@ -653,7 +648,7 @@ impl ForEachClauses for Connection {
     where
         F: FnMut(i64, i64, &Path) -> Result<()>,
     {
-        let mut stmt = self.prepare("SELECT id,dir, name from TUPPATHBUF inner join ModifyList ON TupPathBuf.id = ModifyList.id")?;
+        let mut stmt = self.prepare("SELECT id,dir, name from TUPPATHBUF")?;
         Self::for_id_and_path([], f, &mut stmt)?;
         Ok(())
     }

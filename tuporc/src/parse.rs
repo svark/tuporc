@@ -67,16 +67,21 @@ pub fn parse_tupfiles_in_db<P:AsRef<Path>>(conn: &Connection, root: P) -> Result
                 statement.resolve_paths(Path::new(tupfilepath), &outputtags, &mut bo, &tupdesc)?
             };
 
-            let (ruleid, newrule) = insert_rule.insert_node_exec(
-                &Node::new(
-                    0,
-                    tupfile_node.get_pid(),
-                    tupfile_node.get_mtime(),
-                    statement.getstatement().cat(),
-                    RuleType,
-                ),
-                &db_stmts[..],
-            )?;
+            let stmt_str = statement.getstatement().cat();
+            let maybe_rule_id = db_stmts.iter().find( |e| e.get_name() == stmt_str).map(|n| n.get_id());
+            let newrule = maybe_rule_id.is_some();
+            let ruleid =
+                if let Some(id) = maybe_rule_id {
+                    id
+                } else {
+                    insert_rule.insert_node_exec(&Node::new(
+                        0,
+                        tupfile_node.get_pid(),
+                        tupfile_node.get_mtime(),
+                        statement.getstatement().cat(),
+                        RuleType,
+                    ))?
+                };
 
             if !newrule {
                 del_stmt.delete_rule_links(ruleid)?;
