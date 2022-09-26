@@ -15,7 +15,7 @@ use tupparser::statements::Cat;
 use tupparser::transform::{load_conf_vars, parse_tup};
 
 // handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
-pub fn parse_tupfiles_in_db<P:AsRef<Path>>(conn: &Connection, root: P) -> Result<Vec<ResolvedLink>> {
+pub fn parse_tupfiles_in_db<P: AsRef<Path>>(conn: &Connection, root: P) -> Result<Vec<ResolvedLink>> {
     let mut tupfiles = Vec::new();
     create_dir_path_buf_temptable(conn)?;
     create_group_path_buf_temptable(conn)?;
@@ -39,10 +39,10 @@ pub fn parse_tupfiles_in_db<P:AsRef<Path>>(conn: &Connection, root: P) -> Result
     let mut insert_rule = conn.insert_node_prepare()?;
     let mut inp_linker = conn.insert_sticky_link_prepare()?;
     let mut out_linker = conn.insert_link_prepare()?;
-    let mut insert_link = |name: String, dirpath, rule_id, sticky: bool| -> Result<()> {
+    let mut insert_link = |name: String, dirpath, rule_id, is_input: bool| -> Result<()> {
         if let Some(dirid) = get_dir_id(&mut dirs_in_db, dirpath) {
             if let Ok(node) = find_in_dir.fetch_node(name.as_str(), dirid) {
-                if sticky {
+                if is_input {
                     inp_linker.insert_sticky_link(node.get_id(), rule_id)?;
                 } else {
                     out_linker.insert_link(rule_id, node.get_id())?;
@@ -68,7 +68,7 @@ pub fn parse_tupfiles_in_db<P:AsRef<Path>>(conn: &Connection, root: P) -> Result
             };
 
             let stmt_str = statement.getstatement().cat();
-            let maybe_rule_id = db_stmts.iter().find( |e| e.get_name() == stmt_str).map(|n| n.get_id());
+            let maybe_rule_id = db_stmts.iter().find(|e| e.get_name() == stmt_str).map(|n| n.get_id());
             let newrule = maybe_rule_id.is_some();
             let ruleid =
                 if let Some(id) = maybe_rule_id {

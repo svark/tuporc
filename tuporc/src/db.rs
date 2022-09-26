@@ -35,6 +35,7 @@ pub(crate) struct Node {
     name: String,
     rtype: RowType,
 }
+
 impl Node {
     pub fn new(id: i64, pid: i64, mtime: i64, name: String, rtype: RowType) -> Node {
         Node {
@@ -85,6 +86,7 @@ pub struct SqlStatement<'conn> {
     stmt: Statement<'conn>,
     tok: StatementType,
 }
+
 pub(crate) trait LibSqlPrepare {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
@@ -100,7 +102,6 @@ pub(crate) trait LibSqlPrepare {
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_aux_prepare(&self) -> Result<SqlStatement>;
-
     fn delete_rule_links_prepare(&self) -> Result<SqlStatement>;
 }
 
@@ -124,37 +125,37 @@ pub(crate) trait LibSqlExec {
 
 pub(crate) trait ForEachClauses {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
-    where
-        F: FnMut(i64) -> Result<()>;
+        where
+            F: FnMut(i64) -> Result<()>;
     fn for_each_node_id<P, F>(&self, p: P, f: F) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(i64) -> Result<()>;
+        where
+            P: Params,
+            F: FnMut(i64) -> Result<()>;
     fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>;
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>;
     fn for_each_grp_node_provider<F>(&self, name: &str, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>;
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>;
     fn for_each_grp_node_requirer<F>(&self, name: &str, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>;
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>;
     fn fetch_db_sticky_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
     fn fetch_db_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
     fn fetch_db_outputs(&self, rule_id: i64) -> Result<Vec<i64>>;
 
     fn fetch_db_rules(&self, tupfile_id: i64) -> Result<Vec<Node>>;
     fn for_id_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(i64, i64, &Path) -> Result<()>;
+        where
+            P: Params,
+            F: FnMut(i64, i64, &Path) -> Result<()>;
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>>;
 }
 
 // Check is the node table exists in .tup/db
 pub fn is_initialized(conn: &Connection) -> bool {
     if let Ok(mut stmt) =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?; ")
+    conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?; ")
     {
         stmt.query_row(["Node"], |_x| Ok(true)).is_ok()
     } else {
@@ -173,18 +174,19 @@ pub fn init_db() {
                          name VARCHAR(4096), display VARCHAR(4096), mtime_ns INTEGER DEFAULT 0, unique(dir, name));",
         (),
     )
-    .expect("Failed to create Node Table");
+        .expect("Failed to create Node Table");
     conn.execute(
         "CREATE TABLE NodeLink (from_id INTEGER, to_id INTEGER, \
           PRIMARY KEY (from_id, to_id) ); ",
         (),
     )
-    .expect("Failed to create NodeLink Table");
+        .expect("Failed to create NodeLink Table");
     conn.execute("CREATE INDEX NodeLink_To ON NodeLink(to_id);", ())
         .expect("Failed to create index on NodeLinkTable");
     conn.execute("CREATE TABLE ModifyList (id INTEGER PRIMARY KEY); ", ())
         .expect("Failed to create ModifyList Table");
-    conn.execute("CREATE TABLE StickyLink (id INTEGER PRIMARY KEY); ", ())
+    conn.execute("CREATE TABLE StickyLink (from_id INTEGER, to_id INTEGER,\
+     PRIMARY KEY (from_id, to_id)); ", ())
         .expect("Failed to create StickyLink Table");
     conn.execute("CREATE TABLE DeleteList (id INTEGER PRIMARY KEY); ", ())
         .expect("Failed to create DeleteList Table");
@@ -192,7 +194,7 @@ pub fn init_db() {
         "CREATE TABLE Var ( id INTEGER PRIMARY KEY, value VARCHAR);",
         (),
     )
-    .expect("Failed to create Var table");
+        .expect("Failed to create Var table");
     let _ = File::create("Tupfile.ini").expect("could not open Tupfile.ini for write");
     println!("Finished creating tables");
 }
@@ -215,6 +217,7 @@ CREATE TEMPORARY TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
     conn.execute_batch(stmt.as_str())?;
     Ok(())
 }
+
 // creates a temp table for groups
 pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!(
@@ -241,7 +244,6 @@ SELECT node.id id, node.dir, DIRPATHBUF.name || '/' || node.name name from node 
 }
 
 impl LibSqlPrepare for Transaction<'_> {
-
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into ModifyList(id) Values (?)")?;
         Ok(SqlStatement {
@@ -361,8 +363,8 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: StatementType::DeleteRuleLinks,
         })
     }
-
 }
+
 impl LibSqlPrepare for Connection {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into ModifyList(id) Values (?)")?;
@@ -484,6 +486,7 @@ impl LibSqlPrepare for Connection {
         })
     }
 }
+
 impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == AddToMod, "wrong token for update to modify");
@@ -618,8 +621,8 @@ impl SqlStatement<'_> {
 
 impl ForEachClauses for Connection {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
-    where
-        F: FnMut(i64) -> Result<()>,
+        where
+            F: FnMut(i64) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from Node where type={} or type={}")?;
         let mut rows = stmt.query([RowType::FileType as u8, RowType::DirType as u8])?;
@@ -631,9 +634,9 @@ impl ForEachClauses for Connection {
         Ok(())
     }
     fn for_each_node_id<P, F>(&self, p: P, f: F) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(i64) -> Result<()>,
+        where
+            P: Params,
+            F: FnMut(i64) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from Node where type=?")?;
         let mut rows = stmt.query(p)?;
@@ -645,8 +648,8 @@ impl ForEachClauses for Connection {
         Ok(())
     }
     fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>,
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id,dir, name from TUPPATHBUF")?;
         Self::for_id_and_path([], f, &mut stmt)?;
@@ -654,8 +657,8 @@ impl ForEachClauses for Connection {
     }
 
     fn for_each_grp_node_provider<F>(&self, name: &str, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>,
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from NODE where type=1 AND id in (SELECT from_id from NodeLink where to_id in
 ( SELECT id from GRPPATHBUF  where GRPPATHBUF.name='?'))")?;
@@ -667,8 +670,8 @@ impl ForEachClauses for Connection {
         Ok(())
     }
     fn for_each_grp_node_requirer<F>(&self, name: &str, f: F) -> Result<()>
-    where
-        F: FnMut(i64, i64, &Path) -> Result<()>,
+        where
+            F: FnMut(i64, i64, &Path) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from NODE where type=1 AND id in (SELECT to_id from normal_link where from_id in
 ( SELECT id from GRPPATHBUF  where GRPPATHBUF.name='?'))")?;
@@ -718,9 +721,9 @@ impl ForEachClauses for Connection {
     }
 
     fn for_id_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(i64, i64, &Path) -> Result<()>,
+        where
+            P: Params,
+            F: FnMut(i64, i64, &Path) -> Result<()>,
     {
         let mut rows = stmt.query(p)?;
         let mut mut_f = f;
