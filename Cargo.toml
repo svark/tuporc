@@ -10,5 +10,5 @@ members = [
 ]
 
 [patch.crates-io]
-lua-src = {path = "./tuplua"}
+lua-src = {git = "https://github.com/svark/lua-src-rs"}
 

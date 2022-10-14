@@ -5,3 +5,4 @@ target/*
 Tupfile.ini
 .fdignore
 .tup/db
+Cargo.lock

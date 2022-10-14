@@ -7,3 +7,6 @@
 [submodule "tupsetuphook"]
 	path = tupsetuphook
 	url = https://github.com/svark/tupsetuphook
+[submodule "tuplua"]
+   path = tuplua
+   url = https://github.com/svark/tuplua
