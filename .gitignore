@@ -5,4 +5,7 @@ target/*
 Tupfile.ini
 .fdignore
 .tup/db
+.vs/*
 Cargo.lock
+tuporc/.vscode/*
+.vs/VSWorkspaceState.json
