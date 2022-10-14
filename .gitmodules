@@ -9,4 +9,4 @@
 	url = https://github.com/svark/tupsetuphook
 [submodule "tuplua"]
    path = tuplua
-   url = https://github.com/svark/tuplua
+   url = https://github.com/svark/lua-src-rs
