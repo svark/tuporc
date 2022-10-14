@@ -28,7 +28,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
 dependencies = [
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -45,7 +45,7 @@ checksum = "d9b39be18770d11421cdb1b9947a45dd3f37e93092cbf377614828a319d5fee8"
 dependencies = [
  "hermit-abi",
  "libc",
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -447,16 +447,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel32-sys"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7507624b29483431c0ba2d82aece8ca6cdba9382bff4ddd0f7490560c056098d"
-dependencies = [
- "winapi 0.2.8",
- "winapi-build",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -481,7 +471,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "efbc0f03f9a775e9f6aed295c6a1ba2253c5757a9e03d55c6caa46a681abcddd"
 dependencies = [
  "cfg-if",
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -505,6 +495,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lua-src"
+version = "544.0.1"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "luajit-src"
+version = "210.4.1+restyaa7a722"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c92879345f9a97ee140cfe2e08eff49b101533d784527d46ce6d2dc0096d27b3"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "memchr"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -524,6 +530,22 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "mlua"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10277581090f5cb7ecf814bc611152ce4db6dc8deffcaa08e24ed4c5197d9186"
+dependencies = [
+ "bstr",
+ "cc",
+ "lua-src",
+ "luajit-src",
+ "num-traits",
+ "once_cell",
+ "pkg-config",
+ "rustc-hash",
+]
 
 [[package]]
 name = "nom"
@@ -553,7 +575,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f6bb902e437b6d86e03cce10a7e2af662292c5dfef23b65899ea3ac9354ad44"
 dependencies = [
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -723,31 +745,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f497285884f3fcff424ffc933e56d7cbca511def0c9831a7f9b5f6153e3cc89b"
 
 [[package]]
-name = "rlua"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22a930e1aa100cb70ef5d521ded1e41ba7f2665307fad3abbd2f36f1b533c6f"
-dependencies = [
- "bitflags",
- "bstr",
- "libc",
- "num-traits",
- "rlua-lua54-sys",
-]
-
-[[package]]
-name = "rlua-lua54-sys"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab09facb9a784e48a4d3f4e163cdc9e8d4a7f8d49cf9ce240a2a9d362a88daaf"
-dependencies = [
- "bindgen",
- "cc",
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "rusqlite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -870,7 +867,7 @@ dependencies = [
  "detours-sys",
  "ntapi",
  "wchar",
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -893,17 +890,17 @@ dependencies = [
  "bimap",
  "bstr",
  "daggy",
+ "jwalk",
  "lazy_static",
  "log",
+ "mlua",
  "nom",
  "nom_locate",
  "path-absolutize",
  "pathdiff",
  "petgraph",
  "regex",
- "rlua",
  "thiserror",
- "walkdir",
 ]
 
 [[package]]
@@ -914,7 +911,7 @@ dependencies = [
  "lazy_static",
  "tupinject",
  "wchar",
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]
@@ -952,16 +949,6 @@ name = "version_check"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
-
-[[package]]
-name = "walkdir"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c66c0b9792f0a765345452775f3adbd28dde9d33f30d13e5dcc5ae17cf6f3780"
-dependencies = [
- "kernel32-sys",
- "winapi 0.2.8",
-]
 
 [[package]]
 name = "wasi"
@@ -1002,12 +989,6 @@ dependencies = [
 
 [[package]]
 name = "winapi"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "167dc9d6949a9b857f3451275e911c3f44255842c1f7a76f33c55103a909087a"
-
-[[package]]
-name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
@@ -1015,12 +996,6 @@ dependencies = [
  "winapi-i686-pc-windows-gnu",
  "winapi-x86_64-pc-windows-gnu",
 ]
-
-[[package]]
-name = "winapi-build"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d315eee3b34aca4797b2da6b13ed88266e6d612562a0c46390af8299fc699bc"
 
 [[package]]
 name = "winapi-i686-pc-windows-gnu"
@@ -1034,7 +1009,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70ec6ce85bb158151cae5e5c87f95a8e97d2c0c4b001223f33a334e3ce5de178"
 dependencies = [
- "winapi 0.3.9",
+ "winapi",
 ]
 
 [[package]]

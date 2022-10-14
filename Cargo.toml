@@ -5,5 +5,10 @@ members = [
     "tuprs",
     "tupinject",
     "tupsetuphook",
-    "tuporc"
+    "tuporc",
+    "tuplua"
 ]
+
+[patch.crates-io]
+lua-src = {path = "./tuplua"}
+

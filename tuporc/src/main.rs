@@ -113,7 +113,7 @@ fn main() -> Result<()> {
                 println!("Parsing tupfiles in database");
                 let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
                 scan_root(root.as_path(), &mut conn, &mut present)?;
-                parse_tupfiles_in_db(&conn, root.as_path())?;
+                parse_tupfiles_in_db(&mut conn, root.as_path())?;
                 delete_missing(&conn, &present)?;
             }
             Action::Upd { target } => {
