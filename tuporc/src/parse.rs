@@ -75,7 +75,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
             ids.push(dag.node_count());
             let tup_node_name = tupfile_node.get_name();
             let tup_file_path = Path::new(tupfile_node.get_name());
-            let stmts = parse_tup(&confvars, tup_node_name)?;
+            let stmts = parse_tup(&confvars, tup_node_name, &mut bo)?;
             //let tupdesc = TupPathDescriptor::new(tupfile_node.get_id() as usize);
             let tup_cwd = tup_file_path.parent().expect("tup file parent not found");
             let dir_id = find_dirid.fetch_dirid(tup_cwd)?;
