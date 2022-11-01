@@ -13,4 +13,9 @@ tupparser = { path = "../tuprs" }
 sha1 = "*"
 jwalk = "*"
 anyhow = "*"
+bimap = "0.6.1"
+num = "0.4.0"
+num-derive = "0.3.3"
+num-traits = "0.2.15"
+
 

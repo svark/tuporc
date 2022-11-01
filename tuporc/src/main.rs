@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 extern crate clap;
-
+extern crate bimap;
+extern crate num;
+#[macro_use]
+extern crate num_derive;
 use crate::db::{
     init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement,
 };
@@ -26,7 +29,7 @@ use db::{Node, RowType};
 use rusqlite::{Connection, Row};
 
 #[derive(clap::Parser)]
-#[clap(author, version = "0.1", about = "Tup build system", long_about = None)]
+#[clap(author, version = "0.1", about = "Tup build system implemented in rust", long_about = None)]
 struct Args {
     #[clap(subcommand)]
     command: Option<Action>,
@@ -68,7 +71,7 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
         1 => RowType::RuleType,
         2 => DirType,
         3 => RowType::EnvType,
-        4 => RowType::GEnFType,
+        4 => RowType::GenFType,
         5 => RowType::TupFType,
         6 => GrpType,
         7 => RowType::GEndType,
@@ -147,7 +150,7 @@ fn delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
 }
 
 /// return dir id either from db stored value in readstate or from newly created list in created dirs
-fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
+pub (crate) fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
     dirs_in_db.fetch_dirid(path).ok() // check if in db already
 }
 

@@ -1,18 +1,19 @@
-use crate::db::StatementType::{AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodes, FindTupPath, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
+use crate::db::StatementType::{AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodes, FindParentRule, FindRuleDeps, FindTupPath, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
 use crate::make_node;
 use anyhow::Result;
 use rusqlite::{Connection, Params, Row, Statement, Transaction};
 use std::fs::File;
 use std::path::{Path, MAIN_SEPARATOR};
+use crate::db::RowType::TupFType;
 use crate::RowType::RuleType;
 
-#[derive(Clone, Debug, Copy, PartialEq)]
+#[derive(Clone, Debug, Copy, PartialEq, FromPrimitive)]
 pub enum RowType {
     FileType = 0,
     RuleType = 1,
     DirType = 2,
     EnvType = 3,
-    GEnFType = 4,
+    GenFType = 4,
     TupFType = 5,
     GrpType = 6,
     GEndType = 7,
@@ -72,9 +73,12 @@ pub enum StatementType {
     FindDirId,
     FindGroupId,
     FindNode,
+    FindNodeId,
     FindNodeById,
     FindNodes,
     FindTupPath,
+    FindRuleDeps,
+    FindParentRule,
     UpdMTime,
     UpdDirId,
     DeleteId,
@@ -97,9 +101,12 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodes_prepare(&self) -> Result<SqlStatement>;
     fn fetch_tupfile_path_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
@@ -115,9 +122,13 @@ pub(crate) trait LibSqlExec {
     fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64>;
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64>;
-    fn fetch_groupid<P:AsRef<Path>>(&mut self, p:P) -> Result<i64>;
+    fn fetch_group_id<P:AsRef<Path>>(&mut self, p:P) -> Result<i64>;
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
+    fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
+    fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
     fn fetch_nodes<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
+    fn fetch_rule_deps(&mut self, dir: i64) -> Result<Vec<Node>>;
+    fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>;
     fn fetch_tupfile_path<P: Params>(&mut self, id: i64) -> Result<String>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
@@ -136,22 +147,34 @@ pub(crate) trait ForEachClauses {
             F: FnMut(i64) -> Result<()>;
     fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>;
-    fn for_each_grp_node_provider<F>(&self, grpid: i64 , f: F) -> Result<()>
+            F: FnMut(Node) -> Result<()>;
+
+    fn for_each_grp_nodeid_provider<F>(&self, group_id: i64, rtype : Option<RowType>, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>;
-    fn for_each_grp_node_requirer<F>(&self, grpid: i64, f: F) -> Result<()>
+            F: FnMut(i64) -> Result<()>;
+    fn for_each_grp_node_provider<F>(&self, group_id: i64, rtype: Option<RowType>, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>;
+            F: FnMut(Node) -> Result<()>;
+    fn for_each_grp_node_requirer<F>(&self, group_id: i64, rtype: Option<RowType>, f: F) -> Result<()>
+        where
+            F: FnMut(Node) -> Result<()>;
     fn fetch_db_sticky_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
     fn fetch_db_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
     fn fetch_db_outputs(&self, rule_id: i64) -> Result<Vec<i64>>;
 
     fn fetch_db_rules(&self, tupfile_id: i64) -> Result<Vec<Node>>;
-    fn for_id_and_path<P, F>(p: P, f:F, stmt: &mut Statement) -> Result<()>
+    fn for_tupid_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
         where
             P: Params,
-            F: FnMut(i64, i64, &Path) -> Result<()>;
+            F: FnMut(Node) -> Result<()>;
+    fn for_id<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
+        where
+            P: Params,
+            F: FnMut(i64) -> Result<()>;
+    fn for_node<P, F>(p: P, f:F, stmt: &mut Statement) -> Result<()>
+        where
+            P: Params,
+            F: FnMut(Node) -> Result<()>;
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>>;
 }
 
@@ -240,8 +263,8 @@ pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!("
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TEMPORARY TABLE TUPPATHBUF AS
-SELECT node.id id, node.dir, DIRPATHBUF.name || '/' || node.name name from node inner join DIRPATHBUF ON
-(NODE.dir = DIRPATHBUF.id and node.type={})", RowType::TupFType as u8);
+SELECT node.id id, node.dir dir, node.mtime mtime, DIRPATHBUF.name || '/' || node.name name from node inner join DIRPATHBUF ON
+(NODE.dir = DIRPATHBUF.id and node.type={})", TupFType as u8);
     conn.execute_batch(stmt.as_str())?;
     Ok(())
 }
@@ -316,6 +339,15 @@ impl LibSqlPrepare for Transaction<'_> {
         })
     }
 
+    fn fetch_nodeid_prepare(&self) -> Result<SqlStatement> {
+        let stmt =
+            self.prepare("SELECT id FROM Node where dir=? and name=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNodeId,
+        })
+    }
+
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement> {
         let stmt =
         self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where id=?")?;
@@ -339,6 +371,19 @@ impl LibSqlPrepare for Transaction<'_> {
             stmt,
             tok: FindTupPath,
         })
+    }
+
+    fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&*format!("SELECT node.id, node.dir, node.mtime_ns, node.name, node.type from Node inner join normal_link on (node.id = normal_link.from_id)\
+         where normal_link.from_id in (SELECT id in node where dir=? and type={})", RuleType as u8) )?;
+        Ok(SqlStatement {
+            stmt, tok: FindRuleDeps})
+    }
+    fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&*format!("SELECT node.id from Node inner join normal_link on (node.id = normal_link.from_id)\
+         where normal_link.to_id =? and node.type={})", RuleType as u8) )?;
+        Ok(SqlStatement {
+            stmt, tok: FindParentRule})
     }
 
     fn update_mtime_prepare(&self) -> Result<SqlStatement> {
@@ -452,6 +497,15 @@ impl LibSqlPrepare for Connection {
             tok: FindNode,
         })
     }
+    fn fetch_nodeid_prepare(&self) -> Result<SqlStatement> {
+        let stmt =
+            self.prepare("SELECT id FROM Node where dir=? and name=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNodeId,
+        })
+    }
+
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement> {
         let stmt =
             self.prepare("SELECT id,dir, mtime_ns, name, type FROM Node where id=?")?;
@@ -475,6 +529,18 @@ impl LibSqlPrepare for Connection {
             stmt,
             tok: FindTupPath,
         })
+    }
+
+    fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT to_id from normal_link where from_id in (SELECT id in node where dir=? and type=?)")?;
+        Ok(SqlStatement {
+            stmt, tok: FindRuleDeps})
+    }
+
+    fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where type={} and id in (SELECT from_id from normal_link where to_id = ?", RuleType as u8))?;
+        Ok(SqlStatement {
+            stmt, tok: FindParentRule})
     }
 
     fn update_mtime_prepare(&self) -> Result<SqlStatement> {
@@ -511,12 +577,12 @@ impl LibSqlPrepare for Connection {
 
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(
-            "delete from StickyLink where from_id in (select id from Node where dir=?) or to_id in (select id from node where dir=?);\
-            delete from NodeLink where from_id in (select id from Node where dir = ?) or to_id in (select id from Node where dir=?)",
+            "delete from StickyLink where from_id in (select id from Node where dir = ? and type = ? ) or to_id in (select id from Node where dir=? and type=?);\
+            delete from NodeLink where from_id in (select id from Node where dir = ? and type=?) or to_id in (select id from Node where dir=? and type=?)",
         )?;
         Ok(SqlStatement {
             stmt,
-            tok: StatementType::DeleteRuleLinks,
+            tok: DeleteRuleLinks,
         })
     }
 }
@@ -579,7 +645,7 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(id)
     }
 
-    fn fetch_groupid<P:AsRef<Path>>(&mut self, p: P) -> Result<i64> {
+    fn fetch_group_id<P:AsRef<Path>>(&mut self, p: P) -> Result<i64> {
         anyhow::ensure!(self.tok == FindGroupId, "wrong token for fetch groupid");
         let path_str = Self::db_path_str(p);
         let v = self.stmt.query_row([path_str], |r| {
@@ -596,6 +662,19 @@ impl LibSqlExec for SqlStatement<'_> {
             .query_row([dir.to_string().as_str(), node_name], |r| make_node(r))?;
         Ok(node)
     }
+    fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>
+    {
+        anyhow::ensure!(self.tok == FindNodeById, "wrong token for fetch node by id");
+        let node  = self.stmt.query_row([i], |r| make_node(r))?;
+        Ok(node)
+    }
+    fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
+        anyhow::ensure!(self.tok == FindNodeId, "wrong token for fetch node");
+        let nodeid = self
+            .stmt
+            .query_row([dir.to_string().as_str(), node_name], |r| (r.get(0)))?;
+        Ok(nodeid)
+    }
 
     fn fetch_nodes<P: Params>(&mut self, params: P) -> Result<Vec<Node>> {
         anyhow::ensure!(self.tok == FindNodes, "wrong token for fetch nodes");
@@ -606,6 +685,29 @@ impl LibSqlExec for SqlStatement<'_> {
             nodes.push(node);
         }
         Ok(nodes)
+    }
+
+    fn fetch_rule_deps(&mut self, dir: i64) -> Result<Vec<Node>> {
+        anyhow::ensure!(
+            self.tok == FindRuleDeps,
+            "wrong token for fetch tup file path"
+        );
+        let mut rows = self.stmt.query([dir])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let node = make_node(row)?;
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
+    fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>
+    {
+        anyhow::ensure!(self.tok == FindParentRule, "wrong token for fetch parent rule");
+        let nodeid = self
+            .stmt
+            .query_row([id], |r| (r.get(0)))?;
+        Ok(nodeid)
     }
 
     fn fetch_tupfile_path<P: Params>(&mut self, id: i64) -> Result<String> {
@@ -641,9 +743,9 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
-    fn delete_rule_links(&mut self, dir_id: i64) -> Result<()> {
+    fn delete_rule_links(&mut self, rule_id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == DeleteRuleLinks, "wrong token for delete rule links");
-        self.stmt.execute([dir_id, dir_id, dir_id, dir_id])?;
+        self.stmt.execute([rule_id, rule_id, rule_id, rule_id])?;
         Ok(())
     }
 
@@ -697,41 +799,90 @@ impl ForEachClauses for Connection {
     }
     fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>,
+            F: FnMut(Node) -> Result<()>,
     {
-        let mut stmt = self.prepare("SELECT id,dir, name from TUPPATHBUF")?;
-        Self::for_id_and_path([], f, &mut stmt)?;
+        let mut stmt = self.prepare("SELECT id,dir,name from TUPPATHBUF")?;
+        Self::for_tupid_and_path([], f, &mut stmt)?;
         Ok(())
     }
 
 
-    fn for_each_grp_node_provider<F>(&self, groupid: i64, f: F) -> Result<()>
+    fn for_each_grp_nodeid_provider<F>(&self, group_id: i64, rtype : Option<RowType>, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>,
+            F: FnMut(i64) -> Result<()>,
     {
-        let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, DirPathBuf.name  name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+        if let Some(rty) = rtype {
+            let mut stmt = self.prepare("SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
          where Node.type=? and Node.id in\
          (SELECT from_id from normal_link where to_id  = ?")?;
-        Self::for_id_and_path(
-            [(RuleType as i64) , groupid],
-            f,
-            &mut stmt,
-        )?;
+            Self::for_id(
+                [rty as i64, group_id],
+                f,
+                &mut stmt,
+            )?;
+        }else {
+            let mut stmt = self.prepare("SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         where  Node.id in\
+         (SELECT from_id from normal_link where to_id  = ?")?;
+            Self::for_id(
+                [group_id],
+                f,
+                &mut stmt,
+            )?;
+        }
         Ok(())
     }
-    fn for_each_grp_node_requirer<F>(&self, groupid: i64, f: F) -> Result<()>
+    fn for_each_grp_node_provider<F>(&self, group_id: i64, rtype : Option<RowType>, f: F) -> Result<()>
         where
-            F: FnMut(i64, i64, &Path) -> Result<()>,
+            F: FnMut(Node) -> Result<()>,
     {
-        let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, DirPathBuf.name name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+        if let Some(rty) = rtype {
+            let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, Node.type type, DirPathBuf.name  name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         where Node.type=? and Node.id in\
+         (SELECT from_id from normal_link where to_id  = ?")?;
+            Self::for_node(
+                [rty as i64, group_id],
+                f,
+                &mut stmt,
+            )?;
+        }else {
+            let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, Node.type type, DirPathBuf.name  name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         where  Node.id in\
+         (SELECT from_id from normal_link where to_id  = ?")?;
+            Self::for_node(
+                [group_id],
+                f,
+                &mut stmt,
+            )?;
+        }
+        Ok(())
+    }
+    fn for_each_grp_node_requirer<F>(&self, groupid: i64, rtype: Option<RowType>, f: F) -> Result<()>
+        where
+            F: FnMut(Node) -> Result<()>,
+    {
+        if let Some(rty) = rtype {
+            let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, DirPathBuf.name name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
           where  Node.type=? AND Node.id in \
         (SELECT to_id from normal_link where from_id = ?)"
-        )?;
-        Self::for_id_and_path(
-            [(RuleType as i64), groupid],
-            f,
-            &mut stmt,
-        )?;
+            )?;
+            Self::for_node(
+                [rty as i64, groupid],
+                f,
+                &mut stmt,
+            )?;
+        }else {
+            let mut stmt = self.prepare("SELECT Node.id id, Node.dir dir, DirPathBuf.name name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+          where  Node.id in \
+        (SELECT to_id from normal_link where from_id = ?)"
+            )?;
+            Self::for_node(
+                [groupid],
+                f,
+                &mut stmt,
+            )?;
+
+        }
         Ok(())
     }
     fn fetch_db_sticky_inputs(&self, rule_id: i64) -> Result<Vec<i64>> {
@@ -771,11 +922,10 @@ impl ForEachClauses for Connection {
         )?;
         return Ok(rules);
     }
-
-    fn for_id_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
+    fn for_tupid_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
         where
             P: Params,
-            F: FnMut(i64, i64, &Path) -> Result<()>,
+            F: FnMut(Node) -> Result<()>,
     {
         let mut rows = stmt.query(p)?;
         let mut mut_f = f;
@@ -783,7 +933,40 @@ impl ForEachClauses for Connection {
             let i = row.get(0)?;
             let dir: i64 = row.get(1)?;
             let name: String = row.get(2)?;
-            mut_f(i, dir, Path::new(name.as_str()))?;
+            mut_f(Node::new(i, dir, 0, name, TupFType))?;
+        }
+        Ok(())
+    }
+    fn for_id<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
+        where
+            P: Params,
+            F: FnMut(i64) -> Result<()>
+    {
+        let mut rows = stmt.query(p)?;
+        let mut mut_f = f;
+        while let Some(row) = rows.next()? {
+            let i = row.get(0)?;
+            mut_f(i)?;
+        }
+        Ok(())
+    }
+
+    fn for_node<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
+        where
+            P: Params,
+            F: FnMut(Node) -> Result<()>,
+    {
+        let mut rows = stmt.query(p)?;
+        let mut mut_f = f;
+        while let Some(row) = rows.next()? {
+            let i = row.get(0)?;
+            let dir: i64 = row.get(1)?;
+            let rtype: i64 = row.get(2)?;
+            let name: String = row.get(3)?;
+            let rty :RowType = num::FromPrimitive::from_i64(rtype).ok_or(
+                anyhow::Error::msg("unknown row type returned \
+                 in foreach node query"))?;
+            mut_f(Node::new(i, dir,0, name,  rty))?;
         }
         Ok(())
     }
