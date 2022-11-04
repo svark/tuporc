@@ -102,7 +102,13 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     })?;
     let mut rules_in_tup_file = Vec::new();
     let mut new_outputs = OutputTagInfo::new_no_resolve_groups();
-    let mut bo = gather_rules_from_tupfiles(&mut tupfiles, &confvars, &rootfolder, &mut rules_in_tup_file, &mut new_outputs)?;
+    let mut bo = gather_rules_from_tupfiles(
+        &mut tupfiles,
+        &confvars,
+        &rootfolder,
+        &mut rules_in_tup_file,
+        &mut new_outputs,
+    )?;
 
     let mut crossref = CrossRefMaps::default();
     insert_nodes(conn, &mut bo, &mut rules_in_tup_file, &mut crossref)?;
@@ -116,9 +122,14 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     Ok(Vec::new())
 }
 
-fn gather_rules_from_tupfiles(tupfiles: &mut Vec<Node>, confvars: &HashMap<String, Vec<String>>, rootfolder: &Path, rules_in_tup_file: &mut Vec<ParsedLinks>, new_outputs: &mut OutputTagInfo)
-                              -> Result<BufferObjects>{
-//let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
+fn gather_rules_from_tupfiles(
+    tupfiles: &mut Vec<Node>,
+    confvars: &HashMap<String, Vec<String>>,
+    rootfolder: &Path,
+    rules_in_tup_file: &mut Vec<ParsedLinks>,
+    new_outputs: &mut OutputTagInfo,
+) -> Result<BufferObjects> {
+    //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let mut bo = BufferObjects::new(rootfolder);
     for tupfile_node in tupfiles.iter() {
         // try fetching statements in this tupfile already in the database to avoid inserting same rules again
@@ -135,15 +146,25 @@ fn gather_rules_from_tupfiles(tupfiles: &mut Vec<Node>, confvars: &HashMap<Strin
     Ok(bo)
 }
 
-fn check_uniqueness_of_parent_rule(conn: &mut Connection, bo: &mut BufferObjects, new_outputs: &mut OutputTagInfo, crossref: &mut CrossRefMaps) -> Result<()> {
+fn check_uniqueness_of_parent_rule(
+    conn: &mut Connection,
+    bo: &mut BufferObjects,
+    new_outputs: &mut OutputTagInfo,
+    crossref: &mut CrossRefMaps,
+) -> Result<()> {
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
     for o in new_outputs.get_output_files() {
-        let db_id_of_o = crossref.get_path_db_id(&o).expect(&*format!("output which was which was expected to be db is not {:?}", bo.get_path(&o)));
+        let db_id_of_o = crossref.get_path_db_id(&o).expect(&*format!(
+            "output which was which was expected to be db is not {:?}",
+            bo.get_path(&o)
+        ));
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
             let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = new_outputs.get_parent_rule(&o)
-                .expect(&*format!("unable to fetch parent rule for output {:?}", bo.get_path(&o)));
+            let parent_rule_ref = new_outputs.get_parent_rule(&o).expect(&*format!(
+                "unable to fetch parent rule for output {:?}",
+                bo.get_path(&o)
+            ));
             let path = bo.get_tup_path(parent_rule_ref.get_tupfile_desc());
             return Err(anyhow::Error::msg(
                 format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
@@ -155,7 +176,12 @@ fn check_uniqueness_of_parent_rule(conn: &mut Connection, bo: &mut BufferObjects
     Ok(())
 }
 
-fn add_rule_links(conn: &mut Connection, bo: &mut BufferObjects, rules_in_tup_file: &mut Vec<ParsedLinks>, crossref: &mut CrossRefMaps) -> Result<()> {
+fn add_rule_links(
+    conn: &mut Connection,
+    bo: &mut BufferObjects,
+    rules_in_tup_file: &mut Vec<ParsedLinks>,
+    crossref: &mut CrossRefMaps,
+) -> Result<()> {
     let tconn = conn.transaction()?;
     let mut inp_linker = tconn.insert_sticky_link_prepare()?;
     let mut out_linker = tconn.insert_link_prepare()?;
@@ -196,13 +222,12 @@ fn add_rule_links(conn: &mut Connection, bo: &mut BufferObjects, rules_in_tup_fi
                     let fname = bo.get_path_string(i);
 
                     anyhow::ensure!(
-                            false,
-                            format!(
-                                "could not add a link from input {} to ruleid:{}",
-                                fname,
-                                rule_node_id
-                            )
-                        );
+                        false,
+                        format!(
+                            "could not add a link from input {} to ruleid:{}",
+                            fname, rule_node_id
+                        )
+                    );
                 }
             }
             {
@@ -219,12 +244,24 @@ fn add_rule_links(conn: &mut Connection, bo: &mut BufferObjects, rules_in_tup_fi
 }
 
 // get a global list of outputfiles of a each group
-fn fetch_group_provider_outputs(conn: &mut Connection, bo: &mut BufferObjects, mut new_outputs: OutputTagInfo, crossref: &mut CrossRefMaps) -> Result<()> {
-    let gids = bo.get_group_descs().map(|group_desc| (*group_desc, crossref.get_group_db_id(group_desc).expect(
-        &*format!(
-            "could not fetch groupid from its internal id:{}",
-            group_desc
-        )))).collect::<Vec<_>>();
+fn fetch_group_provider_outputs(
+    conn: &mut Connection,
+    bo: &mut BufferObjects,
+    mut new_outputs: OutputTagInfo,
+    crossref: &mut CrossRefMaps,
+) -> Result<()> {
+    let gids = bo
+        .get_group_descs()
+        .map(|group_desc| {
+            (
+                *group_desc,
+                crossref.get_group_db_id(group_desc).expect(&*format!(
+                    "could not fetch groupid from its internal id:{}",
+                    group_desc
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
     for (group_desc, groupid) in gids {
         conn.for_each_grp_node_provider(groupid, None, |node| -> Result<()> {
             // name of node is actually its path
