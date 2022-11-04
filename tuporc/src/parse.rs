@@ -188,9 +188,9 @@ fn add_rule_links(
     for r in rules_in_tup_file {
         for rl in r.get_resolved_links() {
             let rule_node_id = crossref
-                .get_rule_db_id(&rl.rule_formula_desc)
+                .get_rule_db_id(&rl.get_rule_desc())
                 .expect("rule dbid fetch failed");
-            for i in rl.primary_sources.iter().chain(rl.secondary_sources.iter()) {
+            for i in rl.get_sources() {
                 let mut added: bool = false;
                 match i {
                     InputResolvedType::UnResolvedGroupEntry(g) => {
@@ -231,7 +231,7 @@ fn add_rule_links(
                 }
             }
             {
-                for i in rl.primary_targets.iter().chain(rl.secondary_targets.iter()) {
+                for i in rl.get_targets() {
                     let p = crossref
                         .get_path_db_id(i)
                         .expect(&*format!("failed to fetch db id of path {}", i));
@@ -374,7 +374,7 @@ fn insert_nodes(
             for rl in r.resolved_links.iter() {
                 let rd = rl.get_rule_desc();
                 collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid);
-                for p in rl.primary_targets.iter().chain(rl.secondary_targets.iter()) {
+                for p in rl.get_targets() {
                     collect_nodes_to_insert(
                         p,
                         &RowType::GenFType,
@@ -384,7 +384,7 @@ fn insert_nodes(
                     )?;
                 }
 
-                for i in rl.primary_sources.iter().chain(rl.secondary_sources.iter()) {
+                for i in rl.get_sources() {
                     match i {
                         InputResolvedType::Deglob(mp) => {
                             collect_nodes_to_insert(
@@ -434,16 +434,16 @@ fn add_links_to_groups(
 
     for r in rules_in_tup_file {
         for rl in r.get_resolved_links().iter() {
-            if let Some(group_id) = rl.group.as_ref() {
+            if let Some(group_id) = rl.get_group_desc().as_ref() {
                 if let Some(group_db_id) = crossref.get_group_db_id(&group_id) {
-                    for target in rl.primary_targets.iter().chain(rl.secondary_targets.iter()) {
+                    for target in rl.get_targets() {
                         if let Some(path_db_id) = crossref.get_path_db_id(target) {
                             inp_linker.insert_link(path_db_id, group_db_id)?;
                         }
                     }
                 }
             }
-            for i in rl.primary_sources.iter().chain(rl.secondary_sources.iter()) {
+            for i in rl.get_sources(){
                 match i {
                     InputResolvedType::GroupEntry(g, p) => {
                         if let Some(group_id) = crossref.get_group_db_id(g) {

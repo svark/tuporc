@@ -132,6 +132,7 @@ fn scan_root(root: &Path, conn: &mut Connection, present: &mut HashSet<i64>) -> 
 }
 
 // WIP... delete files and rules in db that arent in the filesystem or in use
+// should restrict attention to the outputs of tupfiles that are modified/deleted.
 fn delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
     let mut delete_stmt = conn.delete_prepare()?;
     let mut delete_aux_stmt = conn.delete_aux_prepare()?;
