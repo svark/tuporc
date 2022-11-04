@@ -14,14 +14,12 @@ use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-extern crate clap;
 extern crate bimap;
+extern crate clap;
 extern crate num;
 #[macro_use]
 extern crate num_derive;
-use crate::db::{
-    init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement,
-};
+use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement};
 use crate::parse::parse_tupfiles_in_db;
 use clap::Parser;
 use db::RowType::{DirType, GrpType};
@@ -150,7 +148,7 @@ fn delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
 }
 
 /// return dir id either from db stored value in readstate or from newly created list in created dirs
-pub (crate) fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
+pub(crate) fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
     dirs_in_db.fetch_dirid(path).ok() // check if in db already
 }
 
@@ -191,7 +189,8 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                     .map_or(false, |direntry| direntry.path().is_dir())
             });
         })
-        .into_iter().filter_map(|e| e.ok())
+        .into_iter()
+        .filter_map(|e| e.ok())
     {
         let maybe_id = parent_ids.entry(e.path());
         let pid: i64;
