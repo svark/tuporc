@@ -2,7 +2,7 @@ use crate::db::{
     create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
     ForEachClauses, LibSqlExec, SqlStatement,
 };
-use crate::RowType::RuleType;
+use crate::RowType::Rule;
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
 use bimap::BiMap;
@@ -61,13 +61,13 @@ pub struct CrossRefMaps {
 
 impl CrossRefMaps {
     pub fn get_group_db_id(&self, g: &GroupPathDescriptor) -> Option<i64> {
-        self.gbo.get_by_left(g).map(|i| *i)
+        self.gbo.get_by_left(g).copied()
     }
     pub fn get_path_db_id(&self, p: &PathDescriptor) -> Option<i64> {
-        self.pbo.get_by_left(p).map(|i| *i)
+        self.pbo.get_by_left(p).copied()
     }
     pub fn get_rule_db_id(&self, r: &RuleDescriptor) -> Option<i64> {
-        self.rbo.get_by_left(r).map(|i| *i)
+        self.rbo.get_by_left(r).copied()
     }
 
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64) {
@@ -115,7 +115,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
 
     check_uniqueness_of_parent_rule(conn, &mut bo, &mut new_outputs, &mut crossref)?;
     //XTODO: delete previous links from output files to groups
-    add_links_to_groups(conn, &mut rules_in_tup_file, &crossref)?;
+    add_links_to_groups(conn, &rules_in_tup_file, &crossref)?;
     fetch_group_provider_outputs(conn, &mut bo, new_outputs, &mut crossref)?;
     add_rule_links(conn, &mut bo, &mut rules_in_tup_file, &mut crossref)?;
 
@@ -123,7 +123,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
 }
 
 fn gather_rules_from_tupfiles(
-    tupfiles: &mut Vec<Node>,
+    tupfiles: &mut [Node],
     confvars: &HashMap<String, Vec<String>>,
     rootfolder: &Path,
     rules_in_tup_file: &mut Vec<ParsedLinks>,
@@ -134,9 +134,9 @@ fn gather_rules_from_tupfiles(
     for tupfile_node in tupfiles.iter() {
         // try fetching statements in this tupfile already in the database to avoid inserting same rules again
         let tup_node_name = tupfile_node.get_name();
-        let (rlinks, mut o, newbo) = parse_tup(&confvars, Path::new(tup_node_name), bo)?;
+        let (rlinks, o, newbo) = parse_tup(confvars, Path::new(tup_node_name), bo)?;
         bo = newbo;
-        new_outputs.merge(&mut o)?;
+        new_outputs.merge(&o)?;
         //   let dir_id = tupfile_node.get_pid();
         // del_stmt.delete_rule_links(dir_id)?; // XTODO: Mark nodes as being deleted, track leaves left unreachable in the graph that depend on this node.
         //db_rules.extend(conn.fetch_db_rules(dir_id)?);
@@ -155,20 +155,20 @@ fn check_uniqueness_of_parent_rule(
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
     for o in new_outputs.get_output_files() {
-        let db_id_of_o = crossref.get_path_db_id(&o).expect(&*format!(
+        let db_id_of_o = crossref.get_path_db_id(o).expect(&*format!(
             "output which was which was expected to be db is not {:?}",
-            bo.get_path(&o)
+            bo.get_path(o)
         ));
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
             let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = new_outputs.get_parent_rule(&o).expect(&*format!(
+            let parent_rule_ref = new_outputs.get_parent_rule(o).expect(&*format!(
                 "unable to fetch parent rule for output {:?}",
-                bo.get_path(&o)
+                bo.get_path(o)
             ));
             let path = bo.get_tup_path(parent_rule_ref.get_tupfile_desc());
             return Err(anyhow::Error::msg(
                 format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
-                        node.get_name(), path.to_string_lossy().to_string(), parent_rule_ref.get_line()
+                        node.get_name(), path.to_string_lossy(), parent_rule_ref.get_line()
                 )
             ));
         }
@@ -188,7 +188,7 @@ fn add_rule_links(
     for r in rules_in_tup_file {
         for rl in r.get_resolved_links() {
             let rule_node_id = crossref
-                .get_rule_db_id(&rl.get_rule_desc())
+                .get_rule_db_id(rl.get_rule_desc())
                 .expect("rule dbid fetch failed");
             for i in rl.get_sources() {
                 let mut added: bool = false;
@@ -265,7 +265,7 @@ fn fetch_group_provider_outputs(
     for (group_desc, groupid) in gids {
         conn.for_each_grp_node_provider(groupid, None, |node| -> Result<()> {
             // name of node is actually its path
-            if *node.get_type() == RowType::GenFType {
+            if *node.get_type() == RowType::GenF {
                 // merge providers of this group from all available in db
                 let pd = bo.add_path_from_root(Path::new(node.get_name())).0;
                 new_outputs.add_group_entry(&group_desc, pd);
@@ -309,7 +309,7 @@ fn insert_nodes(
                         dir,
                         0,
                         group_path.as_path().to_string_lossy().to_string(),
-                        RowType::GrpType,
+                        RowType::Grp,
                     ));
                 }
             }
@@ -321,7 +321,7 @@ fn insert_nodes(
              dir: i64,
              crossref: &mut CrossRefMaps,
              find_nodeid: &mut SqlStatement| {
-                let typ = RuleType;
+                let typ = Rule;
                 let isz: usize = (*rule_desc).into();
                 let rformula = bo.get_rule(rule_desc);
                 let name = format!("{}", rformula);
@@ -377,7 +377,7 @@ fn insert_nodes(
                 for p in rl.get_targets() {
                     collect_nodes_to_insert(
                         p,
-                        &RowType::GenFType,
+                        &RowType::GenF,
                         mtime,
                         crossref,
                         &mut find_nodeid,
@@ -385,18 +385,15 @@ fn insert_nodes(
                 }
 
                 for i in rl.get_sources() {
-                    match i {
-                        InputResolvedType::Deglob(mp) => {
-                            collect_nodes_to_insert(
-                                mp.path_descriptor(),
-                                &RowType::FileType,
-                                mtime,
-                                crossref,
-                                &mut find_nodeid,
-                            )?;
-                        }
-                        _ => {}
-                    };
+                    if let InputResolvedType::Deglob(mp) = i {
+                        collect_nodes_to_insert(
+                            mp.path_descriptor(),
+                            &RowType::File,
+                            mtime,
+                            crossref,
+                            &mut find_nodeid,
+                        )?;
+                    }
                 }
             }
         }
@@ -411,9 +408,9 @@ fn insert_nodes(
         {
             let desc = node.get_id() as usize;
             let db_id = insert_node.insert_node_exec(&node)?;
-            if RowType::GrpType.eq(node.get_type()) {
+            if RowType::Grp.eq(node.get_type()) {
                 crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id);
-            } else if RuleType.eq(node.get_type()) {
+            } else if Rule.eq(node.get_type()) {
                 crossref.add_rule_xref(RuleDescriptor::new(desc), db_id);
             } else {
                 crossref.add_path_xref(PathDescriptor::new(desc), db_id);
@@ -435,7 +432,7 @@ fn add_links_to_groups(
     for r in rules_in_tup_file {
         for rl in r.get_resolved_links().iter() {
             if let Some(group_id) = rl.get_group_desc().as_ref() {
-                if let Some(group_db_id) = crossref.get_group_db_id(&group_id) {
+                if let Some(group_db_id) = crossref.get_group_db_id(group_id) {
                     for target in rl.get_targets() {
                         if let Some(path_db_id) = crossref.get_path_db_id(target) {
                             inp_linker.insert_link(path_db_id, group_db_id)?;
@@ -444,15 +441,12 @@ fn add_links_to_groups(
                 }
             }
             for i in rl.get_sources(){
-                match i {
-                    InputResolvedType::GroupEntry(g, p) => {
-                        if let Some(group_id) = crossref.get_group_db_id(g) {
-                            if let Some(pid) = crossref.get_path_db_id(p) {
-                                inp_linker.insert_link(pid, group_id)?;
-                            }
+                if let InputResolvedType::GroupEntry(g, p) = i {
+                    if let Some(group_id) = crossref.get_group_db_id(g) {
+                        if let Some(pid) = crossref.get_path_db_id(p) {
+                            inp_linker.insert_link(pid, group_id)?;
                         }
                     }
-                    _ => {}
                 }
             }
         }

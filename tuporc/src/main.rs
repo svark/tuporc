@@ -22,7 +22,7 @@ extern crate num_derive;
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement};
 use crate::parse::parse_tupfiles_in_db;
 use clap::Parser;
-use db::RowType::{DirType, GrpType};
+use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
 use rusqlite::{Connection, Row};
 
@@ -65,14 +65,14 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
     let name: String = row.get(3)?;
     let rtype: i8 = row.get(4)?;
     let rtype = match rtype {
-        0 => RowType::FileType,
-        1 => RowType::RuleType,
-        2 => DirType,
-        3 => RowType::EnvType,
-        4 => RowType::GenFType,
-        5 => RowType::TupFType,
-        6 => GrpType,
-        7 => RowType::GEndType,
+        0 => RowType::File,
+        1 => RowType::Rule,
+        2 => Dir,
+        3 => RowType::Env,
+        4 => RowType::GenF,
+        5 => RowType::TupF,
+        6 => Grp,
+        7 => RowType::GEnd,
         _ => panic!("Invalid type {} for row with id:{}", rtype, id),
     };
     Ok(Node::new(id, pid, mtime, name, rtype))
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                 let root = current_dir()?;
                 let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
                 match scan_root(root.as_path(), &mut conn, &mut present) {
-                    Err(e) => eprintln!("{}", e.to_string()),
+                    Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
             }
@@ -205,7 +205,7 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
             )));
         }
         let existing_nodes = conn.fetch_nodes_prepare()?.fetch_nodes([pid])?;
-        println!("{}", e.path().to_string_lossy().to_string());
+        //println!("{}", e.path().to_string_lossy());
         let tx = conn.transaction()?;
         {
             let mut insert_new_node = tx.insert_node_prepare()?;
@@ -219,10 +219,11 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                 .follow_links(true)
                 .skip_hidden(true)
                 .max_depth(1) // walk to immediate children only
-                .min_depth(1)
+                .min_depth(1).into_iter().filter_map(|e| e.ok())
             // skip curdir
             {
-                if let Ok(f) = file_entry {
+                let f = file_entry;
+                {
                     let path_str = f.file_name().to_string_lossy().to_string();
                     let cur_path = f.path();
                     let n = existing_nodes
@@ -241,15 +242,15 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                             } else {
                                 // otherwise insert node in db
                                 let rtype = if is_tupfile(f.file_name()) {
-                                    RowType::TupFType
+                                    RowType::TupF
                                 } else {
-                                    RowType::FileType
+                                    RowType::File
                                 };
                                 let node =
                                     Node::new(0, pid, mtime.subsec_nanos() as i64, path_str, rtype);
                                 let id = insert_new_node.insert_node_exec(&node)?;
                                 // add newly created nodes also into modified list
-                                if rtype == RowType::TupFType {
+                                if rtype == RowType::TupF {
                                     add_to_modified_list.add_to_modify_exec(id)?;
                                 }
                             }

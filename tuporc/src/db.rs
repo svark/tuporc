@@ -1,22 +1,22 @@
-use crate::db::RowType::TupFType;
+use crate::db::RowType::TupF;
 use crate::db::StatementType::{AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
 use crate::make_node;
-use crate::RowType::RuleType;
+use crate::RowType::Rule;
 use anyhow::Result;
 use rusqlite::{Connection, Params, Row, Statement, Transaction};
 use std::fs::File;
 use std::path::{Path, MAIN_SEPARATOR, PathBuf};
 
-#[derive(Clone, Debug, Copy, PartialEq, FromPrimitive)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, FromPrimitive)]
 pub enum RowType {
-    FileType = 0,
-    RuleType = 1,
-    DirType = 2,
-    EnvType = 3,
-    GenFType = 4,
-    TupFType = 5,
-    GrpType = 6,
-    GEndType = 7,
+    File = 0,
+    Rule = 1,
+    Dir = 2,
+    Env = 3,
+    GenF = 4,
+    TupF = 5,
+    Grp = 6,
+    GEnd = 7,
 }
 
 impl ToString for RowType {
@@ -62,7 +62,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatementType {
     AddToMod,
     InsertDir,
@@ -260,7 +260,7 @@ CREATE TEMPORARY TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
            FROM node JOIN full_path ON node.dir=full_path.id
             where node.type={}
  ) SELECT  id, name from full_path",
-        RowType::DirType as u8
+        RowType::Dir as u8
     );
     conn.execute_batch(stmt.as_str())?;
     Ok(())
@@ -274,7 +274,7 @@ pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
 CREATE TEMPORARY TABLE GRPPATHBUF AS
    SELECT  node.id id ,DIRPATHBUF.name || '/' || node.name Name from node inner join DIRPATHBUF on
        (node.dir=DIRPATHBUF.id and node.type={})",
-        RowType::GrpType as u8
+        RowType::Grp as u8
     );
     conn.execute_batch(stmt.as_str())?;
     Ok(())
@@ -286,7 +286,7 @@ pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TEMPORARY TABLE TUPPATHBUF AS
 SELECT node.id id, node.dir dir, node.mtime mtime, DIRPATHBUF.name || '/' || node.name name from node inner join DIRPATHBUF ON
-(NODE.dir = DIRPATHBUF.id and node.type={})", TupFType as u8);
+(NODE.dir = DIRPATHBUF.id and node.type={})", TupF as u8);
     conn.execute_batch(stmt.as_str())?;
     Ok(())
 }
@@ -402,7 +402,7 @@ impl LibSqlPrepare for Transaction<'_> {
 
     fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(&*format!("SELECT node.id, node.dir, node.mtime_ns, node.name, node.type from Node inner join normal_link on (node.id = normal_link.from_id)\
-         where normal_link.from_id in (SELECT id in node where dir=? and type={})", RuleType as u8) )?;
+         where normal_link.from_id in (SELECT id in node where dir=? and type={})", Rule as u8) )?;
         Ok(SqlStatement {
             stmt,
             tok: FindRuleDeps,
@@ -412,7 +412,7 @@ impl LibSqlPrepare for Transaction<'_> {
         let stmt = self.prepare(&*format!(
             "SELECT node.id from Node inner join normal_link on (node.id = normal_link.from_id)\
          where normal_link.to_id =? and node.type={})",
-            RuleType as u8
+            Rule as u8
         ))?;
         Ok(SqlStatement {
             stmt,
@@ -581,7 +581,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where type={} and id in (SELECT from_id from normal_link where to_id = ?", RuleType as u8))?;
+        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where type={} and id in (SELECT from_id from normal_link where to_id = ?", Rule as u8))?;
         Ok(SqlStatement {
             stmt,
             tok: FindParentRule,
@@ -644,7 +644,7 @@ impl LibSqlExec for SqlStatement<'_> {
         let id = self.stmt.insert([
             path_str,
             dir.to_string().as_str(),
-            (RowType::DirType as u8).to_string().as_str(),
+            (RowType::Dir as u8).to_string().as_str(),
         ])?;
         Ok(id)
     }
@@ -704,12 +704,12 @@ impl LibSqlExec for SqlStatement<'_> {
         anyhow::ensure!(self.tok == FindNode, "wrong token for fetch node");
         let node = self
             .stmt
-            .query_row([dir.to_string().as_str(), node_name], |r| make_node(r))?;
+            .query_row([dir.to_string().as_str(), node_name], make_node)?;
         Ok(node)
     }
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node> {
         anyhow::ensure!(self.tok == FindNodeById, "wrong token for fetch node by id");
-        let node = self.stmt.query_row([i], |r| make_node(r))?;
+        let node = self.stmt.query_row([i],  make_node)?;
         Ok(node)
     }
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
@@ -833,7 +833,7 @@ impl ForEachClauses for Connection {
         F: FnMut(i64) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from Node where type={} or type={}")?;
-        let mut rows = stmt.query([RowType::FileType as u8, RowType::DirType as u8])?;
+        let mut rows = stmt.query([RowType::File as u8, RowType::Dir as u8])?;
         let mut mut_f = f;
         while let Some(row) = rows.next()? {
             let i: i64 = row.get(0)?;
@@ -957,17 +957,17 @@ impl ForEachClauses for Connection {
          (SELECT from_id from NodeLink where to_id = ?)")?;
         let mut rules = Vec::new();
         let _ = stmt.query_map(
-            [RuleType as i64, tup_node_dir],
+            [Rule as i64, tup_node_dir],
             |r: &Row| -> rusqlite::Result<()> {
                 let id = r.get(0)?;
                 let rule_str: String = r.get(1)?;
                 let mtime: i64 = r.get(2)?;
-                let node = Node::new(id, tup_node_dir, mtime, rule_str.to_string(), RuleType);
+                let node = Node::new(id, tup_node_dir, mtime, rule_str, Rule);
                 rules.push(node);
                 Ok(())
             },
         )?;
-        return Ok(rules);
+        Ok(rules)
     }
     fn for_tupid_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
     where
@@ -980,7 +980,7 @@ impl ForEachClauses for Connection {
             let i = row.get(0)?;
             let dir: i64 = row.get(1)?;
             let name: String = row.get(2)?;
-            mut_f(Node::new(i, dir, 0, name, TupFType))?;
+            mut_f(Node::new(i, dir, 0, name, TupF))?;
         }
         Ok(())
     }
@@ -1010,7 +1010,7 @@ impl ForEachClauses for Connection {
             let dir: i64 = row.get(1)?;
             let rtype: i64 = row.get(2)?;
             let name: String = row.get(3)?;
-            let rty: RowType = num::FromPrimitive::from_i64(rtype).ok_or(anyhow::Error::msg(
+            let rty: RowType = num::FromPrimitive::from_i64(rtype).ok_or_else(|| anyhow::Error::msg(
                 "unknown row type returned \
                  in foreach node query",
             ))?;
