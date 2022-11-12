@@ -1,3 +1,4 @@
+#![feature(slice_group_by)]
 mod db;
 mod parse;
 
@@ -219,7 +220,9 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                 .follow_links(true)
                 .skip_hidden(true)
                 .max_depth(1) // walk to immediate children only
-                .min_depth(1).into_iter().filter_map(|e| e.ok())
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
             // skip curdir
             {
                 let f = file_entry;

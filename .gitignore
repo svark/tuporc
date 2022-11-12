@@ -9,3 +9,4 @@ Tupfile.ini
 Cargo.lock
 tuporc/.vscode/*
 .vs/VSWorkspaceState.json
+.fleet/settings.json

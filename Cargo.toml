@@ -10,5 +10,7 @@ members = [
 ]
 
 [patch.crates-io]
-lua-src = {git = "https://github.com/svark/lua-src-rs"}
+lua-src = { git = "https://github.com/svark/lua-src-rs" }
 
+[profile.release]
+lto = true

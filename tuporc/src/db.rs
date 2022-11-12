@@ -1,11 +1,15 @@
 use crate::db::RowType::TupF;
-use crate::db::StatementType::{AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
+use crate::db::StatementType::{
+    AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode,
+    FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath,
+    InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime,
+};
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
 use rusqlite::{Connection, Params, Row, Statement, Transaction};
 use std::fs::File;
-use std::path::{Path, MAIN_SEPARATOR, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, FromPrimitive)]
 pub enum RowType {
@@ -133,7 +137,7 @@ pub(crate) trait LibSqlExec {
     fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>;
     fn fetch_tupfile_path(&mut self, id: i64) -> Result<String>;
     /// return full path of node with given  name and id
-    fn fetch_node_path(&mut self, name:&str, dirid: i64) -> Result<PathBuf>;
+    fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     fn delete_exec(&mut self, id: i64) -> Result<()>;
@@ -388,7 +392,8 @@ impl LibSqlPrepare for Transaction<'_> {
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT fullpath from DirPathBuf where id=?")?;
         Ok(SqlStatement {
-            stmt, tok: FindNodePath
+            stmt,
+            tok: FindNodePath,
         })
     }
 
@@ -560,7 +565,7 @@ impl LibSqlPrepare for Connection {
         let stmt = self.prepare("SELECT fullpath from DirPathBuf where id=?")?;
         Ok(SqlStatement {
             stmt,
-            tok: FindNodePath
+            tok: FindNodePath,
         })
     }
 
@@ -709,7 +714,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node> {
         anyhow::ensure!(self.tok == FindNodeById, "wrong token for fetch node by id");
-        let node = self.stmt.query_row([i],  make_node)?;
+        let node = self.stmt.query_row([i], make_node)?;
         Ok(node)
     }
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
@@ -764,11 +769,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf> {
-        anyhow::ensure!(
-            self.tok == FindNodePath,
-            "wrong token for fetch node path"
-            );
-        let path_str:String = self.stmt.query_row([dirid], |r| r.get(0) )?;
+        anyhow::ensure!(self.tok == FindNodePath, "wrong token for fetch node path");
+        let path_str: String = self.stmt.query_row([dirid], |r| r.get(0))?;
         Ok(Path::new(path_str.as_str()).join(name))
     }
 
@@ -1010,10 +1012,12 @@ impl ForEachClauses for Connection {
             let dir: i64 = row.get(1)?;
             let rtype: i64 = row.get(2)?;
             let name: String = row.get(3)?;
-            let rty: RowType = num::FromPrimitive::from_i64(rtype).ok_or_else(|| anyhow::Error::msg(
-                "unknown row type returned \
+            let rty: RowType = num::FromPrimitive::from_i64(rtype).ok_or_else(|| {
+                anyhow::Error::msg(
+                    "unknown row type returned \
                  in foreach node query",
-            ))?;
+                )
+            })?;
             mut_f(Node::new(i, dir, 0, name, rty))?;
         }
         Ok(())
