@@ -406,19 +406,21 @@ impl LibSqlPrepare for Transaction<'_> {
     }
 
     fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!("SELECT node.id, node.dir, node.mtime_ns, node.name, node.type from Node inner join normal_link on (node.id = normal_link.from_id)\
-         where normal_link.from_id in (SELECT id in node where dir=? and type={})", Rule as u8) )?;
+        let sqlstmt = format!("SELECT node.id, node.dir, node.mtime_ns, node.name, node.type from Node inner join normal_link on (node.id = normal_link.from_id)\
+         where normal_link.from_id in (SELECT id in node where dir=? and type={})", Rule as u8);
+        let stmt = self.prepare(sqlstmt.as_str())?;
         Ok(SqlStatement {
             stmt,
             tok: FindRuleDeps,
         })
     }
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!(
+        let stmtstr = format!(
             "SELECT node.id from Node inner join normal_link on (node.id = normal_link.from_id)\
          where normal_link.to_id =? and node.type={})",
             Rule as u8
-        ))?;
+        );
+        let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
             stmt,
             tok: FindParentRule,
@@ -586,7 +588,8 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where type={} and id in (SELECT from_id from normal_link where to_id = ?", Rule as u8))?;
+        let stmtstr = format!("SELECT id, dir, mtime_ns, name, type FROM Node where type={} and id in (SELECT from_id from normal_link where to_id = ?", Rule as u8);
+        let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
             stmt,
             tok: FindParentRule,

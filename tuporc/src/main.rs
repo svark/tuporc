@@ -1,4 +1,4 @@
-#![feature(slice_group_by)]
+//#![feature(slice_group_by)]
 mod db;
 mod parse;
 

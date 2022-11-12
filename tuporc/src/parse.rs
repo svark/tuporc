@@ -119,13 +119,13 @@ fn check_uniqueness_of_parent_rule(
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
     for o in arts.get_output_files() {
-        let db_id_of_o = crossref.get_path_db_id(o).expect(&*format!(
+        let db_id_of_o = crossref.get_path_db_id(o).unwrap_or_else(|| panic!(
             "output which was which was expected to be db is not {:?}",
             rbuf.get_path(o)
         ));
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
             let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = arts.get_parent_rule(o).expect(&*format!(
+            let parent_rule_ref = arts.get_parent_rule(o).unwrap_or_else(|| panic!(
                 "unable to fetch parent rule for output {:?}",
                 rbuf.get_path(o)
             ));
@@ -160,7 +160,7 @@ fn add_rule_links(
                 let mut added: bool = false;
                 match i {
                     InputResolvedType::UnResolvedGroupEntry(g) => {
-                        if let Some(group_id) = crossref.get_group_db_id(&g) {
+                        if let Some(group_id) = crossref.get_group_db_id(g) {
                             inp_linker.insert_sticky_link(group_id, rule_node_id)?;
                             added = true;
                         }
@@ -185,7 +185,7 @@ fn add_rule_links(
                     }
                 }
                 if !added {
-                    let fname = rbuf.get_input_path_str(&i);
+                    let fname = rbuf.get_input_path_str(i);
 
                     anyhow::ensure!(
                         false,
@@ -200,7 +200,7 @@ fn add_rule_links(
                 for i in rl.get_targets() {
                     let p = crossref
                         .get_path_db_id(i)
-                        .expect(&*format!("failed to fetch db id of path {}", i));
+                        .unwrap_or_else(|| panic!("failed to fetch db id of path {}", i));
                     out_linker.insert_link(rule_node_id, p)?;
                 }
             }
@@ -222,7 +222,7 @@ fn fetch_group_provider_outputs(
         .map(|group_desc| {
             (
                 *group_desc,
-                crossref.get_group_db_id(group_desc).expect(&*format!(
+                crossref.get_group_db_id(group_desc).unwrap_or_else(||panic!(
                     "could not fetch groupid from its internal id:{}",
                     group_desc
                 )),
@@ -307,7 +307,7 @@ fn insert_nodes(
          -> Result<()> {
             let isz: usize = (*p).into();
             let path = rbuf.get_path(p);
-            let parent = path.as_path().parent().expect(&*format!(
+            let parent = path.as_path().parent().unwrap_or_else(|| panic!(
                 "No parent folder found for file {:?}",
                 path.as_path()
             ));
@@ -317,7 +317,7 @@ fn insert_nodes(
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string());
             if let Ok(nodeid) = find_nodeid.fetch_node_id(
-                &name.expect(&*format!("missing name:{:?}", path.as_path())),
+                &name.unwrap_or_else(|| panic!("missing name:{:?}", path.as_path())),
                 dir,
             ) {
                 //path_db_id.insert(p, nodeid);
