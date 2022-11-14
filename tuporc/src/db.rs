@@ -108,7 +108,8 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
-    fn fetch_nodes_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_nodes_prepare_by_dirid_no_upd(&self) -> Result<SqlStatement>;
+    fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_tupfile_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement>;
@@ -132,7 +133,8 @@ pub(crate) trait LibSqlExec {
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
-    fn fetch_nodes<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
+    fn fetch_nodes_by_dirid_no_upd<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
+    fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
     fn fetch_rule_deps(&mut self, dir: i64) -> Result<Vec<Node>>;
     fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>;
     fn fetch_tupfile_path(&mut self, id: i64) -> Result<String>;
@@ -153,7 +155,7 @@ pub(crate) trait ForEachClauses {
     where
         P: Params,
         F: FnMut(i64) -> Result<()>;
-    fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
+    fn for_changed_or_created_tup_node_with_path<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>;
 
@@ -223,7 +225,7 @@ pub fn init_db() {
                          name VARCHAR(4096), display VARCHAR(4096), mtime_ns INTEGER DEFAULT 0, unique(dir, name));",
         (),
     )
-        .expect("Failed to create Node Table");
+        .expect("Table already exists.");
     conn.execute(
         "CREATE TABLE NodeLink (from_id INTEGER, to_id INTEGER, \
           PRIMARY KEY (from_id, to_id) ); ",
@@ -335,6 +337,7 @@ impl LibSqlPrepare for Transaction<'_> {
 
     fn insert_node_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into Node (dir, name, mtime_ns, type) Values (?,?,?,?)")?;
+        //let stmt = self.prepare("INSERT into Node (dir, name, mtime_ns, type) Values (?,?,?,?) ON CONFLICT DO UPDATE SET mtime_ns = excluded.mtime_ns WHERE (excluded.mtime_ns > Node.mtime_ns) RETURNING id")?;
         Ok(SqlStatement {
             stmt,
             tok: InsertFile,
@@ -381,7 +384,15 @@ impl LibSqlPrepare for Transaction<'_> {
         })
     }
 
-    fn fetch_nodes_prepare(&self) -> Result<SqlStatement> {
+    fn fetch_nodes_prepare_by_dirid_no_upd(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name=? and mtime_ns <= ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNodes,
+        })
+    }
+
+    fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=?")?;
         Ok(SqlStatement {
             stmt,
@@ -555,7 +566,11 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn fetch_nodes_prepare(&self) -> Result<SqlStatement> {
+    fn fetch_nodes_prepare_by_dirid_no_upd(&self) -> Result<SqlStatement> {
+        todo!()
+    }
+
+    fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=?")?;
         Ok(SqlStatement {
             stmt,
@@ -663,7 +678,7 @@ impl LibSqlExec for SqlStatement<'_> {
             "wrong token for Insert Dir Into DirPathBuf"
         );
         let path_str = SqlStatement::db_path_str(path);
-        self.stmt.insert([id.to_string(), path_str])?;
+        self.stmt.insert(( id, path_str ))?;
         Ok(())
     }
 
@@ -681,13 +696,13 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
         anyhow::ensure!(self.tok == InsertFile, "wrong token for Insert file");
-        let id = self.stmt.insert([
-            n.pid.to_string().as_str(),
+        let r = self.stmt.insert((
+            n.pid,
             n.name.as_str(),
-            n.mtime.to_string().as_str(),
-            (n.get_type()).to_string().as_str(),
-        ])?;
-        Ok(id)
+            n.mtime,
+            (*n.get_type() as u8),
+        ))?;
+        Ok(r)
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
@@ -724,11 +739,15 @@ impl LibSqlExec for SqlStatement<'_> {
         anyhow::ensure!(self.tok == FindNodeId, "wrong token for fetch node");
         let nodeid = self
             .stmt
-            .query_row([dir.to_string().as_str(), node_name], |r| (r.get(0)))?;
+            .query_row(( dir, node_name ), |r| (r.get(0)))?;
         Ok(nodeid)
     }
 
-    fn fetch_nodes<P: Params>(&mut self, params: P) -> Result<Vec<Node>> {
+    fn fetch_nodes_by_dirid_no_upd<P: Params>(&mut self, _params: P) -> Result<Vec<Node>> {
+        todo!()
+    }
+
+    fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>> {
         anyhow::ensure!(self.tok == FindNodes, "wrong token for fetch nodes");
         let mut rows = self.stmt.query(params)?;
         let mut nodes = Vec::new();
@@ -777,9 +796,9 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(Path::new(path_str.as_str()).join(name))
     }
 
-    fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()> {
+    fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()> {
         anyhow::ensure!(self.tok == UpdMTime, "wrong token for update mtime");
-        self.stmt.execute([dirid, mtime_ns])?;
+        self.stmt.execute([id, mtime_ns])?;
         Ok(())
     }
 
@@ -860,7 +879,7 @@ impl ForEachClauses for Connection {
         }
         Ok(())
     }
-    fn for_each_tup_node_with_path<F>(&self, f: F) -> Result<()>
+    fn for_changed_or_created_tup_node_with_path<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>,
     {

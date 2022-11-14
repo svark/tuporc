@@ -21,7 +21,7 @@ extern crate num;
 #[macro_use]
 extern crate num_derive;
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement};
-use crate::parse::parse_tupfiles_in_db;
+use crate::parse::{find_upsert_node, parse_tupfiles_in_db};
 use clap::Parser;
 use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
@@ -165,11 +165,8 @@ fn time_since_unix_epoch(curpath: &Path) -> Result<Duration, Error> {
 
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connection) -> Result<()> {
-    //let mut insert_dir_aux = conn.insert_dir_aux_prepare()?;
-    // search parent dir id with relative path from root
+    println!("ver: {}\n", rusqlite::version());
     {
-        // insert / fetch root node in db
-        //let  dirnodes = conn.fetch_nodes_prepare()?;
         let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
         let n = existing_node.map(|n| n.get_id());
         if n.is_none() {
@@ -179,98 +176,80 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
             present.insert(id);
         }
     }
-    let mut parent_ids: HashMap<PathBuf, i64> = HashMap::new();
-    parent_ids.insert(root.to_path_buf(), 1);
-    for e in WalkDir::new(root)
-        .follow_links(true)
-        .parallelism(Parallelism::RayonDefaultPool)
-        .skip_hidden(true)
-        .process_read_dir(move |_, _, _, children| {
-            children.retain(|d| {
-                d.as_ref()
-                    .map_or(false, |direntry| direntry.path().is_dir())
-            });
-        })
-        .into_iter()
-        .filter_map(|e| e.ok())
+    let mut dir_id_by_path: HashMap<PathBuf, i64> = HashMap::new();
+    dir_id_by_path.insert(root.to_path_buf(), 1);
+    let tx = conn.transaction()?;
     {
-        let maybe_id = parent_ids.entry(e.path());
-        let pid: i64;
-        if let Occupied(o) = maybe_id {
-            pid = *o.get();
-            o.remove_entry();
-        } else {
-            return Err(anyhow::Error::msg(format!(
-                "Could not find a valid id for dir:{:?}",
-                e.path()
-            )));
-        }
-        let existing_nodes = conn.fetch_nodes_prepare()?.fetch_nodes([pid])?;
-        //println!("{}", e.path().to_string_lossy());
-        let tx = conn.transaction()?;
+        let mut insert_new_node = tx.insert_node_prepare()?;
+        //let mut insert_dir = tx.insert_dir_prepare()?;
+        let mut find_node = tx.fetch_node_prepare()?;
+        let mut update_mtime = tx.update_mtime_prepare()?;
+        for e in WalkDir::new(root)
+            .follow_links(true)
+            .parallelism(Parallelism::RayonDefaultPool)
+            .skip_hidden(true)
+            .process_read_dir(move |_, _, _, children| {
+                children.retain(|d| {
+                    d.as_ref()
+                        .map_or(false, |direntry| direntry.path().is_dir())
+                });
+            })
+            .into_iter()
+            .filter_map(|e| e.ok())
         {
-            let mut insert_new_node = tx.insert_node_prepare()?;
-            let mut update_mtime = tx.update_mtime_prepare()?;
-            let mut add_to_modified_list = tx.add_to_modify_prepare()?;
-
-            let mut insert_dir = tx.insert_dir_prepare()?;
-
-            let curdir = e.path();
-            for file_entry in WalkDir::new(curdir)
-                .follow_links(true)
-                .skip_hidden(true)
-                .max_depth(1) // walk to immediate children only
-                .min_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            // skip curdir
+            let maybe_id = dir_id_by_path.entry(e.path());
+            let pid: i64;
+            if let Occupied(o) = maybe_id {
+                pid = *o.get();
+                o.remove_entry();
+            } else {
+                return Err(anyhow::Error::msg(format!(
+                    "Could not find a valid id for dir:{:?}",
+                    e.path()
+                )));
+            }
+            //let existing_nodes = conn.fetch_nodes_prepare_by_dirid()?.fetch_nodes_by_dirid([pid])?;
+            //println!("{}", e.path().to_string_lossy());
             {
-                let f = file_entry;
+                let curdir = e.path();
+                for file_entry in WalkDir::new(curdir)
+                    .follow_links(true)
+                    .skip_hidden(true)
+                    .max_depth(1) // walk to immediate children only
+                    .min_depth(1)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                // skip curdir
                 {
+                    let f = file_entry;
                     let path_str = f.file_name().to_string_lossy().to_string();
                     let cur_path = f.path();
-                    let n = existing_nodes
-                        .iter()
-                        .find(|node| node.get_name() == path_str && node.get_pid() == pid);
-                    n.map(|node| present.insert(node.get_id()));
                     if f.path().is_file() {
                         if let Ok(mtime) = time_since_unix_epoch(cur_path.as_path()) {
-                            if let Some(n) = n {
-                                // for a node already in db, check the diffs in mtime
-                                let curtime = mtime.subsec_nanos() as i64;
-                                if n.get_mtime() != curtime {
-                                    update_mtime.update_mtime_exec(curtime, n.get_id())?;
-                                    //add_to_modified_list.add_to_modify_exec(n.get_id())?;
-                                }
+                            // for a node already in db, check the diffs in mtime
+                            // otherwise insert node in db
+                            let rtype = if is_tupfile(f.file_name()) {
+                                RowType::TupF
                             } else {
-                                // otherwise insert node in db
-                                let rtype = if is_tupfile(f.file_name()) {
-                                    RowType::TupF
-                                } else {
-                                    RowType::File
-                                };
-                                let node =
-                                    Node::new(0, pid, mtime.subsec_nanos() as i64, path_str, rtype);
-                                let id = insert_new_node.insert_node_exec(&node)?;
-                                // add newly created nodes also into modified list
-                                if rtype == RowType::TupF {
-                                    add_to_modified_list.add_to_modify_exec(id)?;
-                                }
-                            }
+                                RowType::File
+                            };
+                            let node =
+                                Node::new(0, pid, mtime.subsec_nanos() as i64, path_str, rtype);
+                            let  id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
+                            present.insert(id);
                         }
                     } else if f.path().is_dir() {
-                        let id = if let Some(node) = n {
-                            node.get_id()
-                        } else {
-                            insert_dir.insert_dir_exec(path_str.as_str(), pid)?
-                        };
-                        parent_ids.insert(f.path(), id);
+                         let node =
+                                Node::new(0, pid, 0, path_str, Dir);
+                        let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node )?.get_id();
+                        dir_id_by_path.insert(f.path(), id);
                         present.insert(id);
                     }
                 }
+                //tx.commit()?;
             }
         }
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(())
 }

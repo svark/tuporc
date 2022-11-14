@@ -72,7 +72,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     let rootfolder = tupparser::transform::locate_file(root.as_ref(), "Tupfile.ini")
         .ok_or(tupparser::errors::Error::RootNotFound)?;
     let confvars = load_conf_vars(rootfolder.as_path())?;
-    conn.for_each_tup_node_with_path(|n: Node| {
+    conn.for_changed_or_created_tup_node_with_path(|n: Node| {
         // name stores full path here
         tupfiles.push(n);
         Ok(())
@@ -119,16 +119,20 @@ fn check_uniqueness_of_parent_rule(
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
     for o in arts.get_output_files() {
-        let db_id_of_o = crossref.get_path_db_id(o).unwrap_or_else(|| panic!(
-            "output which was which was expected to be db is not {:?}",
-            rbuf.get_path(o)
-        ));
+        let db_id_of_o = crossref.get_path_db_id(o).unwrap_or_else(|| {
+            panic!(
+                "output which was which was expected to be db is not {:?}",
+                rbuf.get_path(o)
+            )
+        });
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
             let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = arts.get_parent_rule(o).unwrap_or_else(|| panic!(
-                "unable to fetch parent rule for output {:?}",
-                rbuf.get_path(o)
-            ));
+            let parent_rule_ref = arts.get_parent_rule(o).unwrap_or_else(|| {
+                panic!(
+                    "unable to fetch parent rule for output {:?}",
+                    rbuf.get_path(o)
+                )
+            });
             let path = rbuf.get_tup_path(parent_rule_ref.get_tupfile_desc());
             return Err(anyhow::Error::msg(
                 format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
@@ -222,10 +226,12 @@ fn fetch_group_provider_outputs(
         .map(|group_desc| {
             (
                 *group_desc,
-                crossref.get_group_db_id(group_desc).unwrap_or_else(||panic!(
-                    "could not fetch groupid from its internal id:{}",
-                    group_desc
-                )),
+                crossref.get_group_db_id(group_desc).unwrap_or_else(|| {
+                    panic!(
+                        "could not fetch groupid from its internal id:{}",
+                        group_desc
+                    )
+                }),
             )
         })
         .collect::<Vec<_>>();
@@ -307,10 +313,10 @@ fn insert_nodes(
          -> Result<()> {
             let isz: usize = (*p).into();
             let path = rbuf.get_path(p);
-            let parent = path.as_path().parent().unwrap_or_else(|| panic!(
-                "No parent folder found for file {:?}",
-                path.as_path()
-            ));
+            let parent = path
+                .as_path()
+                .parent()
+                .unwrap_or_else(|| panic!("No parent folder found for file {:?}", path.as_path()));
             let dir = find_dirid.fetch_dirid(parent)?;
             let name = path
                 .as_path()
@@ -362,13 +368,15 @@ fn insert_nodes(
     {
         let tx = conn.transaction()?;
         let mut insert_node = tx.insert_node_prepare()?;
+        let mut find_node = tx.fetch_node_prepare()?;
+        let mut update_mtime = tx.update_mtime_prepare()?;
         for node in groups_to_insert
             .into_iter()
             .chain(paths_to_insert.into_iter())
             .chain(rules_to_insert.into_iter())
         {
             let desc = node.get_id() as usize;
-            let db_id = insert_node.insert_node_exec(&node)?;
+            let db_id = find_upsert_node(&mut insert_node, &mut find_node, &mut update_mtime, &node)?.get_id();
             if RowType::Grp.eq(node.get_type()) {
                 crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id);
             } else if Rule.eq(node.get_type()) {
@@ -380,6 +388,35 @@ fn insert_nodes(
         //tx.commit()?;
     }
     Ok(())
+}
+
+pub(crate) fn find_upsert_node(
+    insert_node: &mut SqlStatement,
+    find_node_id: &mut SqlStatement,
+    update_mtime: &mut SqlStatement,
+    node: &Node,
+) -> Result<Node> {
+    let db_node = find_node_id
+        .fetch_node(node.get_name(), node.get_pid())
+        .or_else(|_| {
+            //eprintln!("n:{:?}", e);
+            insert_node.insert_node_exec(&node).map(|i| {
+                Node::new(
+                    i,
+                    node.get_pid(),
+                    node.get_mtime(),
+                    node.get_name().to_string(),
+                    *node.get_type(),
+                )
+            })
+        })
+        .and_then(|existing_node| {
+            if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
+                update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
+            }
+            Ok(existing_node)
+        })?;
+    Ok(db_node)
 }
 
 fn add_links_to_groups(
