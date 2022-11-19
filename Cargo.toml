@@ -14,3 +14,7 @@ lua-src = { git = "https://github.com/svark/lua-src-rs" }
 
 [profile.release]
 lto = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

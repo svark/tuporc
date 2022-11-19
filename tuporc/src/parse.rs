@@ -365,8 +365,8 @@ fn insert_nodes(
             }
         }
     }
+    let tx = conn.transaction()?;
     {
-        let tx = conn.transaction()?;
         let mut insert_node = tx.insert_node_prepare()?;
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
@@ -385,8 +385,8 @@ fn insert_nodes(
                 crossref.add_path_xref(PathDescriptor::new(desc), db_id);
             }
         }
-        //tx.commit()?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -400,12 +400,13 @@ pub(crate) fn find_upsert_node(
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
             //eprintln!("n:{:?}", e);
+            let pathstr = Path::new(node.get_name()).file_name().unwrap().to_string_lossy().to_string();
             insert_node.insert_node_exec(&node).map(|i| {
                 Node::new(
                     i,
                     node.get_pid(),
                     node.get_mtime(),
-                    node.get_name().to_string(),
+                    pathstr,
                     *node.get_type(),
                 )
             })
