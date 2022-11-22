@@ -678,7 +678,7 @@ impl LibSqlExec for SqlStatement<'_> {
             "wrong token for Insert Dir Into DirPathBuf"
         );
         let path_str = SqlStatement::db_path_str(path);
-        self.stmt.insert(( id, path_str ))?;
+        self.stmt.insert((id, path_str))?;
         Ok(())
     }
 
@@ -696,12 +696,9 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
         anyhow::ensure!(self.tok == InsertFile, "wrong token for Insert file");
-        let r = self.stmt.insert((
-            n.pid,
-            n.name.as_str(),
-            n.mtime,
-            (*n.get_type() as u8),
-        ))?;
+        let r = self
+            .stmt
+            .insert((n.pid, n.name.as_str(), n.mtime, (*n.get_type() as u8)))?;
         Ok(r)
     }
 
@@ -737,9 +734,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
         anyhow::ensure!(self.tok == FindNodeId, "wrong token for fetch node");
-        let nodeid = self
-            .stmt
-            .query_row(( dir, node_name ), |r| (r.get(0)))?;
+        let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
         Ok(nodeid)
     }
 

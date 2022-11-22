@@ -376,7 +376,9 @@ fn insert_nodes(
             .chain(rules_to_insert.into_iter())
         {
             let desc = node.get_id() as usize;
-            let db_id = find_upsert_node(&mut insert_node, &mut find_node, &mut update_mtime, &node)?.get_id();
+            let db_id =
+                find_upsert_node(&mut insert_node, &mut find_node, &mut update_mtime, &node)?
+                    .get_id();
             if RowType::Grp.eq(node.get_type()) {
                 crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id);
             } else if Rule.eq(node.get_type()) {
@@ -400,7 +402,11 @@ pub(crate) fn find_upsert_node(
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
             //eprintln!("n:{:?}", e);
-            let pathstr = Path::new(node.get_name()).file_name().unwrap().to_string_lossy().to_string();
+            let pathstr = Path::new(node.get_name())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             insert_node.insert_node_exec(&node).map(|i| {
                 Node::new(
                     i,

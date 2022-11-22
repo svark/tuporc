@@ -14,7 +14,6 @@ use std::hash::{Hash, Hasher};
 use std::io::Error;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
@@ -23,6 +22,7 @@ use std::vec::Drain;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::Sender;
+use crossbeam::sync::WaitGroup;
 use crossbeam::thread;
 use rusqlite::{Connection, Row};
 use walkdir::DirEntry;
@@ -233,7 +233,7 @@ impl Payload {
     }
 
     fn parent_path(&self) -> &Path {
-        self.parent_path.deref().as_path()
+        self.parent_path.as_path()
     }
     fn get_children(&mut self) -> Drain<'_, DirE> {
         self.children.drain(..)
@@ -334,7 +334,8 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
 
     let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
     let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-
+    let (send_done, recv_done) = crossbeam::channel::unbounded();
+    //paths[0].push(root.to_path_buf());
     //let (diridsender, dirid_receiver) = crossbeam::channel::unbounded::<(PathBuf, i64)>();
     thread::scope(|s| {
         let mut payloadset = HashSet::new();
@@ -343,12 +344,11 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
         let (diridsender, diridreceiver) = crossbeam::channel::bounded::<(PathBuf, i64)>(100);
         dir_id_by_path.insert(root.to_path_buf(), 1);
         println!("root:{:?}", root.to_path_buf());
-        let done_sending_payloads = Arc::new(std::sync::atomic::AtomicU8::new(0));
         {
-            let done_sending_payloads = done_sending_payloads.clone();
             s.spawn(move |_| -> Result<()> {
                 let mut remove_keys = Vec::new();
                 let mut skip_payloads = false;
+                let mut end_work = false;
                 loop {
                     remove_keys.clear();
                     let mut sel = crossbeam::channel::Select::new();
@@ -358,21 +358,33 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                     } else {
                         sel.recv(&payloadreceiver)
                     };
+                    let index2 = if end_work {
+                        usize::MAX
+                    } else {
+                        sel.recv(&recv_done)
+                    };
                     while let Ok(oper) = sel.try_select() {
                         if oper.index() == index0 {
-                            if let Err(_x) = oper
+                            if oper
                                 .recv(&diridreceiver)
-                                .map(|(pbuf, id)| dir_id_by_path.insert(pbuf, id))
+                                .map(|(pbufid, id)| dir_id_by_path.insert(pbufid, id))
+                                .is_err()
                             {
                                 // eprintln!("Error in receiving ids {:?}", x);
                                 break;
                             }
                         } else if oper.index() == index1 {
-                            if let Err(_x) =
-                                oper.recv(&payloadreceiver).map(|p| payloadset.insert(p))
+                            if oper
+                                .recv(&payloadreceiver)
+                                .map(|p| payloadset.insert(p))
+                                .is_err()
                             {
                                 skip_payloads = true;
                                 break;
+                            }
+                        } else if oper.index() == index2 {
+                            if oper.recv(&recv_done).is_ok() {
+                                end_work = true;
                             }
                         } else {
                             eprintln!("unknown index returned in select");
@@ -386,7 +398,7 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                             &mut dir_id_by_path,
                             &mut remove_keys,
                         )?;
-                    } else if done_sending_payloads.load(Ordering::SeqCst) == MAX_THRS_DIRS {
+                    } else if end_work {
                         break;
                     }
                     yield_now();
@@ -492,21 +504,25 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
             ))
             .unwrap();
         drop(heapsender);
+        let wg = WaitGroup::new();
         for _ in 0..MAX_THRS_DIRS {
             let hr = heapreceiver.clone();
             let ps = payloadsender.clone();
-            let dc = done_sending_payloads.clone();
             {
+                let wg = wg.clone();
                 s.spawn(move |_| {
                     for payloaddir in hr.iter() {
                         walkdir_from(payloaddir.parent_path(), payloaddir.sender(), ps.clone());
                     }
                     drop(hr);
                     //println!("done");
-                    dc.fetch_add(1, Ordering::SeqCst);
+                    //dc.fetch_add(1, Ordering::SeqCst);
+                    drop(wg);
                 });
             }
         }
+        wg.wait();
+        send_done.send(()).expect("Failed to send done msg");
     })
     .expect("failed to spawn thread for dir insertion");
     Ok(())
