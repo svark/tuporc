@@ -5,26 +5,27 @@ extern crate num;
 #[macro_use]
 extern crate num_derive;
 
-use std::cmp::Reverse;
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
 use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
+use std::hash::{Hash, Hasher};
 use std::io::Error;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{Ordering};
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 use std::vec::Drain;
 
 use anyhow::Result;
 use clap::Parser;
-use crossbeam::channel::{Receiver, Sender, TryRecvError};
-use crossbeam::thread;
-use jwalk::DirEntry;
-use jwalk::WalkDir;
+use crossbeam::channel::{Sender};
+use crossbeam::{thread};
+use walkdir::DirEntry;
+use walkdir::WalkDir;
 use rusqlite::{Connection, Row};
 
 use db::{Node, RowType};
@@ -36,7 +37,8 @@ use crate::parse::{find_upsert_node, parse_tupfiles_in_db};
 
 mod db;
 mod parse;
-
+const  MAX_THRS_NODES: u8 = 8;
+const MAX_THRS_DIRS: u8 = 6;
 #[derive(clap::Parser)]
 #[clap(author, version = "0.1", about = "Tup build system implemented in rust", long_about = None)]
 struct Args {
@@ -171,17 +173,19 @@ fn time_since_unix_epoch(meta_data: &Metadata) -> Result<Duration, Error> {
         .unwrap_or(Duration::from_secs(0)))
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct DirE {
     file_type: FileType,
     file_name: OsString,
+    metadata: Option<Metadata>,
 }
 
 impl DirE {
-    pub fn from(de:&DirEntry<((), ())>) -> DirE {
+    pub fn from(de:DirEntry) -> DirE {
         DirE {
             file_type: de.file_type(),
             file_name: de.file_name().to_owned(),
+            metadata: de.metadata().ok()
         }
     }
 
@@ -196,30 +200,40 @@ impl DirE {
     pub fn file_name(&self) -> &OsStr {
         self.file_name.as_os_str()
     }
+
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
+    }
 }
 
 
 #[derive(Debug)]
-struct PayLoad {
-    depth : usize,
+struct Payload {
     parent_path: Arc<PathBuf>,
     children: Vec<DirE>,
 }
+#[derive(Debug)]
+struct PayloadDir {
+    parent_path: Arc<PathBuf>,
+    sender: Box<Sender<PayloadDir>>,
+    // payload_sender: Box<Sender<Payload>>,
+}
 
-impl PayLoad {
+impl Eq for Payload {
+}
+impl Hash for Payload {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parent_path.hash(state)
+    }
+}
+impl Payload {
     pub fn new(
-        depth: usize,
         parent_path: Arc<PathBuf>,
-        child: &Vec<jwalk::Result<DirEntry<((), ())>>>,
-    ) -> PayLoad {
-        PayLoad {
-            depth,
+        children: Vec<DirE>,
+    ) -> Payload {
+        Payload {
             parent_path,
-            children: child
-                .iter()
-                .filter_map(|e| e.as_ref().ok())
-                .map(DirE::from)
-                .collect(),
+            children
         }
     }
 
@@ -229,38 +243,110 @@ impl PayLoad {
     fn get_children(&mut self) -> Drain<'_, DirE> {
         self.children.drain(..)
     }
-    fn get_depth(&self) -> usize {
-        self.depth
-    }
 }
-#[derive(Clone, Debug, PartialEq)]
+
+impl PayloadDir {
+    pub fn new(
+        parent_path: Arc<PathBuf>,
+        sender: Box<Sender<PayloadDir>>,
+        //payload_sender: Box<Sender<Payload>>
+    ) -> PayloadDir {
+        PayloadDir {
+            parent_path,
+            sender,
+            //payload_sender
+        }
+    }
+
+    fn parent_path(&self) -> Arc<PathBuf> {
+        self.parent_path.clone()
+    }
+    fn sender(&self) -> &Sender<PayloadDir> {
+        self.sender.deref()
+    }
+
+}
+#[derive(Clone, Debug)]
 struct ProtoNode {
     p: DirE,
     pid: i64,
     pbuf: Arc<PathBuf>,
 }
 
-impl PartialEq<Self> for PayLoad {
+impl PartialEq<Self> for Payload {
     fn eq(&self, other: &Self) -> bool {
         self.parent_path.deref() == (other.parent_path.deref())
     }
 }
 
-impl PartialOrd for PayLoad {
+impl PartialOrd for Payload {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.get_depth().partial_cmp(&other.get_depth())
+        self.parent_path().partial_cmp(other.parent_path())
     }
 }
 
 
-impl Eq for PayLoad {}
 
-impl Ord for PayLoad {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.parent_path().deref().cmp(other.parent_path().deref())
+
+///---------
+impl PartialEq<Self> for PayloadDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.parent_path.deref() == (other.parent_path.deref())
     }
 }
 
+impl Borrow<Path> for Payload {
+    fn borrow(&self) -> &Path {
+        self.parent_path()
+    }
+}
+
+fn walkdir_from(root: Arc<PathBuf>, hs: &Sender<PayloadDir>, ps: Sender<Payload>) {
+// println!("dir:{:?}", root.parent_path());
+
+    let mut children= Vec::new();
+    WalkDir::new(root.deref())
+        .follow_links(true)
+        //.skip_hidden(true)
+        .min_depth(1)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .for_each(|e:DirEntry| {
+            if e.file_type().is_dir() {
+                let bx = Box::new(hs.clone());
+//let hx = Box::new(root.payload_sender().clone());
+                let pdir = PayloadDir::new( Arc::new(e.path().to_path_buf()), bx);
+                hs.send(pdir).unwrap();
+//   println!("done   {:?}/{:?}", e.parent_path(), e.file_name());
+            }
+            children.push(DirE::from(e))
+        });
+    {
+        let payload = Payload::new( root,
+                                   children,
+        );
+        ps.send(payload).unwrap();
+    }
+
+//drop(root.payload_sender);
+}
+
+ fn process_dir (mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>)
+                       -> Result<()>
+ {
+     //let curdir = payload.dir.as_path();
+     //let existing_nodes = conn.fetch_nodes_prepare_by_dirid()?.fetch_nodes_by_dirid([pid])?;
+     //println!("processing dir {:?} with id: {}",  payload.parent_path(), pid);
+     // skip curdir
+     let pp = payload.parent_path.clone();
+     for p in payload.get_children() {
+         //let path_str = f.file_name().to_string_lossy().to_string();
+         ds.send(ProtoNode { p, pid, pbuf: pp.clone() }).unwrap();
+     }
+     //tx.commit()?;
+     Ok(())
+ }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connection) -> Result<()> {
     println!("Sqlite version: {}\n", rusqlite::version());
@@ -278,138 +364,110 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
 
     let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
     let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-    let process_dir = |mut payload: PayLoad, pid: i64, ds: &Sender<ProtoNode>|
-     -> Result<()> {
-        //let curdir = payload.dir.as_path();
-        //let existing_nodes = conn.fetch_nodes_prepare_by_dirid()?.fetch_nodes_by_dirid([pid])?;
-        //println!("processing dir {:?} with id: {}",  payload.parent_path(), pid);
-        // skip curdir
-        let pp = payload.parent_path.clone();
-        for p in payload.get_children(){
-            //let path_str = f.file_name().to_string_lossy().to_string();
-            ds.send(ProtoNode {p, pid, pbuf: pp.clone()}).unwrap();
-        }
-        //tx.commit()?;
-        Ok(())
-    };
 
     //let (diridsender, dirid_receiver) = crossbeam::channel::unbounded::<(PathBuf, i64)>();
     thread::scope(|s| {
-        let heap = Arc::new(RwLock::new(std::collections::binary_heap::BinaryHeap::<Reverse<PayLoad> >::new()));
-        let  dir_id_by_path = Arc::new(RwLock::new(HashMap::new()));
+        let mut payloadset = HashSet::new();
+        let mut dir_id_by_path = HashMap::new();
         let  (payloadsender, payloadreceiver) = crossbeam::channel::unbounded();
-        dir_id_by_path.write().unwrap().insert(root.to_path_buf(), 1);
+        let (diridsender, diridreceiver) = crossbeam::channel::unbounded::<(PathBuf, i64)>();
+        dir_id_by_path.insert(root.to_path_buf(), 1);
         println!("root:{:?}", root.to_path_buf());
         //let heapsize = AtomicUsize::new(0);
+
+
+        let  done_sending_payloads = Arc::new(std::sync::atomic::AtomicU8::new(0));
         {
-            let  payloadreceiverclone : Receiver<PayLoad>= payloadreceiver.clone();
-            let  heapclone = heap.clone();
-            let  dir_id_by_path_clone = dir_id_by_path.clone();
-            s.spawn(move |_| -> Result<()> {
-                loop{
-                    match payloadreceiverclone.try_recv(){
-                        Ok(payload) => {
-                            if let Ok(mut heaprefmut) = heapclone.write()
+            let  done_sending_payloads = done_sending_payloads.clone();
+            s.spawn( move |_| -> Result<()> {
+                let mut remove_keys = Vec::new();
+                loop {
+                    remove_keys.clear();
+                    let mut sel = crossbeam::channel::Select::new();
+                    let index0 = sel.recv(&diridreceiver);
+                    let index1 = sel.recv(&payloadreceiver);
+                    let mut c = false;
+                    while let Ok(oper) = sel.try_select() {
+                        if oper.index() == index0 {
+                            if oper.recv(&diridreceiver).map(|(pbuf, id)| dir_id_by_path.insert(pbuf, id)).is_err()
                             {
-                               // println!("received payload :{:?}", payload.parent_path());
-                                heaprefmut.push(Reverse(payload));
-                                //println!(" hx {:?}", heapsize.load(Ordering::SeqCst));
-                            }else {
-                                return Err(anyhow::Error::msg("heap access failure"));
+                                break;
+                            }
+                        } else if oper.index() == index1 {
+                            if oper.recv(&payloadreceiver).map(|p| payloadset.insert(p)).is_err()
+                            {
+                                break;
                             }
                         }
-                        Err(TryRecvError::Disconnected) => {
-                            if let Ok(heapref) = heapclone.read()
-                            {
-                                if heapref.is_empty()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(_) => {}
+                        c = true;
                     }
+                    if c || !payloadset.is_empty() {
+                        linkup_dbids(&dire_sender, &mut payloadset, &mut dir_id_by_path, &mut remove_keys)?;
+                    }
+                    else if done_sending_payloads.load(Ordering::SeqCst) == MAX_THRS_DIRS
                     {
-                        if let Ok(diridreader) = dir_id_by_path_clone.read() {
-                            if let Ok(mut heapref) = heapclone.write()
-                            {
-                                if let Some(Reverse(payload)) = heapref.pop() {
-                                    //println!(" try {:?} ", payload.parent_path());
-                                    if let Some(pid) = diridreader.deref().get(payload.parent_path()) {
-                                        let pid = *pid;
-                                        process_dir(payload, pid, &dire_sender)?;
-                                        //println!(" hx {:?}", heapref.len());
-                                    }else {
-
-                                       // println!("mishit :{:?}", payload.parent_path.as_path());
-                                        heapref.push(Reverse(payload));
-                                    }
-                                }
-                            }
-                        }
-                        yield_now();
-
+                        break;
                     }
-                }
-                drop(dire_sender);
-                Ok(())
-            });
 
+                    //linkup_payloads_with_dirid(&dire_sender, &mut payloadset, &dir_id_by_path, &mut remove_keys)?;
+                    yield_now();
+                }
+                Ok(())
+
+            });
         }
         {
-            for _ in 0..12 {
+            // threads below convert DirEntries to Node's ready for sql queries/inserts
+            for _ in 0..MAX_THRS_NODES {
                let ns = nodesender.clone();
                let dire_receiver = dire_receiver.clone();
                s.spawn( move |_| -> Result<()> {
-                   loop {
-                       match dire_receiver.try_recv() {
-                           Ok(p) => {
-                               let f = p.p;
-                               let pid = p.pid;
-                               if f.file_type().is_file() {
-                                   let fpath = f.path(p.pbuf.as_ref());
-                                   let metadata = fpath.metadata()?;
-                                   if let Ok(mtime) = time_since_unix_epoch(&metadata) {
-                                       // for a node already in db, check the diffs in mtime
-                                       // otherwise insert node in db
-                                       let rtype = if is_tupfile(f.file_name()) {
-                                           RowType::TupF
-                                       } else {
-                                           RowType::File
-                                       };
-                                       let node = Node::new(
-                                           0,
-                                           pid,
-                                           mtime.subsec_nanos() as i64,
-                                           fpath.to_string_lossy().to_string(),
-                                           rtype,
-                                       );
-                                       ns.send(node).expect("Failed to send node");
-                                       // let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
-                                       // present.insert(id);
-                                   }
-                               } else if f.file_type().is_dir() {
-                                   let fpath = f.path(p.pbuf.as_ref()).to_string_lossy().to_string();
-                                   let node = Node::new(0, pid, 0, fpath, Dir);
-                                   ns.send(node).expect("Failed to send node");
-                                   //let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
-                                   //dir_id_by_path.insert(f.path(), id);
-                                   //present.insert(id);
-                               }
-                           },
-                           Err(TryRecvError::Disconnected) => {break},
-                           Err(_) => {}
+                   for p in dire_receiver.iter() {
+                       let f = p.p;
+                       let pid = p.pid;
+                       if f.file_type().is_file() {
+                           let fpath = f.path(p.pbuf.as_ref());
+                           let metadata = f.metadata();
+                           if metadata.is_none() {
+                               eprintln!("cannot read metadata for: {:?}", fpath.as_path());
+                               continue;
+                           }
+                           if let Ok(mtime) = time_since_unix_epoch(metadata.unwrap()) {
+                               // for a node already in db, check the diffs in mtime
+                               // otherwise insert node in db
+                               let rtype = if is_tupfile(f.file_name()) {
+                                   RowType::TupF
+                               } else {
+                                   RowType::File
+                               };
+                               let node = Node::new(
+                                   0,
+                                   pid,
+                                   mtime.subsec_nanos() as i64,
+                                   fpath.to_string_lossy().to_string(),
+                                   rtype,
+                               );
+                               ns.send(node).expect("Failed to send node");
+                               // let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
+                               // present.insert(id);
+                           }
+                       } else if f.file_type().is_dir() {
+                           let fpath = f.path(p.pbuf.as_ref()).to_string_lossy().to_string();
+                           let node = Node::new(0, pid, 0, fpath, Dir);
+                           ns.send(node).expect("Failed to send node");
+                           //let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
+                           //dir_id_by_path.insert(f.path(), id);
+                           //present.insert(id);
                        }
-                       yield_now();
                    }
                    drop(ns);
                    Ok(())
-               }) ;
+               });
             }
             drop(nodesender);
         }
         {
-            let dir_id_by_path_clone = dir_id_by_path.clone();
+            // the thread below works with sqlite db to insert or upsert nodes
             s.spawn(move |_| -> Result<()> {
                 let tx = conn.transaction()?;
                 {
@@ -417,70 +475,81 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                     //let mut insert_dir = tx.insert_dir_prepare()?;
                     let mut find_node = tx.fetch_node_prepare()?;
                     let mut update_mtime = tx.update_mtime_prepare()?;
-                    loop {
-                        match nodereceiver.try_recv() {
-                            Ok(node) => {
-                                if node.get_type() == &Dir {
-                                    let id: i64 = find_upsert_node(
-                                        &mut insert_new_node,
-                                        &mut find_node,
-                                        &mut update_mtime,
-                                        &node,
-                                    )?
-                                        .get_id();
-                                    let p: PathBuf = PathBuf::from(node.get_name());
-                                    //println!(" dir id for path:{:?} is {}", p.as_path(), id.clone());
-                                    //dir_id_by_path.insert(p, id);
-                                    //diridsender.send((p, id))?;
-                                    if let Some(mut dirid_writer) = dir_id_by_path_clone.write().ok() {
-                                        dirid_writer.insert(p, id);
-                                    }
-                                    //present.insert(id);
-                                } else {
-                                    let _id = find_upsert_node(
-                                        &mut insert_new_node,
-                                        &mut find_node,
-                                        &mut update_mtime,
-                                        &node,
-                                    )?
-                                        .get_id();
-                                    //present.insert(id);
-                                }
-                            }
-                            Err(TryRecvError::Disconnected) => {
-                                break },
-                            Err(_) => {}
+                    for node in nodereceiver.iter() {
+                        if node.get_type() == &Dir {
+                            let id: i64 = find_upsert_node(
+                                &mut insert_new_node,
+                                &mut find_node,
+                                &mut update_mtime,
+                                &node,
+                            )?
+                                .get_id();
+                            let p: PathBuf = PathBuf::from(node.get_name());
+                            //println!(" dir id for path:{:?} is {}", p.as_path(), id.clone());
+                            //dir_id_by_path.insert(p, id);
+                            diridsender.send((p, id))?;
+                            //present.insert(id);
+                        } else {
+                            let _id = find_upsert_node(
+                                &mut insert_new_node,
+                                &mut find_node,
+                                &mut update_mtime,
+                                &node,
+                            )?
+                                .get_id();
+                            //present.insert(id);
                         }
-                        yield_now()
                     }
+                    println!("node receiver exited");
                 }
                 //drop(diridsender);
                 tx.commit()?;
                 Ok(())
             });
         }
-        {
-            WalkDir::new(root)
-                .follow_links(true)
-                .skip_hidden(true)
-                .min_depth(1)
-                .process_read_dir(move |depth, path, _,  children| {
-                    if  depth.is_some()
-                    {
-                        let payload = PayLoad::new( depth.unwrap(),
-                            Arc::new(path.to_path_buf()),
-                            children,
-                        );
-                        payloadsender.send(payload).unwrap();
-                    }
-                })
-                .into_iter()
-                .for_each(|_| {
+        let  (heapsender, heapreceiver) = crossbeam::channel::unbounded();
+        heapsender.send( PayloadDir::new( Arc::new(root.to_path_buf()),
+                                         Box::new(heapsender.clone()))).unwrap();
+        drop(heapsender);
+        //drop(payloadsender);
+        //heap.push(Reverse(PayLoadDir::new(0, Arc::new(root.to_path_buf()))));
+        for _ in 0..MAX_THRS_DIRS {
+            let hr = heapreceiver.clone();
+            let ps = payloadsender.clone();
+            let dc = done_sending_payloads.clone();
+            {
+               s.spawn( move |_| {
+                   for payloaddir in hr.iter()
+                   {
+                       walkdir_from(payloaddir.parent_path(), payloaddir.sender(), ps.clone());
+                       //drop(payloaddir.sender);
+                   }
+                   drop(hr);
+                   println!("done");
+                   dc.fetch_add(1, Ordering::SeqCst);
+               });
+            }
 
-                });
         }
-
     })
     .expect("failed to spawn thread for dir insertion");
+    Ok(())
+}
+
+fn linkup_dbids(dire_sender: &Sender<ProtoNode>, payloadset: &mut HashSet<Payload>, dir_id_by_path: &mut HashMap<PathBuf, i64>,
+                remove_keys: &mut Vec<PathBuf>) -> Result<()> {
+    for (parent_path, pid) in dir_id_by_path.iter()
+    {
+        //let mut len = 0;
+        if let Some(payload) = payloadset.take(parent_path.as_path())
+        {
+            //println!(" -hx {:?} ", len-1);
+            remove_keys.push(parent_path.clone());
+            process_dir(payload, *pid, &dire_sender)?;
+        } else {
+            //    println!("mishit:{:?}", parent_path);
+        }
+    }
+    remove_keys.drain(..).for_each(|p| { let _ = dir_id_by_path.remove(p.as_path()); });
     Ok(())
 }
