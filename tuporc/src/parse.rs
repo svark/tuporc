@@ -371,6 +371,7 @@ fn insert_nodes(
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
         let mut insert_present = tx.insert_present_prepare()?;
+        let mut insert_modify = tx.insert_modify_prepare()?;
         for node in groups_to_insert
             .into_iter()
             .chain(paths_to_insert.into_iter())
@@ -382,6 +383,7 @@ fn insert_nodes(
                 &mut find_node,
                 &mut update_mtime,
                 &mut insert_present,
+                &mut insert_modify,
                 &node,
             )?
             .get_id();
@@ -403,13 +405,14 @@ pub(crate) fn find_upsert_node(
     find_node_id: &mut SqlStatement,
     update_mtime: &mut SqlStatement,
     insert_present: &mut SqlStatement,
+    insert_modify: &mut SqlStatement,
     node: &Node,
 ) -> Result<Node> {
     let db_node = find_node_id
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
             //eprintln!("n:{:?}", e);
-            insert_node.insert_node_exec(&node).map(|i| {
+            let node = insert_node.insert_node_exec(&node).map(|i| {
                 Node::new(
                     i,
                     node.get_pid(),
@@ -417,11 +420,14 @@ pub(crate) fn find_upsert_node(
                     node.get_name().to_string(),
                     *node.get_type(),
                 )
-            })
+            })?;
+            insert_modify.insert_modify(node.get_id())?;
+            Ok::<Node, anyhow::Error>(node)
         })
         .and_then(|existing_node| {
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
                 update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
+                insert_modify.insert_modify(existing_node.get_id())?;
             }
             insert_present.insert_present(existing_node.get_id())?;
             Ok(existing_node)

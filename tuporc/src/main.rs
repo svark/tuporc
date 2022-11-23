@@ -33,7 +33,7 @@ use db::ForEachClauses;
 use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
 
-use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, SqlStatement};
+use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
 use crate::parse::{find_upsert_node, parse_tupfiles_in_db};
 
 mod db;
@@ -110,8 +110,7 @@ fn main() -> Result<()> {
                 }
                 println!("Scanning for files");
                 let root = current_dir()?;
-                let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
-                match scan_root(root.as_path(), &mut conn, &mut present) {
+                match scan_root(root.as_path(), &mut conn) {
                     Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
@@ -126,10 +125,8 @@ fn main() -> Result<()> {
                 }
                 let root = current_dir()?;
                 println!("Parsing tupfiles in database");
-                let mut present: HashSet<i64> = HashSet::new(); // tracks files/folder still in the filesystem
-                scan_root(root.as_path(), &mut conn, &mut present)?;
+                scan_root(root.as_path(), &mut conn)?;
                 parse_tupfiles_in_db(&mut conn, root.as_path())?;
-                delete_missing(&conn, &present)?;
             }
             Action::Upd { target } => {
                 println!("Updating db {}", target.join(" "));
@@ -141,13 +138,13 @@ fn main() -> Result<()> {
 }
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
-fn scan_root(root: &Path, conn: &mut Connection, present: &mut HashSet<i64>) -> Result<()> {
-    insert_direntries(root, present, conn)
+fn scan_root(root: &Path, conn: &mut Connection) -> Result<()> {
+    insert_direntries(root, conn)
 }
 
 // WIP... delete files and rules in db that arent in the filesystem or in use
 // should restrict attention to the outputs of tupfiles that are modified/deleted.
-fn delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
+fn __delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
     let mut delete_stmt = conn.delete_prepare()?;
     let mut delete_aux_stmt = conn.delete_aux_prepare()?;
 
@@ -398,26 +395,27 @@ fn send_children(mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>) -> Resu
     Ok(())
 }
 /// insert directory entries into Node table if not already added.
-fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connection) -> Result<()> {
-    crate::db::create_present_temptable(conn)?;
+fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
+    db::create_present_temptable(conn)?;
     println!("Sqlite version: {}\n", rusqlite::version());
     {
         let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
         let n = existing_node.map(|n| n.get_id());
-        if n.is_none() {
+        let n = if n.is_none() {
             let mut insert_dir = conn.insert_dir_prepare()?;
             let id = insert_dir.insert_dir_exec(".", 0)?;
-            anyhow::ensure!(id == 1, format!("unexpected id for root dir :{} ", id));
-            present.insert(id);
-        }
+            id
+        }else {
+            n.unwrap()
+        };
+        anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
+        conn.insert_present_prepare()?.insert_present(n)?;
     }
 
-    let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
-    let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-    let (send_done, recv_done) = crossbeam::channel::bounded(0);
-    //paths[0].push(root.to_path_buf());
-    //let (diridsender, dirid_receiver) = crossbeam::channel::unbounded::<(PathBuf, i64)>();
     thread::scope(|s| -> Result<()> {
+        let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
+        let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
+        let (send_done, recv_done) = crossbeam::channel::bounded(0);
         let mut payload_set = HashSet::new();
         let mut dir_id_by_path = HashMap::new();
         let (payload_sender, payload_receiver) = crossbeam::channel::unbounded();
@@ -540,10 +538,11 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                 let tx = conn.transaction()?;
                 {
                     let mut insert_new_node = tx.insert_node_prepare()?;
-                    //let mut insert_dir = tx.insert_dir_prepare()?;
                     let mut find_node = tx.fetch_node_prepare()?;
                     let mut insert_present = tx.insert_present_prepare()?;
                     let mut update_mtime = tx.update_mtime_prepare()?;
+                    let mut insert_modify = tx.insert_modify_prepare()?;
+
                     for tnode in nodereceiver.iter() {
                         let node = tnode.get_node();
                         if node.get_type() == &Dir {
@@ -552,6 +551,7 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                                 &mut find_node,
                                 &mut update_mtime,
                                 &mut insert_present,
+                                &mut insert_modify,
                                 &node,
                             )?
                             .get_id();
@@ -563,12 +563,14 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                                 &mut find_node,
                                 &mut update_mtime,
                                 &mut insert_present,
+                                &mut insert_modify,
                                 &node,
                             )?;
                         }
                     }
                 }
                 tx.commit()?;
+                conn.populate_delete_list()?;
                 Ok(())
             });
         }
