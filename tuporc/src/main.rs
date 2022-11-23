@@ -426,11 +426,9 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
         println!("root:{:?}", root.to_path_buf());
         {
             s.spawn(move |_| -> Result<()> {
-                let mut remove_keys = Vec::new();
                 let mut skip_payloads = false;
                 let mut end_payload_work = false;
                 loop {
-                    remove_keys.clear();
                     let mut sel = crossbeam::channel::Select::new();
                     let index0 = sel.recv(&dirid_receiver);
                     let index1 = if skip_payloads {
@@ -477,7 +475,6 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                             &dire_sender,
                             &mut payload_set,
                             &mut dir_id_by_path,
-                            &mut remove_keys,
                         )?;
                     } else if end_payload_work {
                         break;
@@ -597,7 +594,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
         send_done.send(())?;
         Ok(())
     })
-    .expect("failed to spawn thread for dir insertion")
+    .expect("Failed to spawn thread for dir insertion")
     .expect("Failed to return from scope");
     Ok(())
 }
@@ -607,18 +604,17 @@ fn linkup_dbids(
     dire_sender: &Sender<ProtoNode>,
     payload_set: &mut HashSet<Payload>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
-    remove_keys: &mut Vec<HashedPath>,
 ) -> Result<()> {
-    for (parent_path, pid) in dir_id_by_path.iter() {
-        if let Some(payload) = payload_set.take(parent_path) {
-            remove_keys.push(parent_path.clone());
-            send_children(payload, *pid, &dire_sender)?;
+
+    dir_id_by_path.
+        retain(|p, id|
+            // warning this is a predicate with side effects.. :-(
+        if let Some(payload) = payload_set.take(p) {
+            send_children(payload, *id, &dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
+            false
         } else {
-            //    println!("mishit:{:?}", parent_path);
+            true
         }
-    }
-    remove_keys.drain(..).for_each(|p| {
-        let _ = dir_id_by_path.remove(&p);
-    });
+    );
     Ok(())
 }
