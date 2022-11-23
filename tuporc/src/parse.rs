@@ -370,15 +370,21 @@ fn insert_nodes(
         let mut insert_node = tx.insert_node_prepare()?;
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
+        let mut insert_present = tx.insert_present_prepare()?;
         for node in groups_to_insert
             .into_iter()
             .chain(paths_to_insert.into_iter())
             .chain(rules_to_insert.into_iter())
         {
             let desc = node.get_id() as usize;
-            let db_id =
-                find_upsert_node(&mut insert_node, &mut find_node, &mut update_mtime, &node)?
-                    .get_id();
+            let db_id = find_upsert_node(
+                &mut insert_node,
+                &mut find_node,
+                &mut update_mtime,
+                &mut insert_present,
+                &node,
+            )?
+            .get_id();
             if RowType::Grp.eq(node.get_type()) {
                 crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id);
             } else if Rule.eq(node.get_type()) {
@@ -396,23 +402,19 @@ pub(crate) fn find_upsert_node(
     insert_node: &mut SqlStatement,
     find_node_id: &mut SqlStatement,
     update_mtime: &mut SqlStatement,
+    insert_present: &mut SqlStatement,
     node: &Node,
 ) -> Result<Node> {
     let db_node = find_node_id
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
             //eprintln!("n:{:?}", e);
-            let pathstr = Path::new(node.get_name())
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
             insert_node.insert_node_exec(&node).map(|i| {
                 Node::new(
                     i,
                     node.get_pid(),
                     node.get_mtime(),
-                    pathstr,
+                    node.get_name().to_string(),
                     *node.get_type(),
                 )
             })
@@ -421,6 +423,7 @@ pub(crate) fn find_upsert_node(
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
                 update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
             }
+            insert_present.insert_present(existing_node.get_id())?;
             Ok(existing_node)
         })?;
     Ok(db_node)

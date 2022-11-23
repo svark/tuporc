@@ -6,13 +6,14 @@ extern crate num;
 extern crate num_derive;
 
 use std::borrow::Borrow;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
 use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
+use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Error;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::yield_now;
@@ -37,8 +38,8 @@ use crate::parse::{find_upsert_node, parse_tupfiles_in_db};
 
 mod db;
 mod parse;
-const MAX_THRS_NODES: u8 = 8;
-const MAX_THRS_DIRS: u8 = 6;
+const MAX_THRS_NODES: u8 = 4;
+const MAX_THRS_DIRS: u8 = 10;
 #[derive(clap::Parser)]
 #[clap(author, version = "0.1", about = "Tup build system implemented in rust", long_about = None)]
 struct Args {
@@ -179,42 +180,82 @@ struct DirE {
     file_type: FileType,
     file_name: OsString,
     metadata: Option<Metadata>,
+    hashed_path: HashedPath,
 }
 
 impl DirE {
-    fn from(de: DirEntry) -> DirE {
+    fn new(de: DirEntry, hashed_path: HashedPath) -> DirE {
         DirE {
             file_type: de.file_type(),
             file_name: de.file_name().to_owned(),
             metadata: de.metadata().ok(),
+            hashed_path,
         }
     }
 
-    fn path(&self, parent: &Path) -> PathBuf {
-        parent.join(&self.file_name)
+    fn get_path(&self) -> &HashedPath {
+        &self.hashed_path
     }
 
     fn file_type(&self) -> &FileType {
         &self.file_type
     }
 
-    fn file_name(&self) -> &OsStr {
-        self.file_name.as_os_str()
+    fn file_name(&self) -> &OsString {
+        &self.file_name
     }
 
     fn metadata(&self) -> Option<&Metadata> {
         self.metadata.as_ref()
     }
 }
+#[derive(Debug, Clone)]
+struct HashedPath {
+    path: Arc<PathBuf>,
+    hash: u64,
+}
+
+impl Hash for HashedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl From<PathBuf> for HashedPath {
+    fn from(p: PathBuf) -> Self {
+        let rs = RandomState::new();
+        let mut hasher = rs.build_hasher();
+        p.hash(&mut hasher);
+        HashedPath {
+            path: Arc::new(p),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl AsRef<Path> for HashedPath {
+    fn as_ref(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl HashedPath {
+    fn get_hash(&self) -> u64 {
+        self.hash
+    }
+    fn get_path(&self) -> Arc<PathBuf> {
+        self.path.clone()
+    }
+}
 
 #[derive(Debug)]
 struct Payload {
-    parent_path: Arc<PathBuf>,
+    parent_path: HashedPath,
     children: Vec<DirE>,
 }
 #[derive(Debug)]
 struct PayloadDir {
-    parent_path: Arc<PathBuf>,
+    parent_path: HashedPath,
     sender: Sender<PayloadDir>,
 }
 
@@ -224,16 +265,17 @@ impl Hash for Payload {
         self.parent_path.hash(state)
     }
 }
+
 impl Payload {
-    pub fn new(parent_path: Arc<PathBuf>, children: Vec<DirE>) -> Payload {
+    pub fn new(parent_path: HashedPath, children: Vec<DirE>) -> Payload {
         Payload {
             parent_path,
             children,
         }
     }
 
-    fn parent_path(&self) -> &Path {
-        self.parent_path.as_path()
+    fn parent_path(&self) -> &HashedPath {
+        &self.parent_path
     }
     fn get_children(&mut self) -> Drain<'_, DirE> {
         self.children.drain(..)
@@ -241,14 +283,14 @@ impl Payload {
 }
 
 impl PayloadDir {
-    pub fn new(parent_path: Arc<PathBuf>, sender: Sender<PayloadDir>) -> PayloadDir {
+    pub fn new(parent_path: HashedPath, sender: Sender<PayloadDir>) -> PayloadDir {
         PayloadDir {
             parent_path,
             sender,
         }
     }
 
-    fn parent_path(&self) -> Arc<PathBuf> {
+    fn parent_path(&self) -> HashedPath {
         self.parent_path.clone()
     }
     fn sender(&self) -> &Sender<PayloadDir> {
@@ -259,37 +301,77 @@ impl PayloadDir {
 struct ProtoNode {
     p: DirE,
     pid: i64,
-    pbuf: Arc<PathBuf>,
 }
+
+impl ProtoNode {
+    pub fn new(p: DirE, pid: i64) -> ProtoNode {
+        ProtoNode { p, pid }
+    }
+
+    fn get_dire(&self) -> &DirE {
+        &self.p
+    }
+
+    fn get_file_name(&self) -> &OsStr {
+        &self.p.file_name
+    }
+
+    fn get_parent_id(&self) -> i64 {
+        self.pid
+    }
+
+    fn get_path(&self) -> &HashedPath {
+        &self.p.get_path()
+    }
+}
+#[derive(Clone, Debug)]
+struct NodeAtPath {
+    node: Node,
+    pbuf: HashedPath,
+}
+
+impl NodeAtPath {
+    pub fn new(node: Node, pbuf: HashedPath) -> NodeAtPath {
+        NodeAtPath { node, pbuf }
+    }
+
+    pub fn get_node(&self) -> &Node {
+        &self.node
+    }
+    pub fn get_hashed_path(&self) -> &HashedPath {
+        &self.pbuf
+    }
+}
+
+impl PartialEq<Self> for HashedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_hash() == other.get_hash()
+            && self.get_path().as_path() == other.get_path().as_path()
+    }
+}
+impl Eq for HashedPath {}
 
 impl PartialEq<Self> for Payload {
     fn eq(&self, other: &Self) -> bool {
-        self.parent_path.deref() == (other.parent_path.deref())
+        self.parent_path() == other.parent_path()
     }
 }
 
-impl PartialOrd for Payload {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.parent_path().partial_cmp(other.parent_path())
-    }
-}
-
-///---------
 impl PartialEq<Self> for PayloadDir {
     fn eq(&self, other: &Self) -> bool {
-        self.parent_path.deref() == (other.parent_path.deref())
+        self.parent_path() == other.parent_path()
     }
 }
 
-impl Borrow<Path> for Payload {
-    fn borrow(&self) -> &Path {
+impl Borrow<HashedPath> for Payload {
+    fn borrow(&self) -> &HashedPath {
         self.parent_path()
     }
 }
 
-fn walkdir_from(root: Arc<PathBuf>, hs: &Sender<PayloadDir>, ps: Sender<Payload>) {
+fn walkdir_from(root: HashedPath, hs: &Sender<PayloadDir>, ps: Sender<Payload>) {
     let mut children = Vec::new();
-    WalkDir::new(root.deref())
+    WalkDir::new(root.as_ref())
         .follow_links(true)
         //.skip_hidden(true)
         .min_depth(1)
@@ -297,29 +379,27 @@ fn walkdir_from(root: Arc<PathBuf>, hs: &Sender<PayloadDir>, ps: Sender<Payload>
         .into_iter()
         .filter_map(|e| e.ok())
         .for_each(|e: DirEntry| {
+            let pp = HashedPath::from(e.path().to_path_buf());
+            let cur_path = pp.clone();
+            let pdir = PayloadDir::new(pp, hs.clone());
             if e.file_type().is_dir() {
-                let pdir = PayloadDir::new(Arc::new(e.path().to_path_buf()), hs.clone());
                 hs.send(pdir).unwrap();
             }
-            children.push(DirE::from(e))
+            children.push(DirE::new(e, cur_path))
         });
     let payload = Payload::new(root, children);
     ps.send(payload).unwrap();
 }
 
-fn process_dir(mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
-    let pp = payload.parent_path.clone();
+fn send_children(mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
     for p in payload.get_children() {
-        ds.send(ProtoNode {
-            p,
-            pid,
-            pbuf: pp.clone(),
-        })?;
+        ds.send(ProtoNode::new(p, pid))?;
     }
     Ok(())
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connection) -> Result<()> {
+    crate::db::create_present_temptable(conn)?;
     println!("Sqlite version: {}\n", rusqlite::version());
     {
         let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
@@ -334,40 +414,43 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
 
     let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
     let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-    let (send_done, recv_done) = crossbeam::channel::unbounded();
+    let (send_done, recv_done) = crossbeam::channel::bounded(0);
     //paths[0].push(root.to_path_buf());
     //let (diridsender, dirid_receiver) = crossbeam::channel::unbounded::<(PathBuf, i64)>();
-    thread::scope(|s| {
-        let mut payloadset = HashSet::new();
+    thread::scope(|s| -> Result<()> {
+        let mut payload_set = HashSet::new();
         let mut dir_id_by_path = HashMap::new();
-        let (payloadsender, payloadreceiver) = crossbeam::channel::unbounded();
-        let (diridsender, diridreceiver) = crossbeam::channel::bounded::<(PathBuf, i64)>(100);
-        dir_id_by_path.insert(root.to_path_buf(), 1);
+        let (payload_sender, payload_receiver) = crossbeam::channel::unbounded();
+        let (dirid_sender, dirid_receiver) = crossbeam::channel::bounded::<(HashedPath, i64)>(100);
+        let root_hp = HashedPath::from(root.to_path_buf());
+        let root_hash_path = root_hp.clone();
+        dir_id_by_path.insert(root_hp, 1);
         println!("root:{:?}", root.to_path_buf());
         {
             s.spawn(move |_| -> Result<()> {
                 let mut remove_keys = Vec::new();
                 let mut skip_payloads = false;
-                let mut end_work = false;
+                let mut end_payload_work = false;
                 loop {
                     remove_keys.clear();
                     let mut sel = crossbeam::channel::Select::new();
-                    let index0 = sel.recv(&diridreceiver);
+                    let index0 = sel.recv(&dirid_receiver);
                     let index1 = if skip_payloads {
                         usize::MAX
                     } else {
-                        sel.recv(&payloadreceiver)
+                        sel.recv(&payload_receiver)
                     };
-                    let index2 = if end_work {
+                    let index2 = if end_payload_work {
                         usize::MAX
                     } else {
                         sel.recv(&recv_done)
                     };
+
                     while let Ok(oper) = sel.try_select() {
                         if oper.index() == index0 {
                             if oper
-                                .recv(&diridreceiver)
-                                .map(|(pbufid, id)| dir_id_by_path.insert(pbufid, id))
+                                .recv(&dirid_receiver)
+                                .map(|(p, id)| dir_id_by_path.insert(p, id))
                                 .is_err()
                             {
                                 // eprintln!("Error in receiving ids {:?}", x);
@@ -375,8 +458,8 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                             }
                         } else if oper.index() == index1 {
                             if oper
-                                .recv(&payloadreceiver)
-                                .map(|p| payloadset.insert(p))
+                                .recv(&payload_receiver)
+                                .map(|p| payload_set.insert(p))
                                 .is_err()
                             {
                                 skip_payloads = true;
@@ -384,21 +467,21 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                             }
                         } else if oper.index() == index2 {
                             if oper.recv(&recv_done).is_ok() {
-                                end_work = true;
+                                end_payload_work = true;
                             }
                         } else {
                             eprintln!("unknown index returned in select");
                             break;
                         }
                     }
-                    if !payloadset.is_empty() || !dir_id_by_path.is_empty() {
+                    if !payload_set.is_empty() || !dir_id_by_path.is_empty() {
                         linkup_dbids(
                             &dire_sender,
-                            &mut payloadset,
+                            &mut payload_set,
                             &mut dir_id_by_path,
                             &mut remove_keys,
                         )?;
-                    } else if end_work {
+                    } else if end_payload_work {
                         break;
                     }
                     yield_now();
@@ -413,13 +496,13 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                 let dire_receiver = dire_receiver.clone();
                 s.spawn(move |_| -> Result<()> {
                     for p in dire_receiver.iter() {
-                        let f = p.p;
-                        let pid = p.pid;
+                        let f = p.get_dire();
+                        let pid = p.get_parent_id();
+                        let file_name = p.get_file_name();
                         if f.file_type().is_file() {
-                            let fpath = f.path(p.pbuf.as_ref());
                             let metadata = f.metadata();
                             if metadata.is_none() {
-                                eprintln!("cannot read metadata for: {:?}", fpath.as_path());
+                                eprintln!("cannot read metadata for: {:?}", file_name);
                                 continue;
                             }
                             if let Ok(mtime) = time_since_unix_epoch(metadata.unwrap()) {
@@ -434,20 +517,15 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                                     0,
                                     pid,
                                     mtime.subsec_nanos() as i64,
-                                    fpath.to_string_lossy().to_string(),
+                                    file_name.to_string_lossy().to_string(),
                                     rtype,
                                 );
-                                ns.send(node).expect("Failed to send node");
-                                // let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
-                                // present.insert(id);
+                                ns.send(NodeAtPath::new(node, p.get_path().clone()))?;
                             }
                         } else if f.file_type().is_dir() {
-                            let fpath = f.path(p.pbuf.as_ref()).to_string_lossy().to_string();
-                            let node = Node::new(0, pid, 0, fpath, Dir);
-                            ns.send(node).expect("Failed to send node");
-                            //let id = find_upsert_node(&mut insert_new_node, &mut find_node, &mut update_mtime, &node)?.get_id();
-                            //dir_id_by_path.insert(f.path(), id);
-                            //present.insert(id);
+                            let node =
+                                Node::new(0, pid, 0, file_name.to_string_lossy().to_string(), Dir);
+                            ns.send(NodeAtPath::new(node, p.get_path().clone()))?;
                         }
                     }
                     drop(ns);
@@ -464,50 +542,44 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                     let mut insert_new_node = tx.insert_node_prepare()?;
                     //let mut insert_dir = tx.insert_dir_prepare()?;
                     let mut find_node = tx.fetch_node_prepare()?;
+                    let mut insert_present = tx.insert_present_prepare()?;
                     let mut update_mtime = tx.update_mtime_prepare()?;
-                    for node in nodereceiver.iter() {
+                    for tnode in nodereceiver.iter() {
+                        let node = tnode.get_node();
                         if node.get_type() == &Dir {
                             let id: i64 = find_upsert_node(
                                 &mut insert_new_node,
                                 &mut find_node,
                                 &mut update_mtime,
+                                &mut insert_present,
                                 &node,
                             )?
                             .get_id();
-                            let p: PathBuf = PathBuf::from(node.get_name());
-                            //println!(" dir id for path:{:?} is {}", p.as_path(), id.clone());
-                            //dir_id_by_path.insert(p, id);
-                            diridsender.send((p, id))?;
-                            //present.insert(id);
+
+                            dirid_sender.send((tnode.get_hashed_path().clone(), id))?;
                         } else {
-                            let _id = find_upsert_node(
+                            find_upsert_node(
                                 &mut insert_new_node,
                                 &mut find_node,
                                 &mut update_mtime,
+                                &mut insert_present,
                                 &node,
-                            )?
-                            .get_id();
-                            //present.insert(id);
+                            )?;
                         }
                     }
-                    println!("node receiver exited");
                 }
                 tx.commit()?;
                 Ok(())
             });
         }
-        let (heapsender, heapreceiver) = crossbeam::channel::unbounded();
-        heapsender
-            .send(PayloadDir::new(
-                Arc::new(root.to_path_buf()),
-                heapsender.clone(),
-            ))
-            .unwrap();
-        drop(heapsender);
+        let (dirpayload_sender, dirpayload_receiver) = crossbeam::channel::unbounded();
+        let pl = PayloadDir::new(root_hash_path, dirpayload_sender.clone());
+        dirpayload_sender.send(pl)?;
+        drop(dirpayload_sender);
         let wg = WaitGroup::new();
         for _ in 0..MAX_THRS_DIRS {
-            let hr = heapreceiver.clone();
-            let ps = payloadsender.clone();
+            let hr = dirpayload_receiver.clone();
+            let ps = payload_sender.clone();
             {
                 let wg = wg.clone();
                 s.spawn(move |_| {
@@ -515,37 +587,36 @@ fn insert_direntries(root: &Path, present: &mut HashSet<i64>, conn: &mut Connect
                         walkdir_from(payloaddir.parent_path(), payloaddir.sender(), ps.clone());
                     }
                     drop(hr);
-                    //println!("done");
-                    //dc.fetch_add(1, Ordering::SeqCst);
                     drop(wg);
                 });
             }
         }
         wg.wait();
-        send_done.send(()).expect("Failed to send done msg");
+        send_done.send(())?;
+        Ok(())
     })
-    .expect("failed to spawn thread for dir insertion");
+    .expect("failed to spawn thread for dir insertion")
+    .expect("Failed to return from scope");
     Ok(())
 }
 
+/// This tracks the paths which have a available parent id, removes them from payloads, and dir_id_by_path and sends them over to write/query to/from db
 fn linkup_dbids(
     dire_sender: &Sender<ProtoNode>,
-    payloadset: &mut HashSet<Payload>,
-    dir_id_by_path: &mut HashMap<PathBuf, i64>,
-    remove_keys: &mut Vec<PathBuf>,
+    payload_set: &mut HashSet<Payload>,
+    dir_id_by_path: &mut HashMap<HashedPath, i64>,
+    remove_keys: &mut Vec<HashedPath>,
 ) -> Result<()> {
     for (parent_path, pid) in dir_id_by_path.iter() {
-        //let mut len = 0;
-        if let Some(payload) = payloadset.take(parent_path.as_path()) {
-            //println!(" -hx {:?} ", len-1);
+        if let Some(payload) = payload_set.take(parent_path) {
             remove_keys.push(parent_path.clone());
-            process_dir(payload, *pid, &dire_sender)?;
+            send_children(payload, *pid, &dire_sender)?;
         } else {
             //    println!("mishit:{:?}", parent_path);
         }
     }
     remove_keys.drain(..).for_each(|p| {
-        let _ = dir_id_by_path.remove(p.as_path());
+        let _ = dir_id_by_path.remove(&p);
     });
     Ok(())
 }

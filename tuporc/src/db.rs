@@ -2,7 +2,8 @@ use crate::db::RowType::TupF;
 use crate::db::StatementType::{
     AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode,
     FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath,
-    InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime,
+    InsertDir, InsertDirAux, InsertFile, InsertLink, InsertPresent, InsertStickyLink, UpdDirId,
+    UpdMTime,
 };
 use crate::make_node;
 use crate::RowType::Rule;
@@ -74,6 +75,7 @@ pub enum StatementType {
     InsertFile,
     InsertLink,
     InsertStickyLink,
+    InsertPresent,
     FindDirId,
     FindGroupId,
     FindNode,
@@ -103,6 +105,7 @@ pub(crate) trait LibSqlPrepare {
     fn insert_sticky_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_node_prepare(&self) -> Result<SqlStatement>;
+    fn insert_present_prepare(&self) -> Result<SqlStatement>;
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
@@ -145,6 +148,7 @@ pub(crate) trait LibSqlExec {
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     fn delete_exec_aux(&mut self, id: i64) -> Result<()>;
     fn delete_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    fn insert_present(&mut self, id: i64) -> Result<()>;
 }
 
 pub(crate) trait ForEachClauses {
@@ -297,6 +301,12 @@ SELECT node.id id, node.dir dir, node.mtime mtime, DIRPATHBUF.name || '/' || nod
     Ok(())
 }
 
+pub fn create_present_temptable(conn: &Connection) -> Result<()> {
+    let stmt = "DROP TABLE IF EXISTS PresentList; CREATE TEMPORARY TABLE PresentList(id  INTEGER PRIMARY KEY not NULL); ";
+    conn.execute_batch(stmt)?;
+    Ok(())
+}
+
 impl LibSqlPrepare for Transaction<'_> {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into ModifyList(id) Values (?)")?;
@@ -343,6 +353,14 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: InsertFile,
         })
     }
+    fn insert_present_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("insert into PresentList(id) Values (?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertPresent,
+        })
+    }
+
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id FROM DirPathBuf where name=?")?;
         Ok(SqlStatement {
@@ -415,7 +433,6 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: FindTupPath,
         })
     }
-
     fn fetch_rule_deps_prepare(&self) -> Result<SqlStatement> {
         let sqlstmt = format!("SELECT node.id, node.dir, node.mtime_ns, node.name, node.type from Node inner join normal_link on (node.id = normal_link.from_id)\
          where normal_link.from_id in (SELECT id in node where dir=? and type={})", Rule as u8);
@@ -425,6 +442,7 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: FindRuleDeps,
         })
     }
+
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
         let stmtstr = format!(
             "SELECT node.id from Node inner join normal_link on (node.id = normal_link.from_id)\
@@ -445,7 +463,6 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: UpdMTime,
         })
     }
-
     fn update_dirid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("UPDATE Node Set dir = ? where id = ?")?;
         Ok(SqlStatement {
@@ -453,7 +470,6 @@ impl LibSqlPrepare for Transaction<'_> {
             tok: UpdDirId,
         })
     }
-
     fn delete_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("DELETE FROM Node WHERE id=?")?;
         Ok(SqlStatement {
@@ -527,6 +543,15 @@ impl LibSqlPrepare for Connection {
             tok: InsertFile,
         })
     }
+
+    fn insert_present_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into PresentList(id) Values (?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertPresent,
+        })
+    }
+
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id FROM DirPathBuf where name=?")?;
         Ok(SqlStatement {
@@ -821,6 +846,14 @@ impl LibSqlExec for SqlStatement<'_> {
             "wrong token for delete rule links"
         );
         self.stmt.execute([rule_id, rule_id, rule_id, rule_id])?;
+        Ok(())
+    }
+    fn insert_present(&mut self, id: i64) -> Result<()> {
+        anyhow::ensure!(
+            self.tok == InsertPresent,
+            "wrong token for delete rule links"
+        );
+        self.stmt.execute([id])?;
         Ok(())
     }
 }
