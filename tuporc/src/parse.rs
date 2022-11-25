@@ -69,7 +69,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     create_tup_path_buf_temptable(conn)?;
     //create_tup_outputs(conn)?;
 
-    let rootfolder = tupparser::transform::locate_file(root.as_ref(), "Tupfile.ini")
+    let rootfolder = tupparser::transform::locate_file(root.as_ref(), "Tupfile.ini", "")
         .ok_or(tupparser::errors::Error::RootNotFound)?;
     let confvars = load_conf_vars(rootfolder.as_path())?;
     conn.for_changed_or_created_tup_node_with_path(|n: Node| {
