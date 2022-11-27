@@ -1,5 +1,10 @@
 use crate::db::RowType::TupF;
-use crate::db::StatementType::{AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertModify, InsertPresent, InsertStickyLink, UpdDirId, UpdMTime};
+use crate::db::StatementType::{
+    AddToMod, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode,
+    FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, FindRuleDeps, FindTupPath,
+    InsertDir, InsertDirAux, InsertFile, InsertLink, InsertModify, InsertPresent, InsertStickyLink,
+    UpdDirId, UpdMTime,
+};
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
@@ -146,7 +151,6 @@ pub(crate) trait LibSqlExec {
     fn delete_rule_links(&mut self, rule_id: i64) -> Result<()>;
     fn insert_present(&mut self, id: i64) -> Result<()>;
     fn insert_modify(&mut self, id: i64) -> Result<()>;
-
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -231,20 +235,27 @@ pub fn init_db() {
         (),
     )
         .expect("Table already exists.");
+    // NodeLink has links between tup files/rules/groups etc
     conn.execute(
         "CREATE TABLE NodeLink (from_id INTEGER, to_id INTEGER, \
           PRIMARY KEY (from_id, to_id) ); ",
         (),
     )
     .expect("Failed to create NodeLink Table");
+
+    // Above table is indexed based on to_id
     conn.execute("CREATE INDEX NodeLink_To ON NodeLink(to_id);", ())
         .expect("Failed to create index on NodeLinkTable");
+
+    // StickyLinks are static links
     conn.execute(
         "CREATE TABLE StickyLink (from_id INTEGER, to_id INTEGER,\
      PRIMARY KEY (from_id, to_id)); ",
         (),
     )
     .expect("Failed to create StickyLink Table");
+
+    // Var table has env variables
     conn.execute(
         "CREATE TABLE Var ( id INTEGER PRIMARY KEY, value VARCHAR);",
         (),
@@ -292,7 +303,7 @@ pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!("
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TEMPORARY TABLE TUPPATHBUF AS
-SELECT node.id id, node.dir dir, node.mtime mtime, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
+SELECT node.id id, node.dir dir, node.mtime_ns mtime, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
 (NODE.dir = DIRPATHBUF.id and node.type={})", TupF as u8);
     conn.execute_batch(stmt.as_str())?;
     Ok(())
@@ -306,7 +317,6 @@ pub fn create_present_temptable(conn: &Connection) -> Result<()> {
     conn.execute_batch(stmt)?;
     Ok(())
 }
-
 
 impl LibSqlPrepare for Connection {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
@@ -370,7 +380,6 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id FROM DirPathBuf where name=?")?;
         Ok(SqlStatement {
@@ -379,7 +388,7 @@ impl LibSqlPrepare for Connection {
         })
     }
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT id from GRPPATHBUF  where name='?'))")?;
+        let stmt = self.prepare("SELECT id from GRPPATHBUF  where name='?'")?;
         Ok(SqlStatement {
             stmt,
             tok: FindGroupId,
@@ -921,5 +930,4 @@ impl MiscStatements for Connection {
         stmt.execute([])?;
         Ok(())
     }
-
 }

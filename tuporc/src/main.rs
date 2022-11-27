@@ -1,6 +1,7 @@
 extern crate bimap;
 extern crate clap;
 extern crate crossbeam;
+extern crate env_logger;
 extern crate num;
 #[macro_use]
 extern crate num_derive;
@@ -94,7 +95,8 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-
+    env_logger::init();
+    log::info!("Sqlite version: {}\n", rusqlite::version());
     if let Some(act) = args.command {
         match act {
             Action::Init => {
@@ -397,7 +399,7 @@ fn send_children(mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>) -> Resu
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     db::create_present_temptable(conn)?;
-    println!("Sqlite version: {}\n", rusqlite::version());
+    log::debug!("Inserting/updating directory entries to db");
     {
         let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
         let n = existing_node.map(|n| n.get_id());
@@ -405,7 +407,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             let mut insert_dir = conn.insert_dir_prepare()?;
             let id = insert_dir.insert_dir_exec(".", 0)?;
             id
-        }else {
+        } else {
             n.unwrap()
         };
         anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
@@ -471,11 +473,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                         }
                     }
                     if !payload_set.is_empty() || !dir_id_by_path.is_empty() {
-                        linkup_dbids(
-                            &dire_sender,
-                            &mut payload_set,
-                            &mut dir_id_by_path,
-                        )?;
+                        linkup_dbids(&dire_sender, &mut payload_set, &mut dir_id_by_path)?;
                     } else if end_payload_work {
                         break;
                     }
@@ -605,7 +603,6 @@ fn linkup_dbids(
     payload_set: &mut HashSet<Payload>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
 ) -> Result<()> {
-
     dir_id_by_path.
         retain(|p, id|
             // warning this is a predicate with side effects.. :-(

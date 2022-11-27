@@ -6,6 +6,8 @@ use crate::RowType::Rule;
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
 use bimap::BiMap;
+use log;
+use log::debug;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
@@ -77,7 +79,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         tupfiles.push(n);
         Ok(())
     })?;
-    let mut parser = TupParser::new_from(rootfolder, confvars);
+    let mut parser = TupParser::new_from(rootfolder.parent().unwrap(), confvars);
     let mut arts = gather_rules_from_tupfiles(&mut parser, &mut tupfiles)?;
 
     let mut crossref = CrossRefMaps::default();
@@ -97,6 +99,7 @@ fn gather_rules_from_tupfiles(p: &mut TupParser, tupfiles: &mut [Node]) -> Resul
     let mut new_arts = Artifacts::new();
     for tupfile_node in tupfiles.iter() {
         // try fetching statements in this tupfile already in the database to avoid inserting same rules again
+        debug!("parsing {}", tupfile_node.get_name());
         let arts = p.parse(tupfile_node.get_name())?;
         new_arts.merge(arts)?;
         //new_outputs.merge(&o)?;
@@ -186,7 +189,11 @@ fn add_rule_links(
                             inp_linker.insert_sticky_link(group_id, rule_node_id)?;
                             added = true;
                         }
-                    }
+                    } /*InputResolvedType::RawUnchecked(p) => {
+                          if let Some(id) = crossref.get_path_db_id(p) {
+                              inp_linker.insert_sticky_link(id, rule_node_id)?;
+                          }
+                      } */
                 }
                 if !added {
                     let fname = rbuf.get_input_path_str(i);
