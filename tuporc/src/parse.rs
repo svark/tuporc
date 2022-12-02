@@ -11,26 +11,10 @@ use log::debug;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
-use tupparser::decode::{
-    GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink, RuleDescriptor,
-};
-use tupparser::transform::{load_conf_vars, Artifacts, TupParser};
+use tupparser::{Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink, RuleDescriptor, TupParser};
 
-/*
-pub fn get_group_providers(
-    conn: &Connection,
-    groupid: i64,
-    rtype: Option<RowType>,
-) -> Result<Vec<i64>> {
-    let mut results = Vec::new();
-    conn.for_each_grp_nodeid_provider(groupid, rtype, |n| {
-        results.push(n);
-        Ok(())
-    })?;
-    Ok(results)
-}
-*/
-// CrossRefMaps track database ids of paths, groups and rules using BiMap
+// CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
+// These are two ways maps, so you can query both ways
 #[derive(Debug, Clone, Default)]
 pub struct CrossRefMaps {
     gbo: BiMap<GroupPathDescriptor, i64>,
@@ -60,7 +44,7 @@ impl CrossRefMaps {
     }
 }
 
-// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
+/// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
 pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     conn: &mut Connection,
     root: P,
@@ -71,15 +55,12 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     create_tup_path_buf_temptable(conn)?;
     //create_tup_outputs(conn)?;
 
-    let rootfolder = tupparser::transform::locate_file(root.as_ref(), "Tupfile.ini", "")
-        .ok_or(tupparser::errors::Error::RootNotFound)?;
-    let confvars = load_conf_vars(rootfolder.as_path())?;
     conn.for_changed_or_created_tup_node_with_path(|n: Node| {
         // name stores full path here
         tupfiles.push(n);
         Ok(())
     })?;
-    let mut parser = TupParser::new_from(rootfolder.parent().unwrap(), confvars);
+    let mut parser = TupParser::try_new_from(root)?;
     let mut arts = gather_rules_from_tupfiles(&mut parser, &mut tupfiles)?;
 
     let mut crossref = CrossRefMaps::default();
@@ -189,11 +170,7 @@ fn add_rule_links(
                             inp_linker.insert_sticky_link(group_id, rule_node_id)?;
                             added = true;
                         }
-                    } /*InputResolvedType::RawUnchecked(p) => {
-                          if let Some(id) = crossref.get_path_db_id(p) {
-                              inp_linker.insert_sticky_link(id, rule_node_id)?;
-                          }
-                      } */
+                    }
                 }
                 if !added {
                     let fname = rbuf.get_input_path_str(i);
@@ -208,10 +185,10 @@ fn add_rule_links(
                 }
             }
             {
-                for i in rl.get_targets() {
+                for t in rl.get_targets() {
                     let p = crossref
-                        .get_path_db_id(i)
-                        .unwrap_or_else(|| panic!("failed to fetch db id of path {}", i));
+                        .get_path_db_id(t)
+                        .unwrap_or_else(|| panic!("failed to fetch db id of path {}", t));
                     out_linker.insert_link(rule_node_id, p)?;
                 }
             }
