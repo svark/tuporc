@@ -1,11 +1,15 @@
-use crate::db::StatementType::{AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule,  InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
+use crate::db::RowType::{Grp, TupF};
+use crate::db::StatementType::{
+    AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId,
+    FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, InsertDir,
+    InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime,
+};
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
 use rusqlite::{Connection, Params, Statement};
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
-use crate::db::RowType::{Grp, TupF};
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, FromPrimitive)]
 pub enum RowType {
@@ -34,7 +38,7 @@ pub struct Node {
     name: String,
     rtype: RowType,
     display_str: String,
-    flags : String,
+    flags: String,
     srcid: i64,
 }
 impl Node {
@@ -45,56 +49,64 @@ impl Node {
             mtime,
             name,
             rtype,
-            display_str : "".to_string(),
+            display_str: "".to_string(),
             flags: "".to_string(),
-            srcid:-1
+            srcid: -1,
         }
     }
     pub fn copy_from(id: i64, n: &Node) -> Node {
         Node {
             id,
-            pid:n.pid,
-            mtime:n.mtime,
-            name:n.name.clone(),
-            rtype:n.rtype,
-            display_str : n.display_str.clone(),
+            pid: n.pid,
+            mtime: n.mtime,
+            name: n.name.clone(),
+            rtype: n.rtype,
+            display_str: n.display_str.clone(),
             flags: n.flags.clone(),
-            srcid:n.srcid
+            srcid: n.srcid,
         }
     }
-    pub fn new_file_or_genf(id: i64, pid: i64, mtime: i64, name: String, rtype: RowType, srcid: i64) -> Node {
+    pub fn new_file_or_genf(
+        id: i64,
+        pid: i64,
+        mtime: i64,
+        name: String,
+        rtype: RowType,
+        srcid: i64,
+    ) -> Node {
         Node {
             id,
             pid,
             mtime,
             name,
             rtype,
-            display_str : "".to_string(),
+            display_str: "".to_string(),
             flags: "".to_string(),
-            srcid
+            srcid,
         }
-    }pub fn new_rule(id: i64, pid: i64, name: String, display_str: String, flags: String) -> Node {
+    }
+    pub fn new_rule(id: i64, pid: i64, name: String, display_str: String, flags: String) -> Node {
         Node {
             id,
             pid,
-            mtime:0,
+            mtime: 0,
             name,
-            rtype:Grp,
+            rtype: Grp,
             display_str,
             flags,
-            srcid:-1
+            srcid: -1,
         }
     }
     pub fn new_grp(id: i64, pid: i64, name: String) -> Node {
         Node {
             id,
             pid,
-            mtime:0,
+            mtime: 0,
             name,
-            rtype:Grp,
-            display_str:"".to_string(),
+            rtype: Grp,
+            display_str: "".to_string(),
             flags: "".to_string(),
-            srcid:-1
+            srcid: -1,
         }
     }
     pub fn get_id(&self) -> i64 {
@@ -493,8 +505,10 @@ impl LibSqlPrepare for Connection {
 
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
         let rty = Rule as u8;
-        let stmtstr = format!("SELECT id FROM Node where type={rty} and id in \
-        SELECT from_id from NormalLink where to_id = ?");
+        let stmtstr = format!(
+            "SELECT id FROM Node where type={rty} and id in \
+        SELECT from_id from NormalLink where to_id = ?"
+        );
         let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
             stmt,
@@ -549,7 +563,7 @@ impl LibSqlPrepare for Connection {
 impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         anyhow::ensure!(self.tok == AddToMod, "wrong token for update to modifylist");
-        self.stmt.insert((id, (rtype as u8)) )?;
+        self.stmt.insert((id, (rtype as u8)))?;
         Ok(())
     }
     fn add_to_delete_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
@@ -557,8 +571,11 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.insert((id, (rtype as u8)))?;
         Ok(())
     }
-    fn add_to_present_exec(&mut self, id: i64, rtype:RowType) -> Result<()> {
-        anyhow::ensure!(self.tok == AddToPres, "wrong token for update to presentlist");
+    fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
+        anyhow::ensure!(
+            self.tok == AddToPres,
+            "wrong token for update to presentlist"
+        );
         self.stmt.insert((id, (rtype as u8)))?;
         Ok(())
     }
@@ -597,9 +614,15 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
         anyhow::ensure!(self.tok == InsertFile, "wrong token for Insert file");
-        let r = self
-            .stmt
-            .insert((n.pid, n.name.as_str(), n.mtime, (*n.get_type() as u8), n.get_display_str(), n.get_flags(), n.get_srcid()))?;
+        let r = self.stmt.insert((
+            n.pid,
+            n.name.as_str(),
+            n.mtime,
+            (*n.get_type() as u8),
+            n.get_display_str(),
+            n.get_flags(),
+            n.get_srcid(),
+        ))?;
         Ok(r)
     }
 
@@ -625,9 +648,7 @@ impl LibSqlExec for SqlStatement<'_> {
         anyhow::ensure!(self.tok == FindNode, "wrong token for fetch node");
         log::info!("query for node:{:?}, {:?}", node_name, dir);
 
-        let node = self
-            .stmt
-            .query_row((dir, node_name), make_node)?;
+        let node = self.stmt.query_row((dir, node_name), make_node)?;
         Ok(node)
     }
 
@@ -643,7 +664,6 @@ impl LibSqlExec for SqlStatement<'_> {
         let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
         Ok(nodeid)
     }
-
 
     fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>> {
         anyhow::ensure!(self.tok == FindNodes, "wrong token for fetch nodes");
@@ -774,14 +794,14 @@ impl ForEachClauses for Connection {
     {
         if let Some(rty) = rtype {
             let rty = rty as u8;
-            let mut stmt = self.prepare( &format!(
+            let mut stmt = self.prepare(&format!(
                 "SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
          where  Node.type = {rty} and Node.id in\
          (SELECT from_id from NormalLink where to_id = {group_id} "
             ))?;
             Self::for_id([], f, &mut stmt)?;
         } else {
-            let mut stmt = self.prepare( &format!(
+            let mut stmt = self.prepare(&format!(
                 "SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
          where  Node.id in\
          (SELECT from_id from NormalLink where to_id  = {group_id}",
@@ -865,7 +885,7 @@ impl ForEachClauses for Connection {
             let i = row.get(0)?;
             let dir: i64 = row.get(1)?;
             let name: String = row.get(2)?;
-            mut_f(Node::new(i, dir, 0, name, TupF,))?;
+            mut_f(Node::new(i, dir, 0, name, TupF))?;
         }
         Ok(())
     }
@@ -901,7 +921,7 @@ impl ForEachClauses for Connection {
                  in foreach node query",
                 )
             })?;
-            mut_f(Node::new(i, dir, 0, name, rty,))?;
+            mut_f(Node::new(i, dir, 0, name, rty))?;
         }
         Ok(())
     }

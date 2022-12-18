@@ -1,4 +1,8 @@
-use crate::db::{create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable, ForEachClauses, LibSqlExec, SqlStatement};
+use crate::db::RowType::{File, GenF};
+use crate::db::{
+    create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
+    ForEachClauses, LibSqlExec, SqlStatement,
+};
 use crate::RowType::Rule;
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
@@ -8,8 +12,10 @@ use log::debug;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
-use tupparser::{Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink, RuleDescriptor, TupParser};
-use crate::db::RowType::{File, GenF};
+use tupparser::{
+    Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink,
+    RuleDescriptor, TupParser,
+};
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
@@ -91,12 +97,11 @@ fn gather_rules_from_tupfiles(p: &mut TupParser, tupfiles: &mut [Node]) -> Resul
     }
     Ok(new_arts)
 }
-pub (crate) fn gather_rules_to_run(conn : &mut Connection) -> Result<()>
-{
+pub(crate) fn gather_rules_to_run(conn: &mut Connection) -> Result<()> {
     let rule_nodes = conn.rules_to_run()?;
     for rule_node in rule_nodes {
-      println!("{}", rule_node.get_name());
-}
+        println!("{}", rule_node.get_name());
+    }
     Ok(())
 }
 fn check_uniqueness_of_parent_rule(
@@ -229,7 +234,7 @@ fn fetch_group_provider_outputs(
     for (group_desc, groupid) in gids {
         conn.for_each_grp_node_provider(groupid, Some(RowType::GenF), |node| -> Result<()> {
             // name of node is actually its path
-                // merge providers of this group from all available in db
+            // merge providers of this group from all available in db
             let pd = wbuf.add_path_from_root(Path::new(node.get_name())).0;
             arts.add_group_entry(&group_desc, pd);
             Ok(())
@@ -288,7 +293,7 @@ fn insert_nodes(
                 if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
                     crossref.add_rule_xref(*rule_desc, nodeid);
                 } else {
-                    rules_to_insert.push(Node::new_rule(isz as i64, dir,  name, display_str, flags));
+                    rules_to_insert.push(Node::new_rule(isz as i64, dir, name, display_str, flags));
                 }
             };
         let mut collect_nodes_to_insert = |p: &PathDescriptor,
@@ -317,14 +322,14 @@ fn insert_nodes(
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
-                    paths_to_insert.push(Node::new_file_or_genf(
+                paths_to_insert.push(Node::new_file_or_genf(
                     isz as i64,
                     dir,
                     mtime_ns,
                     path.as_path().to_string_lossy().to_string(),
                     rtype.clone(),
-                    srcid
-                    ));
+                    srcid,
+                ));
             }
             Ok(())
         };
@@ -400,21 +405,22 @@ pub(crate) fn find_upsert_node(
     let db_node = find_node_id
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
-            let node = insert_node.insert_node_exec(&node).map(|i| {
-                Node::copy_from(
-                    i,
-                    node
-                )
-            })?;
+            let node = insert_node
+                .insert_node_exec(&node)
+                .map(|i| Node::copy_from(i, node))?;
             add_to_modify.add_to_modify_exec(node.get_id(), node.get_type().clone())?;
             Ok::<Node, anyhow::Error>(node)
         })
         .and_then(|existing_node| {
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
                 update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
-                add_to_modify.add_to_modify_exec(existing_node.get_id(), existing_node.get_type().clone())?;
-            }else {
-                add_to_present.add_to_present_exec(existing_node.get_id(), existing_node.get_type().clone())?;
+                add_to_modify
+                    .add_to_modify_exec(existing_node.get_id(), existing_node.get_type().clone())?;
+            } else {
+                add_to_present.add_to_present_exec(
+                    existing_node.get_id(),
+                    existing_node.get_type().clone(),
+                )?;
             }
             Ok(existing_node)
         })?;

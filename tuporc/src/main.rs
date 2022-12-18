@@ -457,11 +457,11 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                     let mut sel = crossbeam::channel::Select::new();
                     let (index_dirs_done, index_dir_receiver) = if end_dirs {
                         (usize::MAX, usize::MAX)
-                    }else {
+                    } else {
                         (sel.recv(&recv_dirs_done), sel.recv(&dirid_receiver))
                     };
 
-                    let (index_dir_children_done, index_dir_children_recv)  = if end_dir_children {
+                    let (index_dir_children_done, index_dir_children_recv) = if end_dir_children {
                         (usize::MAX, usize::MAX)
                     } else {
                         (sel.recv(&recv_done), sel.recv(&dir_children_receiver))
@@ -474,8 +474,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                 log::debug!("no more dirs expected");
                                 break;
                             }
-                        }
-                        else if oper.index() == index_dir_receiver {
+                        } else if oper.index() == index_dir_receiver {
                             oper.recv(&dirid_receiver)
                                 .map(|(p, id)| dir_id_by_path.insert(p, id))?;
                             changed = true;
@@ -495,7 +494,13 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                         }
                     }
                     if !dir_children_collection.is_empty() || !dir_id_by_path.is_empty() {
-                        if changed { linkup_dbids(&dire_sender, &mut dir_children_collection, &mut dir_id_by_path)?; }
+                        if changed {
+                            linkup_dbids(
+                                &dire_sender,
+                                &mut dir_children_collection,
+                                &mut dir_id_by_path,
+                            )?;
+                        }
                     } else if end_dir_children {
                         break;
                     }
@@ -554,7 +559,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             // Nodes are expected to have parent dir ids.
             // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
             s.spawn(move |_| -> Result<()> {
-                let res =  add_modify_nodes(conn, nodereceiver, dirid_sender);
+                let res = add_modify_nodes(conn, nodereceiver, dirid_sender);
                 let done = send_dirs_done.send(()).map_err(anyhow::Error::new);
                 res.and(done)
             });
