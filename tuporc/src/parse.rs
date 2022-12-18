@@ -1,7 +1,4 @@
-use crate::db::{
-    create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
-    ForEachClauses, LibSqlExec, SqlStatement,
-};
+use crate::db::{create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable, ForEachClauses, LibSqlExec, SqlStatement};
 use crate::RowType::Rule;
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
@@ -12,6 +9,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use tupparser::{Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink, RuleDescriptor, TupParser};
+use crate::db::RowType::{File, GenF};
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
@@ -71,6 +69,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     add_links_to_groups(conn, &arts, &crossref)?;
     fetch_group_provider_outputs(conn, &parser, &mut arts, &mut crossref)?;
     add_rule_links(conn, &parser, &arts, &mut crossref)?;
+    //let rules = gather_rules_to_run(conn)?;
 
     Ok(Vec::new())
 }
@@ -92,7 +91,14 @@ fn gather_rules_from_tupfiles(p: &mut TupParser, tupfiles: &mut [Node]) -> Resul
     }
     Ok(new_arts)
 }
-
+pub (crate) fn gather_rules_to_run(conn : &mut Connection) -> Result<()>
+{
+    let rule_nodes = conn.rules_to_run()?;
+    for rule_node in rule_nodes {
+      println!("{}", rule_node.get_name());
+}
+    Ok(())
+}
 fn check_uniqueness_of_parent_rule(
     conn: &mut Connection,
     parser: &TupParser,
@@ -221,14 +227,11 @@ fn fetch_group_provider_outputs(
         .collect::<Vec<_>>();
     let mut wbuf = parser.write_buf();
     for (group_desc, groupid) in gids {
-        conn.for_each_grp_node_provider(groupid, None, |node| -> Result<()> {
+        conn.for_each_grp_node_provider(groupid, Some(RowType::GenF), |node| -> Result<()> {
             // name of node is actually its path
-            if *node.get_type() == RowType::GenF {
                 // merge providers of this group from all available in db
-                let pd = wbuf.add_path_from_root(Path::new(node.get_name())).0;
-                arts.add_group_entry(&group_desc, pd);
-            }
-
+            let pd = wbuf.add_path_from_root(Path::new(node.get_name())).0;
+            arts.add_group_entry(&group_desc, pd);
             Ok(())
         })?;
     }
@@ -262,12 +265,10 @@ fn insert_nodes(
                 } else {
                     // gather groups that are not in the db yet.
                     let isz: usize = (*grp_id).into();
-                    groups_to_insert.push(Node::new(
+                    groups_to_insert.push(Node::new_grp(
                         isz as i64,
                         dir,
-                        0,
                         group_path.as_path().to_string_lossy().to_string(),
-                        RowType::Grp,
                     ));
                 }
             }
@@ -279,19 +280,21 @@ fn insert_nodes(
              dir: i64,
              crossref: &mut CrossRefMaps,
              find_nodeid: &mut SqlStatement| {
-                let typ = Rule;
                 let isz: usize = (*rule_desc).into();
                 let rformula = rbuf.get_rule(rule_desc);
-                let name = format!("{}", rformula);
+                let name = rformula.get_rule_str();
+                let display_str = rformula.get_display_str();
+                let flags = rformula.get_flags();
                 if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
                     crossref.add_rule_xref(*rule_desc, nodeid);
                 } else {
-                    rules_to_insert.push(Node::new(isz as i64, dir, 0, name, typ));
+                    rules_to_insert.push(Node::new_rule(isz as i64, dir,  name, display_str, flags));
                 }
             };
         let mut collect_nodes_to_insert = |p: &PathDescriptor,
-                                           typ: &RowType,
+                                           rtype: &RowType,
                                            mtime_ns: i64,
+                                           srcid: i64,
                                            crossref: &mut CrossRefMaps,
                                            find_nodeid: &mut SqlStatement|
          -> Result<()> {
@@ -314,13 +317,14 @@ fn insert_nodes(
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
-                paths_to_insert.push(Node::new(
+                    paths_to_insert.push(Node::new_file_or_genf(
                     isz as i64,
                     dir,
                     mtime_ns,
                     path.as_path().to_string_lossy().to_string(),
-                    *typ,
-                ));
+                    rtype.clone(),
+                    srcid
+                    ));
             }
             Ok(())
         };
@@ -332,15 +336,16 @@ fn insert_nodes(
                 let rd = rl.get_rule_desc();
                 collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid);
                 for p in rl.get_targets() {
-                    collect_nodes_to_insert(p, &RowType::GenF, mtime, crossref, &mut find_nodeid)?;
+                    collect_nodes_to_insert(p, &GenF, mtime, dir, crossref, &mut find_nodeid)?;
                 }
 
                 for i in rl.get_sources() {
                     if let InputResolvedType::Deglob(mp) = i {
                         collect_nodes_to_insert(
                             mp.path_descriptor(),
-                            &RowType::File,
+                            &File,
                             mtime,
+                            -1, /*srcid*/
                             crossref,
                             &mut find_nodeid,
                         )?;
@@ -354,8 +359,8 @@ fn insert_nodes(
         let mut insert_node = tx.insert_node_prepare()?;
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
-        let mut insert_present = tx.insert_present_prepare()?;
-        let mut insert_modify = tx.insert_modify_prepare()?;
+        let mut add_to_present = tx.add_to_present_prepare()?;
+        let mut add_to_modify = tx.add_to_modify_prepare()?;
         for node in groups_to_insert
             .into_iter()
             .chain(paths_to_insert.into_iter())
@@ -366,8 +371,8 @@ fn insert_nodes(
                 &mut insert_node,
                 &mut find_node,
                 &mut update_mtime,
-                &mut insert_present,
-                &mut insert_modify,
+                &mut add_to_present,
+                &mut add_to_modify,
                 &node,
             )?
             .get_id();
@@ -388,32 +393,29 @@ pub(crate) fn find_upsert_node(
     insert_node: &mut SqlStatement,
     find_node_id: &mut SqlStatement,
     update_mtime: &mut SqlStatement,
-    insert_present: &mut SqlStatement,
-    insert_modify: &mut SqlStatement,
+    add_to_present: &mut SqlStatement,
+    add_to_modify: &mut SqlStatement,
     node: &Node,
 ) -> Result<Node> {
     let db_node = find_node_id
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
-            //eprintln!("n:{:?}", e);
             let node = insert_node.insert_node_exec(&node).map(|i| {
-                Node::new(
+                Node::copy_from(
                     i,
-                    node.get_pid(),
-                    node.get_mtime(),
-                    node.get_name().to_string(),
-                    *node.get_type(),
+                    node
                 )
             })?;
-            insert_modify.insert_modify(node.get_id())?;
+            add_to_modify.add_to_modify_exec(node.get_id(), node.get_type().clone())?;
             Ok::<Node, anyhow::Error>(node)
         })
         .and_then(|existing_node| {
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
                 update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
-                insert_modify.insert_modify(existing_node.get_id())?;
+                add_to_modify.add_to_modify_exec(existing_node.get_id(), existing_node.get_type().clone())?;
+            }else {
+                add_to_present.add_to_present_exec(existing_node.get_id(), existing_node.get_type().clone())?;
             }
-            insert_present.insert_present(existing_node.get_id())?;
             Ok(existing_node)
         })?;
     Ok(db_node)
@@ -437,15 +439,15 @@ fn add_links_to_groups(
                 }
             }
         }
-        for i in rl.get_sources() {
+        /*for i in rl.get_sources() {
             if let InputResolvedType::GroupEntry(g, p) = i {
                 if let Some(group_id) = crossref.get_group_db_id(g) {
                     if let Some(pid) = crossref.get_path_db_id(p) {
-                        inp_linker.insert_link(pid, group_id)?;
+                        inp_linker.insert_link(pid, GenF, group_id, Grp)?;
                     }
                 }
             }
-        }
+        }*/
     }
     Ok(())
 }

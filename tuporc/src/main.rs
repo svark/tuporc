@@ -23,7 +23,7 @@ use std::vec::Drain;
 
 use anyhow::Result;
 use clap::Parser;
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::WaitGroup;
 use crossbeam::thread;
 use rusqlite::{Connection, Row};
@@ -35,7 +35,7 @@ use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
 
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
-use crate::parse::{find_upsert_node, parse_tupfiles_in_db};
+use crate::parse::{find_upsert_node, gather_rules_to_run, parse_tupfiles_in_db};
 
 mod db;
 mod parse;
@@ -76,9 +76,9 @@ fn is_tupfile(s: &OsStr) -> bool {
 fn make_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;
     let pid: i64 = row.get(1)?;
-    let mtime: i64 = row.get(2)?;
+    let rtype: i8 = row.get(2)?;
     let name: String = row.get(3)?;
-    let rtype: i8 = row.get(4)?;
+    let mtime: i64 = row.get(4)?;
     let rtype = match rtype {
         0 => RowType::File,
         1 => RowType::Rule,
@@ -91,6 +91,15 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
         _ => panic!("Invalid type {} for row with id:{}", rtype, id),
     };
     Ok(Node::new(id, pid, mtime, name, rtype))
+}
+fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
+    let id: i64 = row.get(0)?;
+    let pid: i64 = row.get(1)?;
+    let name: String = row.get(2)?;
+    let display_str: String = row.get(3)?;
+    let flags: String = row.get(4)?;
+
+    Ok(Node::new_rule(id, pid, name, display_str, flags))
 }
 
 fn main() -> Result<()> {
@@ -132,6 +141,18 @@ fn main() -> Result<()> {
             }
             Action::Upd { target } => {
                 println!("Updating db {}", target.join(" "));
+                let mut conn = Connection::open(".tup/db")
+                    .expect("Connection to tup database in .tup/db could not be established");
+                if !is_initialized(&conn) {
+                    return Err(anyhow::Error::msg(
+                        "Tup database is not initialized, use `tup init' to initialize",
+                    ));
+                }
+                let root = current_dir()?;
+                println!("Parsing tupfiles in database");
+                scan_root(root.as_path(), &mut conn)?;
+                parse_tupfiles_in_db(&mut conn, root.as_path())?;
+                let _nodes = gather_rules_to_run(&mut conn)?;
             }
         }
     }
@@ -248,26 +269,26 @@ impl HashedPath {
 }
 
 #[derive(Debug)]
-struct Payload {
+struct DirChldren {
     parent_path: HashedPath,
     children: Vec<DirE>,
 }
 #[derive(Debug)]
-struct PayloadDir {
+struct DirSender {
     parent_path: HashedPath,
-    sender: Sender<PayloadDir>,
+    sender: Sender<DirSender>,
 }
 
-impl Eq for Payload {}
-impl Hash for Payload {
+impl Eq for DirChldren {}
+impl Hash for DirChldren {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.parent_path.hash(state)
     }
 }
 
-impl Payload {
-    pub fn new(parent_path: HashedPath, children: Vec<DirE>) -> Payload {
-        Payload {
+impl DirChldren {
+    pub fn new(parent_path: HashedPath, children: Vec<DirE>) -> DirChldren {
+        DirChldren {
             parent_path,
             children,
         }
@@ -281,9 +302,9 @@ impl Payload {
     }
 }
 
-impl PayloadDir {
-    pub fn new(parent_path: HashedPath, sender: Sender<PayloadDir>) -> PayloadDir {
-        PayloadDir {
+impl DirSender {
+    pub fn new(parent_path: HashedPath, sender: Sender<DirSender>) -> DirSender {
+        DirSender {
             parent_path,
             sender,
         }
@@ -292,7 +313,7 @@ impl PayloadDir {
     fn parent_path(&self) -> HashedPath {
         self.parent_path.clone()
     }
-    fn sender(&self) -> &Sender<PayloadDir> {
+    fn sender(&self) -> &Sender<DirSender> {
         &self.sender
     }
 }
@@ -350,59 +371,58 @@ impl PartialEq<Self> for HashedPath {
 }
 impl Eq for HashedPath {}
 
-impl PartialEq<Self> for Payload {
+impl PartialEq<Self> for DirChldren {
     fn eq(&self, other: &Self) -> bool {
         self.parent_path() == other.parent_path()
     }
 }
 
-impl PartialEq<Self> for PayloadDir {
+impl PartialEq<Self> for DirSender {
     fn eq(&self, other: &Self) -> bool {
         self.parent_path() == other.parent_path()
     }
 }
 
-impl Borrow<HashedPath> for Payload {
+impl Borrow<HashedPath> for DirChldren {
     fn borrow(&self) -> &HashedPath {
         self.parent_path()
     }
 }
 
-fn walkdir_from(root: HashedPath, hs: &Sender<PayloadDir>, ps: Sender<Payload>) {
+fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChldren>) -> Result<()> {
     let mut children = Vec::new();
-    WalkDir::new(root.as_ref())
+    for e in WalkDir::new(root.as_ref())
         .follow_links(true)
         //.skip_hidden(true)
         .min_depth(1)
         .max_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
-        .for_each(|e: DirEntry| {
-            let pp = HashedPath::from(e.path().to_path_buf());
-            let cur_path = pp.clone();
-            let pdir = PayloadDir::new(pp, hs.clone());
-            if e.file_type().is_dir() {
-                hs.send(pdir).unwrap();
-            }
-            children.push(DirE::new(e, cur_path))
-        });
-    let payload = Payload::new(root, children);
-    ps.send(payload).unwrap();
+    {
+        let pp = HashedPath::from(e.path().to_path_buf());
+        let cur_path = pp.clone();
+        let pdir = DirSender::new(pp, hs.clone());
+        if e.file_type().is_dir() {
+            hs.send(pdir)?;
+        }
+        children.push(DirE::new(e, cur_path))
+    }
+    ps.send(DirChldren::new(root, children))?;
+    Ok(())
 }
 
-fn send_children(mut payload: Payload, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
-    for p in payload.get_children() {
+fn send_children(mut dir_children: DirChldren, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
+    for p in dir_children.get_children() {
         ds.send(ProtoNode::new(p, pid))?;
     }
     Ok(())
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
-    db::create_present_temptable(conn)?;
     log::debug!("Inserting/updating directory entries to db");
+    db::create_temptables(conn)?;
     {
-        let existing_node = conn.fetch_node_prepare()?.fetch_node(".", 0).ok();
-        let n = existing_node.map(|n| n.get_id());
+        let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
         let n = if n.is_none() {
             let mut insert_dir = conn.insert_dir_prepare()?;
             let id = insert_dir.insert_dir_exec(".", 0)?;
@@ -411,70 +431,72 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             n.unwrap()
         };
         anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
-        conn.insert_present_prepare()?.insert_present(n)?;
+        conn.add_to_present_prepare()?
+            .add_to_present_exec(n, RowType::Dir)?;
     }
 
+    // Begin processessing
     thread::scope(|s| -> Result<()> {
         let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
         let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
+        let (send_dirs_done, recv_dirs_done) = crossbeam::channel::bounded(0);
         let (send_done, recv_done) = crossbeam::channel::bounded(0);
-        let mut payload_set = HashSet::new();
+        let mut dir_children_collection = HashSet::new();
         let mut dir_id_by_path = HashMap::new();
-        let (payload_sender, payload_receiver) = crossbeam::channel::unbounded();
-        let (dirid_sender, dirid_receiver) = crossbeam::channel::bounded::<(HashedPath, i64)>(100);
+        let (dir_children_sender, dir_children_receiver) = crossbeam::channel::unbounded();
+        let (dirid_sender, dirid_receiver) = crossbeam::channel::unbounded();
         let root_hp = HashedPath::from(root.to_path_buf());
         let root_hash_path = root_hp.clone();
         dir_id_by_path.insert(root_hp, 1);
         println!("root:{:?}", root.to_path_buf());
         {
             s.spawn(move |_| -> Result<()> {
-                let mut skip_payloads = false;
-                let mut end_payload_work = false;
+                let mut end_dirs = false;
+                let mut end_dir_children = false;
                 loop {
                     let mut sel = crossbeam::channel::Select::new();
-                    let index0 = sel.recv(&dirid_receiver);
-                    let index1 = if skip_payloads {
-                        usize::MAX
-                    } else {
-                        sel.recv(&payload_receiver)
-                    };
-                    let index2 = if end_payload_work {
-                        usize::MAX
-                    } else {
-                        sel.recv(&recv_done)
+                    let (index_dirs_done, index_dir_receiver) = if end_dirs {
+                        (usize::MAX, usize::MAX)
+                    }else {
+                        (sel.recv(&recv_dirs_done), sel.recv(&dirid_receiver))
                     };
 
+                    let (index_dir_children_done, index_dir_children_recv)  = if end_dir_children {
+                        (usize::MAX, usize::MAX)
+                    } else {
+                        (sel.recv(&recv_done), sel.recv(&dir_children_receiver))
+                    };
+                    let mut changed = false;
                     while let Ok(oper) = sel.try_select() {
-                        if oper.index() == index0 {
-                            if oper
-                                .recv(&dirid_receiver)
-                                .map(|(p, id)| dir_id_by_path.insert(p, id))
-                                .is_err()
-                            {
-                                // eprintln!("Error in receiving ids {:?}", x);
+                        if oper.index() == index_dirs_done {
+                            if oper.recv(&recv_dirs_done).is_ok() {
+                                end_dirs = true;
+                                log::debug!("no more dirs expected");
                                 break;
                             }
-                        } else if oper.index() == index1 {
-                            if oper
-                                .recv(&payload_receiver)
-                                .map(|p| payload_set.insert(p))
-                                .is_err()
-                            {
-                                skip_payloads = true;
-                                break;
-                            }
-                        } else if oper.index() == index2 {
+                        }
+                        else if oper.index() == index_dir_receiver {
+                            oper.recv(&dirid_receiver)
+                                .map(|(p, id)| dir_id_by_path.insert(p, id))?;
+                            changed = true;
+                        } else if oper.index() == index_dir_children_recv {
+                            oper.recv(&dir_children_receiver)
+                                .map(|p| dir_children_collection.insert(p))?;
+                            changed = true;
+                        } else if oper.index() == index_dir_children_done {
                             if oper.recv(&recv_done).is_ok() {
-                                end_payload_work = true;
+                                end_dir_children = true;
+                                log::debug!("no more payloads expected");
+                                break;
                             }
                         } else {
                             eprintln!("unknown index returned in select");
                             break;
                         }
                     }
-                    if !payload_set.is_empty() || !dir_id_by_path.is_empty() {
-                        linkup_dbids(&dire_sender, &mut payload_set, &mut dir_id_by_path)?;
-                    } else if end_payload_work {
+                    if !dir_children_collection.is_empty() || !dir_id_by_path.is_empty() {
+                        if changed { linkup_dbids(&dire_sender, &mut dir_children_collection, &mut dir_id_by_path)?; }
+                    } else if end_dir_children {
                         break;
                     }
                     yield_now();
@@ -528,65 +550,35 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             drop(nodesender);
         }
         {
-            // the thread below works with sqlite db to insert or upsert nodes
+            // hidden in a corner is this thread below that works with sqlite db to upsert nodes
+            // Nodes are expected to have parent dir ids.
+            // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
             s.spawn(move |_| -> Result<()> {
-                let tx = conn.transaction()?;
-                {
-                    let mut insert_new_node = tx.insert_node_prepare()?;
-                    let mut find_node = tx.fetch_node_prepare()?;
-                    let mut insert_present = tx.insert_present_prepare()?;
-                    let mut update_mtime = tx.update_mtime_prepare()?;
-                    let mut insert_modify = tx.insert_modify_prepare()?;
-
-                    for tnode in nodereceiver.iter() {
-                        let node = tnode.get_node();
-                        if node.get_type() == &Dir {
-                            let id: i64 = find_upsert_node(
-                                &mut insert_new_node,
-                                &mut find_node,
-                                &mut update_mtime,
-                                &mut insert_present,
-                                &mut insert_modify,
-                                &node,
-                            )?
-                            .get_id();
-
-                            dirid_sender.send((tnode.get_hashed_path().clone(), id))?;
-                        } else {
-                            find_upsert_node(
-                                &mut insert_new_node,
-                                &mut find_node,
-                                &mut update_mtime,
-                                &mut insert_present,
-                                &mut insert_modify,
-                                &node,
-                            )?;
-                        }
-                    }
-                }
-                tx.commit()?;
-                conn.populate_delete_list()?;
-                Ok(())
+                let res =  add_modify_nodes(conn, nodereceiver, dirid_sender);
+                let done = send_dirs_done.send(()).map_err(anyhow::Error::new);
+                res.and(done)
             });
         }
-        let (dirpayload_sender, dirpayload_receiver) = crossbeam::channel::unbounded();
-        let pl = PayloadDir::new(root_hash_path, dirpayload_sender.clone());
-        dirpayload_sender.send(pl)?;
-        drop(dirpayload_sender);
+        let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
+        let pl = DirSender::new(root_hash_path, dirs_sender.clone());
+        dirs_sender.send(pl)?;
+        drop(dirs_sender);
         let wg = WaitGroup::new();
         for _ in 0..MAX_THRS_DIRS {
-            let hr = dirpayload_receiver.clone();
-            let ps = payload_sender.clone();
-            {
-                let wg = wg.clone();
-                s.spawn(move |_| {
-                    for payloaddir in hr.iter() {
-                        walkdir_from(payloaddir.parent_path(), payloaddir.sender(), ps.clone());
-                    }
-                    drop(hr);
-                    drop(wg);
-                });
-            }
+            // This loop spreads the task for walking over children among threads.
+            // walkdir is only run for immediate children. When  we encounder dirs, they are packaged in `dir_sender` thereby queuing them until
+            // they are popped for running walkdir on them.
+            let hr = dirs_receiver.clone();
+            let ps = dir_children_sender.clone();
+            let wg = wg.clone();
+            s.spawn(move |_| -> Result<()> {
+                for dir_sender in hr.iter() {
+                    walkdir_from(dir_sender.parent_path(), dir_sender.sender(), ps.clone())?;
+                }
+                drop(hr);
+                drop(wg);
+                Ok(())
+            });
         }
         wg.wait();
         send_done.send(())?;
@@ -597,17 +589,66 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// This tracks the paths which have a available parent id, removes them from payloads, and dir_id_by_path and sends them over to write/query to/from db
+/// For the received nodes which are are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
+/// Those not in database will be inserted.
+fn add_modify_nodes(
+    conn: &mut Connection,
+    nodereceiver: Receiver<NodeAtPath>,
+    dirid_sender: Sender<(HashedPath, i64)>,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut insert_new_node = tx.insert_node_prepare()?;
+        let mut find_node = tx.fetch_node_prepare()?;
+        let mut add_to_present = tx.add_to_present_prepare()?;
+        let mut update_mtime = tx.update_mtime_prepare()?;
+        let mut add_to_modify = tx.add_to_modify_prepare()?;
+
+        for tnode in nodereceiver.iter() {
+            let node = tnode.get_node();
+            log::debug!("recvd {}, {:?}", node.get_name(), node.get_type());
+            if node.get_type() == &Dir {
+                let id: i64 = find_upsert_node(
+                    &mut insert_new_node,
+                    &mut find_node,
+                    &mut update_mtime,
+                    &mut add_to_present,
+                    &mut add_to_modify,
+                    &node,
+                )?
+                .get_id();
+
+                dirid_sender.send((tnode.get_hashed_path().clone(), id))?;
+            } else {
+                find_upsert_node(
+                    &mut insert_new_node,
+                    &mut find_node,
+                    &mut update_mtime,
+                    &mut add_to_present,
+                    &mut add_to_modify,
+                    &node,
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    conn.populate_delete_list()?;
+
+    Ok(())
+}
+
+/// This tracks the paths which have a available parent id, removes them from dir_children, and dir_id_by_path and sends them over to write/query to/from db
 fn linkup_dbids(
     dire_sender: &Sender<ProtoNode>,
-    payload_set: &mut HashSet<Payload>,
+    dir_children_set: &mut HashSet<DirChldren>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
 ) -> Result<()> {
     dir_id_by_path.
         retain(|p, id|
-            // warning this is a predicate with side effects.. :-(
-        if let Some(payload) = payload_set.take(p) {
-            send_children(payload, *id, &dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
+            // warning this is a predicate with side effects.. :-(.
+            // return false on those child for which payload was consumed.
+        if let Some(dir_children) = dir_children_set.take(p) {
+            send_children(dir_children, *id, &dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
             false
         } else {
             true
