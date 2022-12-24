@@ -7,6 +7,7 @@ use crate::RowType::Rule;
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
 use bimap::BiMap;
+use execute::shell;
 use log;
 use log::debug;
 use rusqlite::Connection;
@@ -97,10 +98,23 @@ fn gather_rules_from_tupfiles(p: &mut TupParser, tupfiles: &mut [Node]) -> Resul
     }
     Ok(new_arts)
 }
-pub(crate) fn gather_rules_to_run(conn: &mut Connection) -> Result<()> {
+pub(crate) fn exec_rules_to_run(conn: &mut Connection, root: &Path) -> Result<()> {
     let rule_nodes = conn.rules_to_run()?;
+
     for rule_node in rule_nodes {
-        println!("{}", rule_node.get_name());
+        let cmd = shell(rule_node.get_name());
+        if rule_node.get_display_str().is_empty() {
+            println!("{:?}", cmd);
+        } else {
+            println!("{}", rule_node.get_display_str());
+        }
+        let out = tupexec::Command::from_std_cmd(cmd)
+            .outdir(root.join(".tup").as_os_str())
+            .spawn()?;
+        let exit_status = out.wait();
+        if !exit_status.success() {
+            break;
+        }
     }
     Ok(())
 }
@@ -110,14 +124,14 @@ fn check_uniqueness_of_parent_rule(
     arts: &Artifacts,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
-    let rbuf = parser.read_buf();
+    let read_buf = parser.read_buf();
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
     for o in arts.get_output_files() {
         let db_id_of_o = crossref.get_path_db_id(o).unwrap_or_else(|| {
             panic!(
                 "output which was which was expected to be db is not {:?}",
-                rbuf.get_path(o)
+                read_buf.get_path(o)
             )
         });
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
@@ -125,10 +139,10 @@ fn check_uniqueness_of_parent_rule(
             let parent_rule_ref = arts.get_parent_rule(o).unwrap_or_else(|| {
                 panic!(
                     "unable to fetch parent rule for output {:?}",
-                    rbuf.get_path(o)
+                    read_buf.get_path(o)
                 )
             });
-            let path = rbuf.get_tup_path(parent_rule_ref.get_tupfile_desc());
+            let path = read_buf.get_tup_path(parent_rule_ref.get_tupfile_desc());
             return Err(anyhow::Error::msg(
                 format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
                         node.get_name(), path.to_string_lossy(), parent_rule_ref.get_line()
@@ -182,6 +196,7 @@ fn add_rule_links(
                             added = true;
                         }
                     }
+                    InputResolvedType::UnResolvedFile(_) => {}
                 }
                 if !added {
                     let fname = rbuf.get_input_path_str(i);
@@ -232,7 +247,7 @@ fn fetch_group_provider_outputs(
         .collect::<Vec<_>>();
     let mut wbuf = parser.write_buf();
     for (group_desc, groupid) in gids {
-        conn.for_each_grp_node_provider(groupid, Some(RowType::GenF), |node| -> Result<()> {
+        conn.for_each_grp_node_provider(groupid, Some(GenF), |node| -> Result<()> {
             // name of node is actually its path
             // merge providers of this group from all available in db
             let pd = wbuf.add_path_from_root(Path::new(node.get_name())).0;
@@ -255,12 +270,12 @@ fn insert_nodes(
     let mut paths_to_insert = Vec::new();
     let mut rules_to_insert = Vec::new();
     let mut paths_to_update: HashMap<i64, i64> = HashMap::new();
-    let rbuf = parser.read_buf();
+    let read_buf = parser.read_buf();
     // collect all un-added groups and add them in a single transaction.
     {
         let mut find_dirid = conn.fetch_dirid_prepare()?;
         let mut find_group_id = conn.fetch_groupid_prepare()?;
-        for (group_path, grp_id) in rbuf.get_group_iter() {
+        for (group_path, grp_id) in read_buf.get_group_iter() {
             let parent = group_path.as_path().parent().unwrap();
             if let Some(dir) = get_dir_id(&mut find_dirid, parent.to_string_lossy().to_string()) {
                 let id = find_group_id.fetch_group_id(group_path.as_path()).ok();
@@ -286,10 +301,10 @@ fn insert_nodes(
              crossref: &mut CrossRefMaps,
              find_nodeid: &mut SqlStatement| {
                 let isz: usize = (*rule_desc).into();
-                let rformula = rbuf.get_rule(rule_desc);
-                let name = rformula.get_rule_str();
-                let display_str = rformula.get_display_str();
-                let flags = rformula.get_flags();
+                let rule_formula = read_buf.get_rule(rule_desc);
+                let name = rule_formula.get_rule_str();
+                let display_str = rule_formula.get_display_str();
+                let flags = rule_formula.get_flags();
                 if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
                     crossref.add_rule_xref(*rule_desc, nodeid);
                 } else {
@@ -304,7 +319,7 @@ fn insert_nodes(
                                            find_nodeid: &mut SqlStatement|
          -> Result<()> {
             let isz: usize = (*p).into();
-            let path = rbuf.get_path(p);
+            let path = read_buf.get_path(p);
             let parent = path
                 .as_path()
                 .parent()
@@ -432,8 +447,8 @@ fn add_links_to_groups(
     arts: &Artifacts,
     crossref: &CrossRefMaps,
 ) -> Result<()> {
-    let tconn = conn.transaction()?;
-    let mut inp_linker = tconn.insert_sticky_link_prepare()?;
+    let tx = conn.transaction()?;
+    let mut inp_linker = tx.insert_sticky_link_prepare()?;
 
     for rl in arts.get_resolved_links() {
         if let Some(group_id) = rl.get_group_desc().as_ref() {

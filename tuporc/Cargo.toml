@@ -10,6 +10,7 @@ clap = { version = "3.2.16", features = ["derive"] }
 daggy = "*"
 rusqlite = { version = "0.28.0", features = ["bundled"] }
 tupparser = { path = "../tuprs" }
+tupsetuphook = {path = "../tupsetuphook"}
 sha1 = "*"
 walkdir = "*"
 anyhow = "*"
@@ -20,3 +21,4 @@ num-traits = "0.2.15"
 crossbeam = "*"
 env_logger = "0.9.3"
 log = "0.4.17"
+execute = "0.2.11"

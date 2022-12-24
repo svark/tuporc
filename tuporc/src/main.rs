@@ -33,9 +33,10 @@ use walkdir::WalkDir;
 use db::ForEachClauses;
 use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
+extern crate execute;
 
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
-use crate::parse::{find_upsert_node, gather_rules_to_run, parse_tupfiles_in_db};
+use crate::parse::{exec_rules_to_run, find_upsert_node, parse_tupfiles_in_db};
 
 mod db;
 mod parse;
@@ -152,7 +153,7 @@ fn main() -> Result<()> {
                 println!("Parsing tupfiles in database");
                 scan_root(root.as_path(), &mut conn)?;
                 parse_tupfiles_in_db(&mut conn, root.as_path())?;
-                let _nodes = gather_rules_to_run(&mut conn)?;
+                let _nodes = exec_rules_to_run(&mut conn, root.as_path())?;
             }
         }
     }
@@ -393,7 +394,6 @@ fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChldren>
     let mut children = Vec::new();
     for e in WalkDir::new(root.as_ref())
         .follow_links(true)
-        //.skip_hidden(true)
         .min_depth(1)
         .max_depth(1)
         .into_iter()
@@ -431,18 +431,22 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             n.unwrap()
         };
         anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
-        conn.add_to_present_prepare()?
-            .add_to_present_exec(n, RowType::Dir)?;
+        conn.add_to_present_prepare()?.add_to_present_exec(n, Dir)?;
     }
 
     // Begin processessing
     thread::scope(|s| -> Result<()> {
         let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
         let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
+        // channel for communicating that we are done with finding ids of directories.
         let (send_dirs_done, recv_dirs_done) = crossbeam::channel::bounded(0);
+        // channel for communicating  that we are done with finding children of directories.
         let (send_done, recv_done) = crossbeam::channel::bounded(0);
-        let mut dir_children_collection = HashSet::new();
+        // Map of children of  directories as returned by walkdir. `DirChildren`
+        let mut dir_children_set = HashSet::new();
+        // map of database ids of directories
         let mut dir_id_by_path = HashMap::new();
+        // channel for  tracking children of a directory `DirChildren`.
         let (dir_children_sender, dir_children_receiver) = crossbeam::channel::unbounded();
         let (dirid_sender, dirid_receiver) = crossbeam::channel::unbounded();
         let root_hp = HashedPath::from(root.to_path_buf());
@@ -480,7 +484,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                             changed = true;
                         } else if oper.index() == index_dir_children_recv {
                             oper.recv(&dir_children_receiver)
-                                .map(|p| dir_children_collection.insert(p))?;
+                                .map(|p| dir_children_set.insert(p))?;
                             changed = true;
                         } else if oper.index() == index_dir_children_done {
                             if oper.recv(&recv_done).is_ok() {
@@ -493,13 +497,9 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                             break;
                         }
                     }
-                    if !dir_children_collection.is_empty() || !dir_id_by_path.is_empty() {
+                    if !dir_children_set.is_empty() || !dir_id_by_path.is_empty() {
                         if changed {
-                            linkup_dbids(
-                                &dire_sender,
-                                &mut dir_children_collection,
-                                &mut dir_id_by_path,
-                            )?;
+                            linkup_dbids(&dire_sender, &mut dir_children_set, &mut dir_id_by_path)?;
                         }
                     } else if end_dir_children {
                         break;
@@ -648,10 +648,10 @@ fn linkup_dbids(
     dir_children_set: &mut HashSet<DirChldren>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
 ) -> Result<()> {
+    // retains only dir ids for which its children were not found in `dir_children`.
     dir_id_by_path.
         retain(|p, id|
             // warning this is a predicate with side effects.. :-(.
-            // return false on those child for which payload was consumed.
         if let Some(dir_children) = dir_children_set.take(p) {
             send_children(dir_children, *id, &dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
             false
