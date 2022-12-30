@@ -7,6 +7,7 @@ use crate::db::StatementType::{
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
+use log::debug;
 use rusqlite::{Connection, Params, Statement};
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
@@ -629,7 +630,8 @@ impl LibSqlExec for SqlStatement<'_> {
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
         anyhow::ensure!(self.tok == FindDirId, "wrong token for find dir");
         let path_str = Self::db_path_str(p);
-
+        let path_str = path_str.as_str();
+        debug!("find dir id for :{}", path_str);
         let id = self.stmt.query_row([path_str], |r| r.get(0))?;
         Ok(id)
     }
@@ -637,6 +639,7 @@ impl LibSqlExec for SqlStatement<'_> {
     fn fetch_group_id<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
         anyhow::ensure!(self.tok == FindGroupId, "wrong token for fetch groupid");
         let path_str = Self::db_path_str(p);
+        debug!("find group id for :{}", path_str);
         let v = self.stmt.query_row([path_str], |r| {
             let v: i64 = r.get(0)?;
             Ok(v)

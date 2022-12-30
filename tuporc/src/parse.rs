@@ -8,7 +8,6 @@ use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
 use anyhow::Result;
 use bimap::BiMap;
 use execute::shell;
-use log;
 use log::debug;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -66,7 +65,8 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         Ok(())
     })?;
     let mut parser = TupParser::try_new_from(root)?;
-    let mut arts = gather_rules_from_tupfiles(&mut parser, &mut tupfiles)?;
+    let arts = gather_rules_from_tupfiles(&mut parser, &mut tupfiles)?;
+    let mut arts = parser.reresolve(arts)?;
 
     let mut crossref = CrossRefMaps::default();
     insert_nodes(conn, tupfiles.as_slice(), &parser, &arts, &mut crossref)?;
@@ -276,8 +276,8 @@ fn insert_nodes(
         let mut find_dirid = conn.fetch_dirid_prepare()?;
         let mut find_group_id = conn.fetch_groupid_prepare()?;
         for (group_path, grp_id) in read_buf.get_group_iter() {
-            let parent = group_path.as_path().parent().unwrap();
-            if let Some(dir) = get_dir_id(&mut find_dirid, parent.to_string_lossy().to_string()) {
+            let parent = tupparser::transform::get_parent_str(group_path.as_path());
+            if let Some(dir) = get_dir_id(&mut find_dirid, parent) {
                 let id = find_group_id.fetch_group_id(group_path.as_path()).ok();
                 if let Some(i) = id {
                     // grp_db_id.insert(grp_id, i);
@@ -320,11 +320,18 @@ fn insert_nodes(
          -> Result<()> {
             let isz: usize = (*p).into();
             let path = read_buf.get_path(p);
+            //debug!("np:{:?}", path.as_path());
             let parent = path
                 .as_path()
                 .parent()
                 .unwrap_or_else(|| panic!("No parent folder found for file {:?}", path.as_path()));
-            let dir = find_dirid.fetch_dirid(parent)?;
+            let dir = {
+                let x = find_dirid.fetch_dirid(parent);
+                if x.is_err() {
+                    debug!("failed to fetch dir id");
+                }
+                x?
+            };
             let name = path
                 .as_path()
                 .file_name()
@@ -376,6 +383,8 @@ fn insert_nodes(
     }
     let tx = conn.transaction()?;
     {
+        paths_to_insert.sort_by(|a: &Node, b: &Node| a.get_id().partial_cmp(&b.get_id()).unwrap());
+        paths_to_insert.dedup_by_key(|n| n.get_id());
         let mut insert_node = tx.insert_node_prepare()?;
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
@@ -417,6 +426,7 @@ pub(crate) fn find_upsert_node(
     add_to_modify: &mut SqlStatement,
     node: &Node,
 ) -> Result<Node> {
+    debug!("find_upsert_node:{}", node.get_name());
     let db_node = find_node_id
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
