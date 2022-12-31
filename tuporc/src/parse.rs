@@ -1,4 +1,4 @@
-use crate::db::RowType::{File, GenF};
+use crate::db::RowType::GenF;
 use crate::db::{
     create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
     ForEachClauses, LibSqlExec, SqlStatement,
@@ -10,7 +10,7 @@ use bimap::BiMap;
 use execute::shell;
 use log::debug;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use tupparser::{
     Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ResolvedLink,
@@ -162,64 +162,86 @@ fn add_rule_links(
     let rbuf = parser.read_buf();
     let rules_in_tup_file = arts.rules_by_tup();
     let tconn = conn.transaction()?;
-    let mut inp_linker = tconn.insert_sticky_link_prepare()?;
-    let mut out_linker = tconn.insert_link_prepare()?;
-    for r in rules_in_tup_file {
-        for rl in r {
-            let rule_node_id = crossref
-                .get_rule_db_id(rl.get_rule_desc())
-                .expect("rule dbid fetch failed");
-            for i in rl.get_sources() {
-                let mut added: bool = false;
-                match i {
-                    InputResolvedType::UnResolvedGroupEntry(g) => {
-                        if let Some(group_id) = crossref.get_group_db_id(g) {
-                            inp_linker.insert_sticky_link(group_id, rule_node_id)?;
-                            added = true;
+    {
+        let mut inp_linker = tconn.insert_sticky_link_prepare()?;
+        let mut out_linker = tconn.insert_link_prepare()?;
+        for r in rules_in_tup_file {
+            for rl in r {
+                let rule_node_id = crossref
+                    .get_rule_db_id(rl.get_rule_desc())
+                    .expect("rule dbid fetch failed");
+                let mut processed = std::collections::HashSet::new();
+                let mut processed_group = std::collections::HashSet::new();
+                for i in rl.get_sources() {
+                    let mut added: bool = false;
+                    match i {
+                        InputResolvedType::UnResolvedGroupEntry(g) => {
+                            if let Some(group_id) = crossref.get_group_db_id(g) {
+                                inp_linker.insert_sticky_link(group_id, rule_node_id)?;
+                                added = true;
+                            }
+                        }
+                        InputResolvedType::Deglob(mp) => {
+                            if let Some(pid) = crossref.get_path_db_id(mp.path_descriptor()) {
+                                debug!("slink {} => {}", pid, rule_node_id);
+                                if processed.insert(pid) {
+                                    inp_linker.insert_sticky_link(pid, rule_node_id)?;
+                                }
+                                added = true;
+                            }
+                        }
+                        InputResolvedType::BinEntry(_, p) => {
+                            if let Some(pid) = crossref.get_path_db_id(p) {
+                                debug!("bin slink {} => {}", pid, rule_node_id);
+                                if processed.insert(pid)
+                                {
+                                    inp_linker.insert_sticky_link(pid, rule_node_id)?;
+                                }
+                                added = true;
+                            }
+                        }
+                        InputResolvedType::GroupEntry(g, p) => {
+                            if let Some(group_id) = crossref.get_group_db_id(g) {
+                                debug!("group link {} => {}", group_id, rule_node_id);
+                                if processed_group.insert(group_id) {
+                                    inp_linker.insert_sticky_link(group_id, rule_node_id)?;
+                                }
+                                if let Some(pid) = crossref.get_path_db_id(p) {
+                                    if processed.insert(pid) {
+                                        inp_linker.insert_sticky_link(pid, rule_node_id)?;
+                                    }
+                                }
+                                added = true;
+                            }
+                        }
+                        InputResolvedType::UnResolvedFile(f) => {
+                            debug!("unresolved entry found during linking {}", f);
                         }
                     }
-                    InputResolvedType::Deglob(mp) => {
-                        if let Some(pid) = crossref.get_path_db_id(mp.path_descriptor()) {
-                            inp_linker.insert_sticky_link(pid, rule_node_id)?;
-                            added = true;
-                        }
-                    }
-                    InputResolvedType::BinEntry(_, p) => {
-                        if let Some(pid) = crossref.get_path_db_id(p) {
-                            inp_linker.insert_sticky_link(pid, rule_node_id)?;
-                            added = true;
-                        }
-                    }
-                    InputResolvedType::GroupEntry(g, _) => {
-                        if let Some(group_id) = crossref.get_group_db_id(g) {
-                            inp_linker.insert_sticky_link(group_id, rule_node_id)?;
-                            added = true;
-                        }
-                    }
-                    InputResolvedType::UnResolvedFile(_) => {}
-                }
-                if !added {
-                    let fname = rbuf.get_input_path_str(i);
+                    if !added {
+                        let fname = rbuf.get_input_path_str(i);
 
-                    anyhow::ensure!(
+                        anyhow::ensure!(
                         false,
                         format!(
                             "could not add a link from input {} to ruleid:{}",
                             fname, rule_node_id
                         )
                     );
+                    }
                 }
-            }
-            {
-                for t in rl.get_targets() {
-                    let p = crossref
-                        .get_path_db_id(t)
-                        .unwrap_or_else(|| panic!("failed to fetch db id of path {}", t));
-                    out_linker.insert_link(rule_node_id, p)?;
+                {
+                    for t in rl.get_targets() {
+                        let p = crossref
+                            .get_path_db_id(t)
+                            .unwrap_or_else(|| panic!("failed to fetch db id of path {}", t));
+                        out_linker.insert_link(rule_node_id, p)?;
+                    }
                 }
             }
         }
     }
+    tconn.commit()?;
     Ok(())
 }
 
@@ -267,7 +289,7 @@ fn insert_nodes(
 ) -> Result<()> {
     let rules_in_tup_file = arts.rules_by_tup();
     let mut groups_to_insert: Vec<_> = Vec::new();
-    let mut paths_to_insert = Vec::new();
+    let mut paths_to_insert = BTreeSet::new();
     let mut rules_to_insert = Vec::new();
     let mut paths_to_update: HashMap<i64, i64> = HashMap::new();
     let read_buf = parser.read_buf();
@@ -278,7 +300,8 @@ fn insert_nodes(
         for (group_path, grp_id) in read_buf.get_group_iter() {
             let parent = tupparser::transform::get_parent_str(group_path.as_path());
             if let Some(dir) = get_dir_id(&mut find_dirid, parent) {
-                let id = find_group_id.fetch_group_id(group_path.as_path()).ok();
+                let grp_name = group_path.file_name();
+                let id = find_group_id.fetch_group_id(grp_name.as_str(), dir).ok();
                 if let Some(i) = id {
                     // grp_db_id.insert(grp_id, i);
                     crossref.add_group_xref(*grp_id, i);
@@ -288,7 +311,7 @@ fn insert_nodes(
                     groups_to_insert.push(Node::new_grp(
                         isz as i64,
                         dir,
-                        group_path.as_path().to_string_lossy().to_string(),
+                        grp_name,
                     ));
                 }
             }
@@ -344,7 +367,7 @@ fn insert_nodes(
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
-                paths_to_insert.push(Node::new_file_or_genf(
+                paths_to_insert.insert(Node::new_file_or_genf(
                     isz as i64,
                     dir,
                     mtime_ns,
@@ -355,6 +378,7 @@ fn insert_nodes(
             }
             Ok(())
         };
+        let mut processed = std::collections::HashSet::new();
         for r in rules_in_tup_file.iter().zip(tup_nodes.iter()) {
             let dir = r.1.get_id();
             let mtime = r.1.get_mtime();
@@ -363,19 +387,26 @@ fn insert_nodes(
                 let rd = rl.get_rule_desc();
                 collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid);
                 for p in rl.get_targets() {
-                    collect_nodes_to_insert(p, &GenF, mtime, dir, crossref, &mut find_nodeid)?;
+                    if processed.insert(p) {
+                        collect_nodes_to_insert(p, &GenF, mtime, dir, crossref, &mut find_nodeid)?;
+                    }
                 }
+
+            }
+           for rl in r.0.iter() {
 
                 for i in rl.get_sources() {
                     if let InputResolvedType::Deglob(mp) = i {
-                        collect_nodes_to_insert(
-                            mp.path_descriptor(),
-                            &File,
-                            mtime,
-                            -1, /*srcid*/
-                            crossref,
-                            &mut find_nodeid,
-                        )?;
+                        if processed.insert(mp.path_descriptor()) {
+                            collect_nodes_to_insert(
+                                mp.path_descriptor(),
+                                &GenF,
+                                mtime,
+                                -1, /*srcid*/
+                                crossref,
+                                &mut find_nodeid,
+                            )?;
+                        }
                     }
                 }
             }
@@ -383,8 +414,6 @@ fn insert_nodes(
     }
     let tx = conn.transaction()?;
     {
-        paths_to_insert.sort_by(|a: &Node, b: &Node| a.get_id().partial_cmp(&b.get_id()).unwrap());
-        paths_to_insert.dedup_by_key(|n| n.get_id());
         let mut insert_node = tx.insert_node_prepare()?;
         let mut find_node = tx.fetch_node_prepare()?;
         let mut update_mtime = tx.update_mtime_prepare()?;
@@ -458,19 +487,20 @@ fn add_links_to_groups(
     crossref: &CrossRefMaps,
 ) -> Result<()> {
     let tx = conn.transaction()?;
-    let mut inp_linker = tx.insert_sticky_link_prepare()?;
+    {
+        let mut inp_linker = tx.insert_sticky_link_prepare()?;
 
-    for rl in arts.get_resolved_links() {
-        if let Some(group_id) = rl.get_group_desc().as_ref() {
-            if let Some(group_db_id) = crossref.get_group_db_id(group_id) {
-                for target in rl.get_targets() {
-                    if let Some(path_db_id) = crossref.get_path_db_id(target) {
-                        inp_linker.insert_link(path_db_id, group_db_id)?;
+        for rl in arts.get_resolved_links() {
+            if let Some(group_id) = rl.get_group_desc().as_ref() {
+                if let Some(group_db_id) = crossref.get_group_db_id(group_id) {
+                    for target in rl.get_targets() {
+                        if let Some(path_db_id) = crossref.get_path_db_id(target) {
+                            inp_linker.insert_sticky_link(path_db_id, group_db_id)?;
+                        }
                     }
                 }
             }
-        }
-        /*for i in rl.get_sources() {
+            /*for i in rl.get_sources() {
             if let InputResolvedType::GroupEntry(g, p) = i {
                 if let Some(group_id) = crossref.get_group_db_id(g) {
                     if let Some(pid) = crossref.get_path_db_id(p) {
@@ -479,6 +509,8 @@ fn add_links_to_groups(
                 }
             }
         }*/
+        }
     }
+    tx.commit()?;
     Ok(())
 }

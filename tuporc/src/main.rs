@@ -270,7 +270,7 @@ impl HashedPath {
 }
 
 #[derive(Debug)]
-struct DirChldren {
+struct DirChildren {
     parent_path: HashedPath,
     children: Vec<DirE>,
 }
@@ -280,16 +280,16 @@ struct DirSender {
     sender: Sender<DirSender>,
 }
 
-impl Eq for DirChldren {}
-impl Hash for DirChldren {
+impl Eq for DirChildren {}
+impl Hash for DirChildren {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.parent_path.hash(state)
     }
 }
 
-impl DirChldren {
-    pub fn new(parent_path: HashedPath, children: Vec<DirE>) -> DirChldren {
-        DirChldren {
+impl DirChildren {
+    pub fn new(parent_path: HashedPath, children: Vec<DirE>) -> DirChildren {
+        DirChildren {
             parent_path,
             children,
         }
@@ -372,7 +372,7 @@ impl PartialEq<Self> for HashedPath {
 }
 impl Eq for HashedPath {}
 
-impl PartialEq<Self> for DirChldren {
+impl PartialEq<Self> for DirChildren {
     fn eq(&self, other: &Self) -> bool {
         self.parent_path() == other.parent_path()
     }
@@ -384,13 +384,13 @@ impl PartialEq<Self> for DirSender {
     }
 }
 
-impl Borrow<HashedPath> for DirChldren {
+impl Borrow<HashedPath> for DirChildren {
     fn borrow(&self) -> &HashedPath {
         self.parent_path()
     }
 }
 
-fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChldren>) -> Result<()> {
+fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChildren>) -> Result<()> {
     let mut children = Vec::new();
     for e in WalkDir::new(root.as_ref())
         .follow_links(true)
@@ -407,11 +407,11 @@ fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChldren>
         }
         children.push(DirE::new(e, cur_path))
     }
-    ps.send(DirChldren::new(root, children))?;
+    ps.send(DirChildren::new(root, children))?;
     Ok(())
 }
 
-fn send_children(mut dir_children: DirChldren, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
+fn send_children(mut dir_children: DirChildren, pid: i64, ds: &Sender<ProtoNode>) -> Result<()> {
     for p in dir_children.get_children() {
         ds.send(ProtoNode::new(p, pid))?;
     }
@@ -560,6 +560,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
             s.spawn(move |_| -> Result<()> {
                 let res = add_modify_nodes(conn, nodereceiver, dirid_sender);
+                log::debug!("finished adding nodes");
                 let done = send_dirs_done.send(()).map_err(anyhow::Error::new);
                 res.and(done)
             });
@@ -577,12 +578,9 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             let ps = dir_children_sender.clone();
             let wg = wg.clone();
             s.spawn(move |_| -> Result<()> {
-                for dir_sender in hr.iter() {
-                    walkdir_from(dir_sender.parent_path(), dir_sender.sender(), ps.clone())?;
-                }
-                drop(hr);
+                let res = walk_recvd_dirs(hr, ps);
                 drop(wg);
-                Ok(())
+                res
             });
         }
         wg.wait();
@@ -591,6 +589,14 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     })
     .expect("Failed to spawn thread for dir insertion")
     .expect("Failed to return from scope");
+    Ok(())
+}
+
+// dir with db ids are available now walk over their children (`DirChildren` and send them for upserts
+fn walk_recvd_dirs(hr: Receiver<DirSender>, ps: Sender<DirChildren>) -> Result<()> {
+    for dir_sender in hr.iter() {
+        walkdir_from(dir_sender.parent_path(), dir_sender.sender(), ps.clone())?;
+    }
     Ok(())
 }
 
@@ -645,7 +651,7 @@ fn add_modify_nodes(
 /// This tracks the paths which have a available parent id, removes them from dir_children, and dir_id_by_path and sends them over to write/query to/from db
 fn linkup_dbids(
     dire_sender: &Sender<ProtoNode>,
-    dir_children_set: &mut HashSet<DirChldren>,
+    dir_children_set: &mut HashSet<DirChildren>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
 ) -> Result<()> {
     // retains only dir ids for which its children were not found in `dir_children`.
