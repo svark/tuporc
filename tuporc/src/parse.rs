@@ -193,8 +193,7 @@ fn add_rule_links(
                         InputResolvedType::BinEntry(_, p) => {
                             if let Some(pid) = crossref.get_path_db_id(p) {
                                 debug!("bin slink {} => {}", pid, rule_node_id);
-                                if processed.insert(pid)
-                                {
+                                if processed.insert(pid) {
                                     inp_linker.insert_sticky_link(pid, rule_node_id)?;
                                 }
                                 added = true;
@@ -222,12 +221,12 @@ fn add_rule_links(
                         let fname = rbuf.get_input_path_str(i);
 
                         anyhow::ensure!(
-                        false,
-                        format!(
-                            "could not add a link from input {} to ruleid:{}",
-                            fname, rule_node_id
-                        )
-                    );
+                            false,
+                            format!(
+                                "could not add a link from input {} to ruleid:{}",
+                                fname, rule_node_id
+                            )
+                        );
                     }
                 }
                 {
@@ -272,7 +271,7 @@ fn fetch_group_provider_outputs(
         conn.for_each_grp_node_provider(groupid, Some(GenF), |node| -> Result<()> {
             // name of node is actually its path
             // merge providers of this group from all available in db
-            let pd = wbuf.add_path_from_root(Path::new(node.get_name())).0;
+            let pd = wbuf.add_abs(Path::new(node.get_name())).0;
             arts.add_group_entry(&group_desc, pd);
             Ok(())
         })?;
@@ -308,11 +307,7 @@ fn insert_nodes(
                 } else {
                     // gather groups that are not in the db yet.
                     let isz: usize = (*grp_id).into();
-                    groups_to_insert.push(Node::new_grp(
-                        isz as i64,
-                        dir,
-                        grp_name,
-                    ));
+                    groups_to_insert.push(Node::new_grp(isz as i64, dir, grp_name));
                 }
             }
         }
@@ -391,10 +386,8 @@ fn insert_nodes(
                         collect_nodes_to_insert(p, &GenF, mtime, dir, crossref, &mut find_nodeid)?;
                     }
                 }
-
             }
-           for rl in r.0.iter() {
-
+            for rl in r.0.iter() {
                 for i in rl.get_sources() {
                     if let InputResolvedType::Deglob(mp) = i {
                         if processed.insert(mp.path_descriptor()) {
@@ -501,14 +494,14 @@ fn add_links_to_groups(
                 }
             }
             /*for i in rl.get_sources() {
-            if let InputResolvedType::GroupEntry(g, p) = i {
-                if let Some(group_id) = crossref.get_group_db_id(g) {
-                    if let Some(pid) = crossref.get_path_db_id(p) {
-                        inp_linker.insert_link(pid, GenF, group_id, Grp)?;
+                if let InputResolvedType::GroupEntry(g, p) = i {
+                    if let Some(group_id) = crossref.get_group_db_id(g) {
+                        if let Some(pid) = crossref.get_path_db_id(p) {
+                            inp_linker.insert_link(pid, GenF, group_id, Grp)?;
+                        }
                     }
                 }
-            }
-        }*/
+            }*/
         }
     }
     tx.commit()?;
