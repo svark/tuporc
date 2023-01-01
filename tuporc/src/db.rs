@@ -1,10 +1,6 @@
 use std::cmp::Ordering;
 use crate::db::RowType::{Grp, TupF};
-use crate::db::StatementType::{
-    AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGroupId,
-    FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, InsertDir,
-    InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime,
-};
+use crate::db::StatementType::{AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGlobNodes, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
@@ -173,6 +169,7 @@ pub enum StatementType {
     FindNodeId,
     FindNodeById,
     FindNodes,
+    FindGlobNodes,
     FindNodePath,
     FindParentRule,
     UpdMTime,
@@ -202,6 +199,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
+    fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
@@ -514,6 +512,14 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: FindNodes,
+        })
+    }
+
+    fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name LIKE ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindGlobNodes,
         })
     }
 
