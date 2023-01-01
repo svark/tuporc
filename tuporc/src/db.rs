@@ -1,11 +1,16 @@
-use std::cmp::Ordering;
 use crate::db::RowType::{Grp, TupF};
-use crate::db::StatementType::{AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId, FindGlobNodes, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes, FindParentRule, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId, UpdMTime};
+use crate::db::StatementType::{
+    AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId,
+    FindGlobNodes, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes,
+    FindParentRule, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId,
+    UpdMTime,
+};
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
 use log::debug;
 use rusqlite::{Connection, Params, Statement};
+use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
@@ -516,7 +521,9 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name LIKE ?")?;
+        let stmt = self.prepare(
+            "SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name LIKE ?",
+        )?;
         Ok(SqlStatement {
             stmt,
             tok: FindGlobNodes,
@@ -635,7 +642,10 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()> {
-        anyhow::ensure!(self.tok == InsertStickyLink, "wrong token for insert sticky link");
+        anyhow::ensure!(
+            self.tok == InsertStickyLink,
+            "wrong token for insert sticky link"
+        );
         self.stmt.insert([from_id, to_id])?;
         Ok(())
     }
@@ -666,7 +676,7 @@ impl LibSqlExec for SqlStatement<'_> {
     fn fetch_group_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
         anyhow::ensure!(self.tok == FindGroupId, "wrong token for fetch groupid");
         debug!("find group id for :{} at dir:{} ", node_name, dir);
-        let v = self.stmt.query_row(( dir, node_name ), |r| {
+        let v = self.stmt.query_row((dir, node_name), |r| {
             let v: i64 = r.get(0)?;
             Ok(v)
         })?;
