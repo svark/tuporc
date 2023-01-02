@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, FromPrimitive)]
 pub enum RowType {
-    File = 0,
-    Rule = 1,
-    Dir = 2,
-    Env = 3,
-    GenF = 4,
-    TupF = 5,
-    Grp = 6,
-    GEnd = 7,
+    File = 0, //< Fite
+    Rule = 1, //< Rule
+    Dir = 2, //< Directory
+    Env = 3, //< Env var
+    GenF = 4,//< Generated file
+    TupF = 5, //< Tupfile or lua
+    Grp = 6, //< Group
+    GenD = 7, //< Generated Directory
 }
 
 impl ToString for RowType {
@@ -36,13 +36,13 @@ impl ToString for RowType {
 #[derive(Clone, Debug)]
 pub struct Node {
     id: i64,
-    pid: i64,
-    mtime: i64,
-    name: String,
-    rtype: RowType,
-    display_str: String,
-    flags: String,
-    srcid: i64,
+    pid: i64, //< Parent folder id
+    mtime: i64, // time in nano s
+    name: String, // name of file or dir or rule or group
+    rtype: RowType,// type of data in this row
+    display_str: String, // rule display
+    flags: String, // flags for rule that appear in description
+    srcid: i64, //< wherefrom this node came about
 }
 
 impl PartialEq<Self> for Node {

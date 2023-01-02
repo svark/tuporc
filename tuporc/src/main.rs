@@ -88,7 +88,7 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
         4 => RowType::GenF,
         5 => RowType::TupF,
         6 => Grp,
-        7 => RowType::GEnd,
+        7 => RowType::GenD,
         _ => panic!("Invalid type {} for row with id:{}", rtype, id),
     };
     Ok(Node::new(id, pid, mtime, name, rtype))
