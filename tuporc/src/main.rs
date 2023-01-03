@@ -30,7 +30,7 @@ use rusqlite::{Connection, Row};
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 
-use db::ForEachClauses;
+//use db::ForEachClauses;
 use db::RowType::{Dir, Grp};
 use db::{Node, RowType};
 extern crate execute;
@@ -168,18 +168,7 @@ fn scan_root(root: &Path, conn: &mut Connection) -> Result<()> {
 
 // WIP... delete files and rules in db that arent in the filesystem or in use
 // should restrict attention to the outputs of tupfiles that are modified/deleted.
-fn __delete_missing(conn: &Connection, present: &HashSet<i64>) -> Result<()> {
-    let mut delete_stmt = conn.delete_prepare()?;
-    let mut delete_aux_stmt = conn.delete_aux_prepare()?;
-
-    conn.for_each_file_node_id(|node_id: i64| -> Result<()> {
-        if !present.contains(&node_id) {
-            //XTODO: delete rules and generated files derived from this id
-            delete_stmt.delete_exec(node_id)?;
-            delete_aux_stmt.delete_exec_aux(node_id)?;
-        }
-        Ok(())
-    })?;
+fn __delete_missing(_conn: &Connection, _present: &HashSet<i64>) -> Result<()> {
     Ok(())
 }
 /// return dir id either from db stored value in readstate or from newly created list in created dirs
@@ -439,9 +428,9 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
         let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
         let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
         // channel for communicating that we are done with finding ids of directories.
-        let (send_dirs_done, recv_dirs_done) = crossbeam::channel::bounded(0);
+        //let (send_dirs_done, recv_dirs_done) = crossbeam::channel::bounded(0);
         // channel for communicating  that we are done with finding children of directories.
-        let (send_done, recv_done) = crossbeam::channel::bounded(0);
+        //let (send_done, recv_done) = crossbeam::channel::bounded(0);
         // Map of children of  directories as returned by walkdir. `DirChildren`
         let mut dir_children_set = HashSet::new();
         // map of database ids of directories
@@ -459,41 +448,51 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                 let mut end_dir_children = false;
                 loop {
                     let mut sel = crossbeam::channel::Select::new();
-                    let (index_dirs_done, index_dir_receiver) = if end_dirs {
-                        (usize::MAX, usize::MAX)
+                    let index_dir_receiver = if end_dirs {
+                        usize::MAX
                     } else {
-                        (sel.recv(&recv_dirs_done), sel.recv(&dirid_receiver))
+                        sel.recv(&dirid_receiver)
                     };
 
-                    let (index_dir_children_done, index_dir_children_recv) = if end_dir_children {
-                        (usize::MAX, usize::MAX)
+                    let index_dir_children_recv = if end_dir_children {
+                        usize::MAX
                     } else {
-                        (sel.recv(&recv_done), sel.recv(&dir_children_receiver))
+                        sel.recv(&dir_children_receiver)
                     };
                     let mut changed = false;
                     while let Ok(oper) = sel.try_select() {
-                        if oper.index() == index_dirs_done {
-                            if oper.recv(&recv_dirs_done).is_ok() {
-                                end_dirs = true;
-                                log::debug!("no more dirs expected");
-                                break;
-                            }
-                        } else if oper.index() == index_dir_receiver {
-                            oper.recv(&dirid_receiver)
-                                .map(|(p, id)| dir_id_by_path.insert(p, id))?;
-                            changed = true;
+                        if oper.index() == index_dir_receiver {
+                            oper.recv(&dirid_receiver).map_or_else(
+                                |_| {
+                                    log::debug!("no more dirs  expected");
+                                    end_dirs = true;
+                                    ()
+                                },
+                                |(p, id)| {
+                                    dir_id_by_path.insert(p, id);
+                                    changed = true;
+                                    ()
+                                },
+                            );
                         } else if oper.index() == index_dir_children_recv {
-                            oper.recv(&dir_children_receiver)
-                                .map(|p| dir_children_set.insert(p))?;
-                            changed = true;
-                        } else if oper.index() == index_dir_children_done {
-                            if oper.recv(&recv_done).is_ok() {
-                                end_dir_children = true;
-                                log::debug!("no more payloads expected");
-                                break;
-                            }
-                        } else {
+                            oper.recv(&dir_children_receiver).map_or_else(
+                                |_| {
+                                    log::debug!("no more dir children expected");
+                                    end_dir_children = true;
+                                    ()
+                                },
+                                |p| {
+                                    dir_children_set.insert(p);
+                                    changed = true;
+                                    ()
+                                },
+                            );
+                        }
+                        else {
                             eprintln!("unknown index returned in select");
+                            break;
+                        }
+                        if end_dirs || end_dir_children {
                             break;
                         }
                     }
@@ -561,8 +560,10 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             s.spawn(move |_| -> Result<()> {
                 let res = add_modify_nodes(conn, nodereceiver, dirid_sender);
                 log::debug!("finished adding nodes");
-                let done = send_dirs_done.send(()).map_err(anyhow::Error::new);
-                res.and(done)
+                if res.is_err() {
+                    log::debug!("with Err:{:?}", res)
+                }
+                res
             });
         }
         let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
@@ -584,7 +585,6 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             });
         }
         wg.wait();
-        send_done.send(())?;
         Ok(())
     })
     .expect("Failed to spawn thread for dir insertion")

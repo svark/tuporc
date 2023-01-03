@@ -1,10 +1,5 @@
 use crate::db::RowType::{Grp, TupF};
-use crate::db::StatementType::{
-    AddToDel, AddToMod, AddToPres, DeleteId, DeleteIdAux, DeleteRuleLinks, FindDirId,
-    FindGlobNodes, FindGroupId, FindNode, FindNodeById, FindNodeId, FindNodePath, FindNodes,
-    FindParentRule, InsertDir, InsertDirAux, InsertFile, InsertLink, InsertStickyLink, UpdDirId,
-    UpdMTime,
-};
+use crate::db::StatementType::*;
 use crate::make_node;
 use crate::RowType::Rule;
 use anyhow::Result;
@@ -180,7 +175,6 @@ pub enum StatementType {
     UpdMTime,
     UpdDirId,
     DeleteId,
-    DeleteIdAux,
     DeleteRuleLinks,
 }
 
@@ -210,7 +204,6 @@ pub(crate) trait LibSqlPrepare {
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
-    fn delete_aux_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
 }
 
@@ -234,7 +227,6 @@ pub(crate) trait LibSqlExec {
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     fn delete_exec(&mut self, id: i64) -> Result<()>;
-    fn delete_exec_aux(&mut self, id: i64) -> Result<()>;
     fn delete_rule_links(&mut self, rule_id: i64) -> Result<()>;
 }
 pub(crate) trait MiscStatements {
@@ -575,13 +567,6 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn delete_aux_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into DeleteList(id) Values (?)")?;
-        Ok(SqlStatement {
-            stmt,
-            tok: DeleteIdAux,
-        })
-    }
 
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(
@@ -744,12 +729,6 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn delete_exec(&mut self, id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == DeleteId, "wrong token for delete node");
-        self.stmt.execute([id])?;
-        Ok(())
-    }
-
-    fn delete_exec_aux(&mut self, id: i64) -> Result<()> {
-        anyhow::ensure!(self.tok == DeleteIdAux, "wrong token for delete node");
         self.stmt.execute([id])?;
         Ok(())
     }
@@ -995,8 +974,8 @@ impl ForEachClauses for Connection {
 impl MiscStatements for Connection {
     fn populate_delete_list(&self) -> Result<()> {
         let mut stmt = self.prepare(
-            "Insert into DeleteList SELECT id from Node Except \
-         (SELECT id from PresentList Union Select id from ModifyList)",
+            "Insert into DeleteList SELECT id, type from Node Except \
+         SELECT id, type from PresentList Union Select id, type from ModifyList",
         )?;
         stmt.execute([])?;
         Ok(())
