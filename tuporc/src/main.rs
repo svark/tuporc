@@ -153,7 +153,7 @@ fn main() -> Result<()> {
                 println!("Parsing tupfiles in database");
                 scan_root(root.as_path(), &mut conn)?;
                 parse_tupfiles_in_db(&mut conn, root.as_path())?;
-                let _nodes = exec_rules_to_run(&mut conn, root.as_path())?;
+                exec_rules_to_run(&mut conn, root.as_path())?;
             }
         }
     }
@@ -331,7 +331,7 @@ impl ProtoNode {
     }
 
     fn get_path(&self) -> &HashedPath {
-        &self.p.get_path()
+        self.p.get_path()
     }
 }
 #[derive(Clone, Debug)]
@@ -412,13 +412,12 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     db::create_temptables(conn)?;
     {
         let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
-        let n = if n.is_none() {
+        let n = n.ok_or_else(|| anyhow::Error::msg("no such node : '.'"));
+        let n = n.or_else(|_| -> Result<i64> {
             let mut insert_dir = conn.insert_dir_prepare()?;
-            let id = insert_dir.insert_dir_exec(".", 0)?;
-            id
-        } else {
-            n.unwrap()
-        };
+            let i = insert_dir.insert_dir_exec(".", 0)?;
+            Ok(i)
+        })?;
         anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
         conn.add_to_present_prepare()?.add_to_present_exec(n, Dir)?;
     }
@@ -466,12 +465,10 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                 |_| {
                                     log::debug!("no more dirs  expected");
                                     end_dirs = true;
-                                    ()
                                 },
                                 |(p, id)| {
                                     dir_id_by_path.insert(p, id);
                                     changed = true;
-                                    ()
                                 },
                             );
                         } else if oper.index() == index_dir_children_recv {
@@ -479,16 +476,13 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                 |_| {
                                     log::debug!("no more dir children expected");
                                     end_dir_children = true;
-                                    ()
                                 },
                                 |p| {
                                     dir_children_set.insert(p);
                                     changed = true;
-                                    ()
                                 },
                             );
-                        }
-                        else {
+                        } else {
                             eprintln!("unknown index returned in select");
                             break;
                         }
@@ -625,7 +619,7 @@ fn add_modify_nodes(
                     &mut update_mtime,
                     &mut add_to_present,
                     &mut add_to_modify,
-                    &node,
+                    node,
                 )?
                 .get_id();
 
@@ -637,7 +631,7 @@ fn add_modify_nodes(
                     &mut update_mtime,
                     &mut add_to_present,
                     &mut add_to_modify,
-                    &node,
+                    node,
                 )?;
             }
         }
@@ -659,7 +653,7 @@ fn linkup_dbids(
         retain(|p, id|
             // warning this is a predicate with side effects.. :-(.
         if let Some(dir_children) = dir_children_set.take(p) {
-            send_children(dir_children, *id, &dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
+            send_children(dir_children, *id, dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
             false
         } else {
             true

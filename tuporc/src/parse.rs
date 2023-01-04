@@ -367,7 +367,7 @@ fn insert_nodes(
                     dir,
                     mtime_ns,
                     path.as_path().to_string_lossy().to_string(),
-                    rtype.clone(),
+                    *rtype,
                     srcid,
                 ));
             }
@@ -453,20 +453,20 @@ pub(crate) fn find_upsert_node(
         .fetch_node(node.get_name(), node.get_pid())
         .or_else(|_| {
             let node = insert_node
-                .insert_node_exec(&node)
+                .insert_node_exec(node)
                 .map(|i| Node::copy_from(i, node))?;
-            add_to_modify.add_to_modify_exec(node.get_id(), node.get_type().clone())?;
+            add_to_modify.add_to_modify_exec(node.get_id(), *node.get_type())?;
             Ok::<Node, anyhow::Error>(node)
         })
         .and_then(|existing_node| {
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {
                 update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
                 add_to_modify
-                    .add_to_modify_exec(existing_node.get_id(), existing_node.get_type().clone())?;
+                    .add_to_modify_exec(existing_node.get_id(), *existing_node.get_type())?;
             } else {
                 add_to_present.add_to_present_exec(
                     existing_node.get_id(),
-                    existing_node.get_type().clone(),
+                    *existing_node.get_type(),
                 )?;
             }
             Ok(existing_node)
