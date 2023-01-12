@@ -1,19 +1,18 @@
 extern crate bimap;
 extern crate clap;
+extern crate core;
 extern crate crossbeam;
 extern crate env_logger;
-extern crate num;
-#[macro_use]
-extern crate num_derive;
+extern crate execute;
 
 use std::borrow::Borrow;
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::RandomState;
 use std::env::current_dir;
 use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
-use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,18 +29,20 @@ use rusqlite::{Connection, Row};
 use walkdir::DirEntry;
 use walkdir::WalkDir;
 
+use db::{Node, RowType};
 //use db::ForEachClauses;
 use db::RowType::{Dir, Grp};
-use db::{Node, RowType};
-extern crate execute;
 
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
-use crate::parse::{exec_rules_to_run, find_upsert_node, parse_tupfiles_in_db};
+use crate::parse::{find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
+
 
 mod db;
 mod parse;
+
 const MAX_THRS_NODES: u8 = 4;
 const MAX_THRS_DIRS: u8 = 10;
+
 #[derive(clap::Parser)]
 #[clap(author, version = "0.1", about = "Tup build system implemented in rust", long_about = None)]
 struct Args {
@@ -128,32 +129,37 @@ fn main() -> Result<()> {
                 };
             }
             Action::Parse => {
-                let mut conn = Connection::open(".tup/db")
-                    .expect("Connection to tup database in .tup/db could not be established");
-                if !is_initialized(&conn) {
-                    return Err(anyhow::Error::msg(
-                        "Tup database is not initialized, use `tup init' to initialize",
-                    ));
-                }
                 let root = current_dir()?;
-                println!("Parsing tupfiles in database");
-                scan_root(root.as_path(), &mut conn)?;
-                parse_tupfiles_in_db(&mut conn, root.as_path())?;
+                let tupfiles = {
+                    let mut conn = Connection::open(".tup/db")
+                        .expect("Connection to tup database in .tup/db could not be established");
+                    if !is_initialized(&conn) {
+                        return Err(anyhow::Error::msg(
+                            "Tup database is not initialized, use `tup init' to initialize",
+                        ));
+                    }
+                    println!("Parsing tupfiles in database");
+                    scan_root(root.as_path(), &mut conn)?;
+                    crate::parse::gather_tupfiles(&mut conn)?
+                };
+                parse_tupfiles_in_db(tupfiles, root.as_path(), false)?;
             }
             Action::Upd { target } => {
                 println!("Updating db {}", target.join(" "));
-                let mut conn = Connection::open(".tup/db")
-                    .expect("Connection to tup database in .tup/db could not be established");
-                if !is_initialized(&conn) {
-                    return Err(anyhow::Error::msg(
-                        "Tup database is not initialized, use `tup init' to initialize",
-                    ));
-                }
                 let root = current_dir()?;
-                println!("Parsing tupfiles in database");
-                scan_root(root.as_path(), &mut conn)?;
-                parse_tupfiles_in_db(&mut conn, root.as_path())?;
-                exec_rules_to_run(&mut conn, root.as_path())?;
+                let tupfiles = {
+                    let mut conn = Connection::open(".tup/db")
+                        .expect("Connection to tup database in .tup/db could not be established");
+                    if !is_initialized(&conn) {
+                        return Err(anyhow::Error::msg(
+                            "Tup database is not initialized, use `tup init' to initialize",
+                        ));
+                    }
+                    println!("Parsing tupfiles in database");
+                    scan_root(root.as_path(), &mut conn)?;
+                    gather_tupfiles(&mut conn)?
+                };
+                parse_tupfiles_in_db(tupfiles, root.as_path(), true)?;
             }
         }
     }

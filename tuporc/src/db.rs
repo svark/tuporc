@@ -8,11 +8,13 @@ use rusqlite::{Connection, Params, Statement};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use tupparser::decode::MatchingPath;
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq, FromPrimitive)]
+#[repr(u8)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum RowType {
     File = 0,
-    //< Fite
+    //< File
     Rule = 1,
     //< Rule
     Dir = 2,
@@ -34,6 +36,30 @@ impl ToString for RowType {
     }
 }
 
+impl TryFrom<u8> for RowType {
+    type Error = u8;
+    fn try_from(value: u8) -> std::result::Result<Self, u8> {
+        if value == 0 {
+            Ok(Self::File)
+        } else if value == 1 {
+            Ok(Self::Rule)
+        } else if value == 2 {
+            Ok(Self::Dir)
+        } else if value == 3 {
+            Ok(Self::Env)
+        } else if value == 4 {
+            Ok(Self::GenF)
+        } else if value == 5 {
+            Ok(Self::TupF)
+        } else if value == 6 {
+            Ok(Self::Grp)
+        } else if value == 7 {
+            Ok(Self::GenD)
+        } else {
+            Err(value)
+        }
+    }
+}
 /// Fields in the Node table in the database
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -50,7 +76,7 @@ pub struct Node {
     // rule display
     flags: String,
     // flags for rule that appear in description
-    srcid: i64,          //< wherefrom this node came about
+    srcid: i64, //< wherefrom this node came about
 }
 
 impl PartialEq<Self> for Node {
@@ -235,6 +261,9 @@ pub(crate) trait LibSqlExec {
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
     fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
+    fn fetch_glob_nodes<F>(&mut self, glob_path: &str, f: F) -> Result<Vec<MatchingPath>>
+        where
+            F: FnMut(String) -> MatchingPath;
     fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>;
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
@@ -526,9 +555,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(
-            "SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and name LIKE ?",
-        )?;
+        let stmt = self.prepare("SELECT name FROM DirPathBuf where name REGEXP ?")?;
         Ok(SqlStatement {
             stmt,
             tok: FindGlobNodes,
@@ -536,7 +563,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT fullpath from DirPathBuf where id=?")?;
+        let stmt = self.prepare("SELECT name from DirPathBuf where id=?")?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodePath,
@@ -546,8 +573,9 @@ impl LibSqlPrepare for Connection {
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
         let rty = Rule as u8;
         let stmtstr = format!(
-            "SELECT id FROM Node where type={rty} and id in \
-        (SELECT from_id from NormalLink where to_id = ?)"
+            "SELECT id FROM Node where type={} and id in \
+        (SELECT from_id from NormalLink where to_id = ?)",
+            rty
         );
         let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
@@ -708,6 +736,25 @@ impl LibSqlExec for SqlStatement<'_> {
         while let Some(row) = rows.next()? {
             let node = make_node(row)?;
             nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
+    fn fetch_glob_nodes<F>(&mut self, glob_path: &str, mut f: F) -> Result<Vec<MatchingPath>>
+        where
+            F: FnMut(String) -> MatchingPath,
+    {
+        anyhow::ensure!(
+            self.tok == FindGlobNodes,
+            "wrong token for fetch glob nodes"
+        );
+        let mut rows = self.stmt.query([glob_path])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let node: String = row.get(0)?;
+            //nodes.push(node);
+            let id = f(node);
+            nodes.push(id);
         }
         Ok(nodes)
     }
@@ -943,13 +990,15 @@ impl ForEachClauses for Connection {
         while let Some(row) = rows.next()? {
             let i = row.get(0)?;
             let dir: i64 = row.get(1)?;
-            let rtype: i64 = row.get(2)?;
+            let rtype: i8 = row.get(2)?;
             let name: String = row.get(3)?;
-            let rty: RowType = num::FromPrimitive::from_i64(rtype).ok_or_else(|| {
-                anyhow::Error::msg(
+            let rtype = rtype as u8;
+            let rty: RowType = RowType::try_from(rtype).map_err(|e| {
+                anyhow::Error::msg(format!(
                     "unknown row type returned \
-                 in foreach node query",
-                )
+                 in foreach node query :{}",
+                    e
+                ))
             })?;
             mut_f(Node::new(i, dir, 0, name, rty))?;
         }
