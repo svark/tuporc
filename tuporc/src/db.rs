@@ -261,10 +261,10 @@ pub(crate) trait LibSqlExec {
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
     fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
-    fn fetch_glob_nodes<F>(&mut self, glob_path: &str, f: F) -> Result<Vec<MatchingPath>>
+    fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
         where
-            F: FnMut(String) -> MatchingPath;
-    fn fetch_parent_rule(&mut self, id: i64) -> Result<i64>;
+            F: FnMut(&String) -> MatchingPath, P: AsRef<Path>;
+    fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>>;
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
@@ -390,7 +390,7 @@ pub fn create_dir_path_buf_temptable(conn: &Connection) -> Result<()> {
     // https://gist.github.com/jbrown123/b65004fd4e8327748b650c77383bf553
     let stmt = format!(
         "DROP TABLE IF EXISTS DIRPATHBUF;
-CREATE TEMPORARY TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
+CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
 (
     VALUES(1, '.')
     UNION ALL
@@ -409,7 +409,7 @@ pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!(
         "
     DROP TABLE IF EXISTS GRPPATHBUF;
-CREATE TEMPORARY TABLE GRPPATHBUF AS
+CREATE  TABLE GRPPATHBUF AS
    SELECT  node.id id ,DIRPATHBUF.name || '/' || node.name Name from node inner join DIRPATHBUF on
        (node.dir=DIRPATHBUF.id and node.type={})",
         RowType::Grp as u8
@@ -422,7 +422,7 @@ CREATE TEMPORARY TABLE GRPPATHBUF AS
 pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!("
 DROP TABLE IF EXISTS TUPPATHBUF;
-CREATE TEMPORARY TABLE TUPPATHBUF AS
+CREATE TABLE TUPPATHBUF AS
 SELECT node.id id, node.dir dir, node.mtime_ns mtime, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
 (NODE.dir = DIRPATHBUF.id and node.type={})", TupF as u8);
     conn.execute_batch(stmt.as_str())?;
@@ -555,7 +555,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT name FROM DirPathBuf where name REGEXP ?")?;
+        let stmt = self.prepare("SELECT name from Node where name like ? and dir in (SELECT id FROM DirPathBuf where name = ?)")?;
         Ok(SqlStatement {
             stmt,
             tok: FindGlobNodes,
@@ -740,32 +740,40 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(nodes)
     }
 
-    fn fetch_glob_nodes<F>(&mut self, glob_path: &str, mut f: F) -> Result<Vec<MatchingPath>>
+    fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, mut f: F) -> Result<Vec<MatchingPath>>
         where
-            F: FnMut(String) -> MatchingPath,
+            F: FnMut(&String) -> MatchingPath,
+            P: AsRef<Path>
     {
         anyhow::ensure!(
             self.tok == FindGlobNodes,
             "wrong token for fetch glob nodes"
         );
-        let mut rows = self.stmt.query([glob_path])?;
+        let path_str = SqlStatement::db_path_str(glob_path);
+        let gname_str = gname.as_ref().to_string_lossy().to_string();
+        let mut rows = self.stmt.query((gname_str.replace('*', "%"), path_str))?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             let node: String = row.get(0)?;
             //nodes.push(node);
-            let id = f(node);
+            let id = f(&node);
             nodes.push(id);
         }
         Ok(nodes)
     }
 
-    fn fetch_parent_rule(&mut self, id: i64) -> Result<i64> {
+    fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>> {
         anyhow::ensure!(
             self.tok == FindParentRule,
             "wrong token for fetch parent rule"
         );
-        let nodeid = self.stmt.query_row([id], |r| (r.get(0)))?;
-        Ok(nodeid)
+        let mut ids = Vec::new();
+        let mut rows = self.stmt.query([id])?;
+        while let Ok(Some(r)) = rows.next() {
+            let id: i64 = r.get(0)?;
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf> {

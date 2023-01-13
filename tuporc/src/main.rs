@@ -140,7 +140,7 @@ fn main() -> Result<()> {
                     }
                     println!("Parsing tupfiles in database");
                     scan_root(root.as_path(), &mut conn)?;
-                    crate::parse::gather_tupfiles(&mut conn)?
+                    gather_tupfiles(&mut conn)?
                 };
                 parse_tupfiles_in_db(tupfiles, root.as_path(), false)?;
             }

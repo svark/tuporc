@@ -73,7 +73,9 @@ impl DbPathSearcher {
         glob_path: &GlobPath,
     ) -> Result<Vec<MatchingPath>> {
         let has_glob_pattern = glob_path.has_glob_pattern();
-        let fetch_row = |s: String| {
+        let base_path = ph.get_path(glob_path.get_base_desc()).clone();
+        let diff_path = ph.get_rel_path(glob_path.get_path_desc(), glob_path.get_base_desc());
+        let fetch_row = |s: &String| {
             let (pd, _) = ph.add_abs(Path::new(s.as_str()));
             if has_glob_pattern {
                 let grps = glob_path.group(s.as_str());
@@ -83,7 +85,7 @@ impl DbPathSearcher {
             }
         };
         let mut glob_query = self.conn.fetch_glob_nodes_prepare()?;
-        let mps = glob_query.fetch_glob_nodes(glob_path.re().as_str(), fetch_row)?;
+        let mps = glob_query.fetch_glob_nodes(base_path.as_path(), diff_path.as_path(), fetch_row)?;
         Ok(mps)
     }
 }
@@ -228,19 +230,24 @@ fn check_uniqueness_of_parent_rule(
             )
         });
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
-            let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = outs.get_parent_rule(o).unwrap_or_else(|| {
-                panic!(
-                    "unable to fetch parent rule for output {:?}",
-                    read_buf.get_path(o)
-                )
-            });
-            let path = read_buf.get_tup_path(parent_rule_ref.get_tupfile_desc());
-            return Err(anyhow::Error::msg(
-                format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
-                        node.get_name(), path.to_string_lossy(), parent_rule_ref.get_line()
-                )
-            ));
+            if rule_id.len() > 1 {
+                let node = fetch_rule.fetch_node_by_id(*rule_id.first().unwrap())?;
+                let parent_rule_ref = outs.get_parent_rule(o).unwrap_or_else(|| {
+                    panic!(
+                        "unable to fetch parent rule for output {:?}",
+                        read_buf.get_path(o)
+                    )
+                });
+                let tup_path = read_buf.get_tup_path(parent_rule_ref.get_tupfile_desc());
+                //let rule_str = parent_rule_ref.to_string();
+                {
+                    return Err(anyhow::Error::msg(
+                        format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
+                                node.get_name(), tup_path.to_string_lossy(), parent_rule_ref.get_line()
+                        )
+                    ));
+                }
+            }
         }
     }
     Ok(())
