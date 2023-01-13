@@ -11,7 +11,7 @@ use tupparser::{
     Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ReadWriteBufferObjects,
     ResolvedLink, RuleDescriptor, TupParser,
 };
-use tupparser::decode::{GlobPath, MatchingPath, OutputHolder, PathBuffers, PathSearcher, RuleRef};
+use tupparser::decode::{GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers, PathSearcher, RuleRef};
 use tupparser::errors::Error;
 
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
@@ -61,11 +61,10 @@ struct DbPathSearcher {
 
 impl DbPathSearcher {
     pub fn new(conn: Connection) -> DbPathSearcher {
-        let dbsearcher = DbPathSearcher {
+        DbPathSearcher {
             conn,
             psx: OutputHolder::new(),
-        };
-        dbsearcher
+        }
     }
 
     fn fetch_glob_nodes(
@@ -107,8 +106,13 @@ impl PathSearcher for DbPathSearcher {
     fn get_outs(&self) -> &OutputHolder {
         &self.psx
     }
-    fn acquire(&mut self, t: &impl PathSearcher) {
-        self.psx.acquire(&*t.get_outs())
+
+    fn merge(&mut self, o: &impl OutputHandler) -> Result<(), Error> {
+        OutputHandler::merge(&mut self.psx, o)
+    }
+
+    fn acquire(&mut self, t: OutputHolder) {
+        self.psx.acquire(t)
     }
 }
 
@@ -118,7 +122,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     root: P,
     e: bool,
 ) -> Result<Vec<ResolvedLink>> {
-    let (mut arts, mut rwbufs) = {
+    let (arts, mut rwbufs, mut outs) = {
         let conn = Connection::open(".tup/db")
             .expect("Connection to tup database in .tup/db could not be established");
 
@@ -126,7 +130,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
         let arts = gather_rules_from_tupfiles(&mut parser, &tupfiles)?;
         let arts = parser.reresolve(arts)?;
-        (arts, parser.read_write_buffers())
+        (arts, parser.read_write_buffers(), parser.get_outs().clone())
     };
     let mut conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");
@@ -140,10 +144,10 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         &mut crossref,
     )?;
 
-    check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
     //XTODO: delete previous links from output files to groups
     add_links_to_groups(&mut conn, &arts, &crossref)?;
-    fetch_group_provider_outputs(&mut conn, &mut rwbufs, &mut arts, &mut crossref)?;
+    fetch_group_provider_outputs(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
     add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
     //let rules = gather_rules_to_run(conn)?;
     if e {
@@ -178,7 +182,7 @@ fn gather_rules_from_tupfiles(
         // try fetching statements in this tupfile already in the database to avoid inserting same rules again
         debug!("parsing {}", tupfile_node.get_name());
         let arts = p.parse(tupfile_node.get_name())?;
-        new_arts.merge(arts)?;
+        new_arts.extend(arts)?;
         //new_outputs.merge(&o)?;
         //   let dir_id = tupfile_node.get_pid();
         // del_stmt.delete_rule_links(dir_id)?; // XTODO: Mark nodes as being deleted, track leaves left unreachable in the graph that depend on this node.
@@ -211,12 +215,12 @@ pub(crate) fn exec_rules_to_run(conn: &mut Connection, root: &Path) -> Result<()
 fn check_uniqueness_of_parent_rule(
     conn: &mut Connection,
     read_buf: &ReadWriteBufferObjects,
-    arts: &Artifacts,
+    outs: &impl OutputHandler,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
     let mut parent_rule = conn.fetch_parent_rule_prepare()?;
     let mut fetch_rule = conn.fetch_node_by_id_prepare()?;
-    for o in arts.get_output_files().iter() {
+    for o in outs.get_output_files().iter() {
         let db_id_of_o = crossref.get_path_db_id(o).unwrap_or_else(|| {
             panic!(
                 "output which was which was expected to be db is not {:?}",
@@ -225,7 +229,7 @@ fn check_uniqueness_of_parent_rule(
         });
         if let Ok(rule_id) = parent_rule.fetch_parent_rule(db_id_of_o) {
             let node = fetch_rule.fetch_node_by_id(rule_id)?;
-            let parent_rule_ref = arts.get_parent_rule(o).unwrap_or_else(|| {
+            let parent_rule_ref = outs.get_parent_rule(o).unwrap_or_else(|| {
                 panic!(
                     "unable to fetch parent rule for output {:?}",
                     read_buf.get_path(o)
@@ -336,7 +340,7 @@ fn add_rule_links(
 fn fetch_group_provider_outputs(
     conn: &mut Connection,
     rwbuf: &mut ReadWriteBufferObjects,
-    arts: &mut Artifacts,
+    outs: &mut OutputHolder,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
     let vs = rwbuf.map_group_desc(|group_desc| -> (GroupPathDescriptor, i64) {
@@ -356,7 +360,7 @@ fn fetch_group_provider_outputs(
             // name of node is actually its path
             // merge providers of this group from all available in db
             let pd = rwbuf.add_abs(Path::new(node.get_name())).0;
-            arts.add_group_entry(&group_desc, pd);
+            outs.add_group_entry(&group_desc, pd);
             Ok(())
         })?;
     }
