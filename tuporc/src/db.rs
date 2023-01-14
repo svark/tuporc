@@ -1,14 +1,17 @@
+use std::cmp::Ordering;
+use std::fs::File;
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+
+use anyhow::Result;
+use log::debug;
+use rusqlite::{Connection, Params, Statement};
+
+use tupparser::decode::MatchingPath;
+
 use crate::db::RowType::{Grp, TupF};
 use crate::db::StatementType::*;
 use crate::make_node;
 use crate::RowType::Rule;
-use anyhow::Result;
-use log::debug;
-use rusqlite::{Connection, Params, Statement};
-use std::cmp::Ordering;
-use std::fs::File;
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
-use tupparser::decode::MatchingPath;
 
 #[repr(u8)]
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -662,6 +665,7 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == InsertLink, "wrong token for insert link");
+        debug!("Normal link: {} -> {}" , from_id, to_id);
         self.stmt.insert([from_id, to_id])?;
         Ok(())
     }
@@ -671,6 +675,7 @@ impl LibSqlExec for SqlStatement<'_> {
             self.tok == InsertStickyLink,
             "wrong token for insert sticky link"
         );
+        debug!("Sticky link : {} -> {}", from_id, to_id);
         self.stmt.insert([from_id, to_id])?;
         Ok(())
     }
