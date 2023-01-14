@@ -408,7 +408,7 @@ CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
 }
 
 /// return ids of nodes that depend on rule_id
-pub fn get_rule_deps(conn: &Connection, rule_id: i64) -> Result<Vec<i64>> {
+pub fn __get_rule_deps(conn: &Connection, rule_id: i64) -> Result<Vec<i64>> {
     let stmt = format!(
         "SELECT id, type from Node where in in (WITH RECURSIVE dependants(x) AS (
    SELECT {rule_id}
