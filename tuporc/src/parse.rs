@@ -76,7 +76,8 @@ impl DbPathSearcher {
         let base_path = ph.get_path(glob_path.get_base_desc()).clone();
         let diff_path = ph.get_rel_path(glob_path.get_path_desc(), glob_path.get_base_desc());
         let fetch_row = |s: &String| {
-            let (pd, _) = ph.add_abs(Path::new(s.as_str()));
+            debug!("found:{} at {:?}", s, base_path.as_path());
+            let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
             if has_glob_pattern {
                 let grps = glob_path.group(s.as_str());
                 MatchingPath::with_captures(pd, grps)
@@ -132,6 +133,19 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
         let arts = gather_rules_from_tupfiles(&mut parser, &tupfiles)?;
         let arts = parser.reresolve(arts)?;
+        /*
+        let dbref = parser.get_searcher();
+        let mut del = dbref.conn.delete_tup_rule_links_prepare()?;
+        let mut s = dbref.conn.fetch_rules_nodes_prepare_by_dirid()?;
+        for tupfile in &tupfiles {
+            let dir = tupfile.get_pid();
+            let rules = s.fetch_rule_nodes_by_dirid(dir)?;
+            for r in rules {
+               //db.conn.
+               del.delete_rule_links(r.get_id())?;
+            }
+            //del.add_to_delete_exec()
+        } */
         (arts, parser.read_write_buffers(), parser.get_outs().clone())
     };
     let mut conn = Connection::open(".tup/db")
@@ -187,7 +201,7 @@ fn gather_rules_from_tupfiles(
         new_arts.extend(arts)?;
         //new_outputs.merge(&o)?;
         //   let dir_id = tupfile_node.get_pid();
-        // del_stmt.delete_rule_links(dir_id)?; // XTODO: Mark nodes as being deleted, track leaves left unreachable in the graph that depend on this node.
+        //    del_stmt.delete_rule_links(dir_id)?; // XTODO: Mark nodes as being deleted, track unreachable leaves in the graph that depend on this node.
         //db_rules.extend(conn.fetch_db_rules(dir_id)?);
         // need to mark generated nodes from rules of this tupfile as deleted unless resurrected below
         //rules_in_tup_file.push(ParsedLinks::new(tupfile_node.clone(), rlinks));
@@ -447,20 +461,22 @@ fn insert_nodes(
             let name = path
                 .as_path()
                 .file_name()
-                .map(|s| s.to_string_lossy().to_string());
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| panic!("missing name:{:?}", path.as_path()));
             if let Ok(nodeid) = find_nodeid.fetch_node_id(
-                &name.unwrap_or_else(|| panic!("missing name:{:?}", path.as_path())),
+                &name,
                 dir,
             ) {
                 //path_db_id.insert(p, nodeid);
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
+                debug!("need to add {:?} in dir:{}", name, dir);
                 paths_to_insert.insert(Node::new_file_or_genf(
                     isz as i64,
                     dir,
                     mtime_ns,
-                    path.as_path().to_string_lossy().to_string(),
+                    name,
                     *rtype,
                     srcid,
                 ));
@@ -481,6 +497,7 @@ fn insert_nodes(
                     }
                 }
             }
+            debug!("now gathering inputs to insert");
             for rl in r.0.iter() {
                 for i in rl.get_sources() {
                     if let InputResolvedType::Deglob(mp) = i {

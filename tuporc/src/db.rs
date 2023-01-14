@@ -239,7 +239,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
-    fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
+    fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
@@ -263,7 +263,7 @@ pub(crate) trait LibSqlExec {
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
-    fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>>;
+    fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>>;
     fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
         where
             F: FnMut(&String) -> MatchingPath, P: AsRef<Path>;
@@ -405,6 +405,27 @@ CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
     );
     conn.execute_batch(stmt.as_str())?;
     Ok(())
+}
+
+/// return ids of nodes that depend on rule_id
+pub fn get_rule_deps(conn: &Connection, rule_id: i64) -> Result<Vec<i64>> {
+    let stmt = format!(
+        "SELECT id, type from Node where in in (WITH RECURSIVE dependants(x) AS (
+   SELECT {rule_id}
+   UNION
+  SELECT to_id FROM NormalLink JOIN dependants ON NormalLink.from_id=x
+)
+SELECT DISTINCT x FROM dependants;)",
+    );
+    let mut s = conn.prepare(stmt.as_str())?;
+    let mut rows = s.query(())?;
+    let mut nodes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        //nodes.push(node);
+        nodes.push(id);
+    }
+    Ok(nodes)
 }
 
 // creates a temp table for groups
@@ -549,8 +570,9 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn fetch_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT id, dir, mtime_ns, name, type FROM Node where dir=?")?;
+    fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
+        let rtype = Rule as u8;
+        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and type={rtype}"))?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodes,
@@ -734,9 +756,9 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(nodeid)
     }
 
-    fn fetch_nodes_by_dirid<P: Params>(&mut self, params: P) -> Result<Vec<Node>> {
+    fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>> {
         anyhow::ensure!(self.tok == FindNodes, "wrong token for fetch nodes");
-        let mut rows = self.stmt.query(params)?;
+        let mut rows = self.stmt.query([dir])?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             let node = make_node(row)?;
