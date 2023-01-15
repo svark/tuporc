@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 use anyhow::Result;
@@ -15,10 +15,7 @@ use tupparser::decode::{GlobPath, MatchingPath, OutputHandler, OutputHolder, Pat
 use tupparser::errors::Error;
 
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
-use crate::db::{
-    create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
-    ForEachClauses, LibSqlExec, SqlStatement,
-};
+use crate::db::{create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable, ForEachClauses, LibSqlExec, SqlStatement};
 use crate::db::RowType::GenF;
 use crate::RowType::Rule;
 
@@ -125,28 +122,43 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     root: P,
     e: bool,
 ) -> Result<Vec<ResolvedLink>> {
-    let (arts, mut rwbufs, mut outs) = {
+    let (arts, mut rwbufs, mut outs, tupfiles) = {
         let conn = Connection::open(".tup/db")
             .expect("Connection to tup database in .tup/db could not be established");
 
         let db = DbPathSearcher::new(conn);
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
-        let arts = gather_rules_from_tupfiles(&mut parser, &tupfiles)?;
-        let arts = parser.reresolve(arts)?;
-        /*
-        let dbref = parser.get_searcher();
-        let mut del = dbref.conn.delete_tup_rule_links_prepare()?;
-        let mut s = dbref.conn.fetch_rules_nodes_prepare_by_dirid()?;
-        for tupfile in &tupfiles {
-            let dir = tupfile.get_pid();
-            let rules = s.fetch_rule_nodes_by_dirid(dir)?;
-            for r in rules {
-               //db.conn.
-               del.delete_rule_links(r.get_id())?;
+        let mut visited = BTreeSet::new();
+        {
+            let mut dbref = parser.get_mut_searcher();
+            let tx = dbref.conn.transaction()?;
+            {
+                let mut del = tx.delete_tup_rule_links_prepare()?;
+                let mut s = tx.fetch_rules_nodes_prepare_by_dirid()?;
+                let mut deloutputs = tx.mark_outputs_deleted_prepare()?;
+                let mut fetch_rule_deps = tx.get_rule_deps_tupfiles_prepare()?;
+                let mut tupfile_to_process = VecDeque::from(tupfiles);
+                while let Some(tupfile) = tupfile_to_process.pop_front() {
+                    let dir = tupfile.get_pid();
+                    if visited.insert(tupfile)
+                    {
+                        let rules = s.fetch_rule_nodes_by_dirid(dir)?;
+                        for r in rules {
+                            //db.conn.
+                            let deps = fetch_rule_deps.fetch_dependant_tupfiles(r.get_id())?;
+                            tupfile_to_process.extend(deps.into_iter().filter(|n| !visited.contains(&n)));
+                            del.delete_rule_links(r.get_id())?;
+                            deloutputs.mark_rule_outputs_deleted(r.get_id())?;
+                        }
+                    }
+                }
             }
-            //del.add_to_delete_exec()
-        } */
-        (arts, parser.read_write_buffers(), parser.get_outs().clone())
+            tx.commit()?;
+        }
+        let tupfiles: Vec<_> = visited.into_iter().collect();
+        let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice())?;
+        let arts = parser.reresolve(arts)?;
+        (arts, parser.read_write_buffers(), parser.get_outs().clone(), tupfiles)
     };
     let mut conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");

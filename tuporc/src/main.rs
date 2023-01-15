@@ -1,6 +1,5 @@
 extern crate bimap;
 extern crate clap;
-extern crate core;
 extern crate crossbeam;
 extern crate env_logger;
 extern crate execute;
@@ -35,7 +34,6 @@ use db::RowType::{Dir, Grp};
 
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
 use crate::parse::{find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
-
 
 mod db;
 mod parse;
@@ -392,7 +390,7 @@ fn walkdir_from(root: HashedPath, hs: &Sender<DirSender>, ps: Sender<DirChildren
         .min_depth(1)
         .max_depth(1)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
     {
         let pp = HashedPath::from(e.path().to_path_buf());
         let cur_path = pp.clone();

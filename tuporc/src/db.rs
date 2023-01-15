@@ -8,9 +8,9 @@ use rusqlite::{Connection, Params, Statement};
 
 use tupparser::decode::MatchingPath;
 
+use crate::make_node;
 use crate::db::RowType::{Grp, TupF};
 use crate::db::StatementType::*;
-use crate::make_node;
 use crate::RowType::Rule;
 
 #[repr(u8)]
@@ -218,6 +218,9 @@ pub enum StatementType {
     UpdDirId,
     DeleteId,
     DeleteRuleLinks,
+    ImmediateDeps,
+    RuleDepRules,
+    RestoreDeleted,
 }
 
 pub struct SqlStatement<'conn> {
@@ -247,6 +250,9 @@ pub(crate) trait LibSqlPrepare {
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
+    fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
+    fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
+    fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
 }
 
 pub(crate) trait LibSqlExec {
@@ -273,6 +279,8 @@ pub(crate) trait LibSqlExec {
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     fn delete_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
+    fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -407,26 +415,6 @@ CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
     Ok(())
 }
 
-/// return ids of nodes that depend on rule_id
-pub fn __get_rule_deps(conn: &Connection, rule_id: i64) -> Result<Vec<i64>> {
-    let stmt = format!(
-        "SELECT id, type from Node where in in (WITH RECURSIVE dependants(x) AS (
-   SELECT {rule_id}
-   UNION
-  SELECT to_id FROM NormalLink JOIN dependants ON NormalLink.from_id=x
-)
-SELECT DISTINCT x FROM dependants;)",
-    );
-    let mut s = conn.prepare(stmt.as_str())?;
-    let mut rows = s.query(())?;
-    let mut nodes = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        //nodes.push(node);
-        nodes.push(id);
-    }
-    Ok(nodes)
-}
 
 // creates a temp table for groups
 pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
@@ -643,6 +631,29 @@ impl LibSqlPrepare for Connection {
             tok: DeleteRuleLinks,
         })
     }
+
+    fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(" SELECT id from Node where id in (SELECT to_id from NormalLink where from_id=?")?;
+        Ok(SqlStatement { stmt, tok: ImmediateDeps })
+    }
+
+    fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement> {
+        let ttype = TupF as u8;
+        let rtype = Rule as u8;
+        let stmt = self.prepare(&*format!(
+            "SELECT id, dir, mtime_ns, name, type  from Node where type={ttype} and dir in (SELECT dir from Node where type = {rtype} and id in (WITH RECURSIVE dependants(x) AS (
+   SELECT ?
+   UNION
+  SELECT to_id FROM NormalLink JOIN dependants ON NormalLink.from_id=x
+)
+SELECT DISTINCT x FROM dependants;))",
+        ))?;
+        Ok(SqlStatement { stmt, tok: RuleDepRules })
+    }
+    fn restore_deleted_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&*format!("DELETE from DeletedList where id = ?"))?;
+        Ok(SqlStatement { stmt, tok: RestoreDeleted })
+    }
 }
 
 impl LibSqlExec for SqlStatement<'_> {
@@ -834,6 +845,29 @@ impl LibSqlExec for SqlStatement<'_> {
         );
         self.stmt.execute([rule_id, rule_id, rule_id, rule_id])?;
         Ok(())
+    }
+
+    fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()> {
+        anyhow::ensure!(
+            self.tok == ImmediateDeps,
+            "wrong token for mark immediate rule as deleted"
+        );
+        self.stmt.execute([rule_id])?;
+        Ok(())
+    }
+
+    fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
+        anyhow::ensure!(
+            self.tok == RuleDepRules,
+            "wrong token for delete rule links"
+        );
+        let mut rows = self.stmt.query([rule_id])?;
+        let mut vs = Vec::new();
+        while let Some(r) = rows.next()? {
+            let n = make_node(r)?;
+            vs.push(n);
+        }
+        Ok(vs)
     }
 }
 
