@@ -9,13 +9,19 @@ use rusqlite::Connection;
 
 use tupparser::{
     Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ReadWriteBufferObjects,
-    ResolvedLink, RuleDescriptor, TupParser,
+    ResolvedLink, RuleDescriptor, TupParser, TupPathDescriptor,
 };
-use tupparser::decode::{GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers, PathSearcher, RuleRef};
+use tupparser::decode::{
+    get_resolved_path_desc, GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
+    PathSearcher, RuleRef,
+};
 use tupparser::errors::Error;
 
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
-use crate::db::{create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable, ForEachClauses, LibSqlExec, SqlStatement};
+use crate::db::{
+    create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
+    ForEachClauses, LibSqlExec, SqlStatement,
+};
 use crate::db::RowType::GenF;
 use crate::RowType::Rule;
 
@@ -26,6 +32,7 @@ pub struct CrossRefMaps {
     gbo: BiMap<GroupPathDescriptor, i64>,
     pbo: BiMap<PathDescriptor, i64>,
     rbo: BiMap<RuleDescriptor, i64>,
+    dbo: BiMap<TupPathDescriptor, i64>,
 }
 
 impl CrossRefMaps {
@@ -39,6 +46,10 @@ impl CrossRefMaps {
         self.rbo.get_by_left(r).copied()
     }
 
+    pub fn get_tup_dir(&self, r: &TupPathDescriptor) -> Option<i64> {
+        self.dbo.get_by_left(r).copied()
+    }
+
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64) {
         self.gbo.insert(g, db_id);
     }
@@ -47,6 +58,9 @@ impl CrossRefMaps {
     }
     pub fn add_rule_xref(&mut self, r: RuleDescriptor, db_id: i64) {
         self.rbo.insert(r, db_id);
+    }
+    pub fn add_tup_dir(&mut self, t: TupPathDescriptor, db_id: i64) {
+        self.dbo.insert(t, db_id);
     }
 }
 
@@ -83,7 +97,8 @@ impl DbPathSearcher {
             }
         };
         let mut glob_query = self.conn.fetch_glob_nodes_prepare()?;
-        let mps = glob_query.fetch_glob_nodes(base_path.as_path(), diff_path.as_path(), fetch_row)?;
+        let mps =
+            glob_query.fetch_glob_nodes(base_path.as_path(), diff_path.as_path(), fetch_row)?;
         Ok(mps)
     }
 }
@@ -92,7 +107,7 @@ impl PathSearcher for DbPathSearcher {
     fn discover_paths(
         &self,
         ph: &mut impl PathBuffers,
-        glob_path: &tupparser::decode::GlobPath,
+        glob_path: &GlobPath,
     ) -> std::result::Result<Vec<MatchingPath>, Error> {
         let mps = self
             .fetch_glob_nodes(ph, glob_path)
@@ -122,7 +137,8 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     root: P,
     e: bool,
 ) -> Result<Vec<ResolvedLink>> {
-    let (arts, mut rwbufs, mut outs, tupfiles) = {
+    let mut crossref = CrossRefMaps::default();
+    let (arts, mut rwbufs, mut outs) = {
         let conn = Connection::open(".tup/db")
             .expect("Connection to tup database in .tup/db could not be established");
 
@@ -133,21 +149,23 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
             let mut dbref = parser.get_mut_searcher();
             let tx = dbref.conn.transaction()?;
             {
-                let mut del = tx.delete_tup_rule_links_prepare()?;
+                let (mut del_sticky_link, mut del_normal_link) =
+                    tx.delete_tup_rule_links_prepare()?;
                 let mut s = tx.fetch_rules_nodes_prepare_by_dirid()?;
                 let mut deloutputs = tx.mark_outputs_deleted_prepare()?;
                 let mut fetch_rule_deps = tx.get_rule_deps_tupfiles_prepare()?;
                 let mut tupfile_to_process = VecDeque::from(tupfiles);
                 while let Some(tupfile) = tupfile_to_process.pop_front() {
                     let dir = tupfile.get_pid();
-                    if visited.insert(tupfile)
-                    {
+                    if visited.insert(tupfile) {
                         let rules = s.fetch_rule_nodes_by_dirid(dir)?;
                         for r in rules {
                             //db.conn.
                             let deps = fetch_rule_deps.fetch_dependant_tupfiles(r.get_id())?;
-                            tupfile_to_process.extend(deps.into_iter().filter(|n| !visited.contains(&n)));
-                            del.delete_rule_links(r.get_id())?;
+                            tupfile_to_process
+                                .extend(deps.into_iter().filter(|n| !visited.contains(&n)));
+                            del_sticky_link.delete_sticky_rule_links(r.get_id())?;
+                            del_normal_link.delete_normal_rule_links(r.get_id())?;
                             deloutputs.mark_rule_outputs_deleted(r.get_id())?;
                         }
                     }
@@ -158,19 +176,18 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let tupfiles: Vec<_> = visited.into_iter().collect();
         let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice())?;
         let arts = parser.reresolve(arts)?;
-        (arts, parser.read_write_buffers(), parser.get_outs().clone(), tupfiles)
+        for tup_node in tupfiles.iter() {
+            let tupid = *parser
+                .read_write_buffers()
+                .get_tup_id(Path::new(tup_node.get_name()));
+            crossref.add_tup_dir(tupid, tup_node.get_pid());
+        }
+        (arts, parser.read_write_buffers(), parser.get_outs().clone())
     };
     let mut conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");
 
-    let mut crossref = CrossRefMaps::default();
-    insert_nodes(
-        &mut conn,
-        tupfiles.as_slice(),
-        &rwbufs,
-        &arts,
-        &mut crossref,
-    )?;
+    insert_nodes(&mut conn, &rwbufs, &arts, &mut crossref)?;
 
     check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
     //XTODO: delete previous links from output files to groups
@@ -304,6 +321,8 @@ fn add_rule_links(
                             if let Some(group_id) = crossref.get_group_db_id(&g) {
                                 inp_linker.insert_sticky_link(group_id, rule_node_id)?;
                                 added = true;
+                            } else {
+                                debug!("db group not found with descriptor {:?}", g);
                             }
                         }
                         InputResolvedType::Deglob(mp) => {
@@ -313,6 +332,12 @@ fn add_rule_links(
                                     inp_linker.insert_sticky_link(pid, rule_node_id)?;
                                 }
                                 added = true;
+                            } else {
+                                debug!(
+                                    "db path not found with descriptor {:?} => {:?}",
+                                    mp.path_descriptor(),
+                                    rbuf.get_input_path_str(&i)
+                                );
                             }
                         }
                         InputResolvedType::BinEntry(_, p) => {
@@ -322,6 +347,8 @@ fn add_rule_links(
                                     inp_linker.insert_sticky_link(pid, rule_node_id)?;
                                 }
                                 added = true;
+                            } else {
+                                debug!("bin entry not found:{:?}", p);
                             }
                         }
                         InputResolvedType::GroupEntry(g, p) => {
@@ -336,6 +363,8 @@ fn add_rule_links(
                                     }
                                 }
                                 added = true;
+                            } else {
+                                debug!("group id not found in db:{}", g);
                             }
                         }
                         InputResolvedType::UnResolvedFile(f) => {
@@ -400,9 +429,22 @@ fn fetch_group_provider_outputs(
     Ok(())
 }
 
+fn find_by_path(path: &Path, find_stmt: &mut SqlStatement) -> Result<i64> {
+    let parent = path
+        .parent()
+        .unwrap_or_else(|| panic!("No parent folder found for file {:?}", path));
+
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| panic!("missing name:{:?}", path));
+    let i = find_stmt
+        .find_node_by_path(parent, name.as_str())?;
+    Ok(i)
+}
+
 fn insert_nodes(
     conn: &mut Connection,
-    tup_nodes: &[Node],
     read_write_buf: &ReadWriteBufferObjects,
     arts: &Artifacts,
     crossref: &mut CrossRefMaps,
@@ -412,6 +454,7 @@ fn insert_nodes(
     let mut paths_to_insert = BTreeSet::new();
     let mut rules_to_insert = Vec::new();
     let mut paths_to_update: HashMap<i64, i64> = HashMap::new();
+
     // collect all un-added groups and add them in a single transaction.
     {
         let mut find_dirid = conn.fetch_dirid_prepare()?;
@@ -432,6 +475,7 @@ fn insert_nodes(
             }
         });
         let mut find_nodeid = conn.fetch_nodeid_prepare()?;
+        let mut find_by_path_stmt = conn.find_node_by_path_prepare()?;
 
         let mut collect_rule_nodes_to_insert =
             |rule_desc: &RuleDescriptor,
@@ -475,54 +519,67 @@ fn insert_nodes(
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| panic!("missing name:{:?}", path.as_path()));
-            if let Ok(nodeid) = find_nodeid.fetch_node_id(
-                &name,
-                dir,
-            ) {
+            if let Ok(nodeid) = find_nodeid.fetch_node_id(&name, dir) {
                 //path_db_id.insert(p, nodeid);
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
                 debug!("need to add {:?} in dir:{}", name, dir);
                 paths_to_insert.insert(Node::new_file_or_genf(
-                    isz as i64,
-                    dir,
-                    mtime_ns,
-                    name,
-                    *rtype,
-                    srcid,
+                    isz as i64, dir, mtime_ns, name, *rtype, srcid,
                 ));
             }
             Ok(())
         };
         let mut processed = std::collections::HashSet::new();
-        for r in rules_in_tup_file.iter().zip(tup_nodes.iter()) {
-            let dir = r.1.get_id();
-            let mtime = r.1.get_mtime();
-
-            for rl in r.0.iter() {
+        for r in rules_in_tup_file.iter() {
+            for rl in r.iter() {
                 let rd = rl.get_rule_desc();
+                let rule_ref = rl.get_rule_ref();
+                let tup_desc = rule_ref.get_tupfile_desc();
+                let dir = crossref.get_tup_dir(tup_desc).ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "No tup directory found in db for tup descriptor:{:?}",
+                        tup_desc
+                    ))
+                })?;
                 collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid);
                 for p in rl.get_targets() {
                     if processed.insert(p) {
-                        collect_nodes_to_insert(p, &GenF, mtime, dir, crossref, &mut find_nodeid)?;
+                        collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
                     }
                 }
             }
-            debug!("now gathering inputs to insert");
-            for rl in r.0.iter() {
+
+            debug!(
+                "Cross referencing inputs to insert with the db ids with same name and directory"
+            );
+            for rl in r.iter() {
                 for i in rl.get_sources() {
-                    if let InputResolvedType::Deglob(mp) = i {
-                        if processed.insert(mp.path_descriptor()) {
-                            collect_nodes_to_insert(
-                                mp.path_descriptor(),
-                                &GenF,
-                                mtime,
-                                -1, /*srcid*/
-                                crossref,
-                                &mut find_nodeid,
-                            )?;
+                    let p = get_resolved_path_desc(i);
+                    if let Some(p) = p {
+                        let inp = read_write_buf.get_input_path_str(i);
+                        if processed.insert(p) {
+                            if let Ok(nodeid) =
+                                find_by_path(Path::new(inp.as_str()), &mut find_by_path_stmt)
+                            {
+                                crossref.add_path_xref(*p, nodeid);
+                            } else {
+                                anyhow::ensure!(
+                                    false,
+                                    "unresolved input found:{:?} for rule: {:?}",
+                                    inp,
+                                    rl.get_rule_ref()
+                                );
+                            }
                         }
+                    } else {
+                        anyhow::ensure!(
+                            false,
+                            "unresolved input found:{:?} for rule: {:?}",
+                            p,
+                            rl.get_rule_ref()
+                        );
                     }
                 }
             }

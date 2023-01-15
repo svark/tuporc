@@ -8,7 +8,7 @@ use rusqlite::{Connection, Params, Statement};
 
 use tupparser::decode::MatchingPath;
 
-use crate::make_node;
+use crate::{make_node, make_tup_node};
 use crate::db::RowType::{Grp, TupF};
 use crate::db::StatementType::*;
 use crate::RowType::Rule;
@@ -213,11 +213,13 @@ pub enum StatementType {
     FindNodes,
     FindGlobNodes,
     FindNodePath,
+    FindNodeByPath,
     FindParentRule,
     UpdMTime,
     UpdDirId,
     DeleteId,
-    DeleteRuleLinks,
+    DeleteNormalRuleLinks,
+    DeleteStickyRuleLinks,
     ImmediateDeps,
     RuleDepRules,
     RestoreDeleted,
@@ -246,10 +248,11 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
+    fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
-    fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
+    fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
     fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
@@ -278,9 +281,11 @@ pub(crate) trait LibSqlExec {
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     fn delete_exec(&mut self, id: i64) -> Result<()>;
-    fn delete_rule_links(&mut self, rule_id: i64) -> Result<()>;
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
+    fn delete_sticky_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<i64>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -435,20 +440,11 @@ pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!("
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TABLE TUPPATHBUF AS
-SELECT node.id id, node.dir dir, node.mtime_ns mtime, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
+SELECT node.id id, node.dir dir, node.mtime_ns mtime_ns, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
 (NODE.dir = DIRPATHBUF.id and node.type={})", TupF as u8);
     conn.execute_batch(stmt.as_str())?;
     Ok(())
 }
-/*pub fn create_rule_buf_temptable(conn: &Connection) -> Result<()> {
-    let stmt = format!("
-DROP TABLE IF EXISTS RULEBUF;
-CREATE TEMPORARY TABLE RULEBUF AS
-SELECT node.id id, node.dir dir, node.mtime_ns mtime, DIRPATHBUF.name name from Node inner join DIRPATHBUF ON
-(NODE.dir = DIRPATHBUF.id and node.type={})", Rule as u8);
-    conn.execute_batch(stmt.as_str())?;
-    Ok(())
-}*/
 
 pub fn create_temptables(conn: &Connection) -> Result<()> {
     let stmt = "DROP TABLE IF EXISTS PresentList; CREATE TABLE PresentList(id  INTEGER PRIMARY KEY not NULL, type INTEGER); \
@@ -560,7 +556,7 @@ impl LibSqlPrepare for Connection {
 
     fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
         let rtype = Rule as u8;
-        let stmt = self.prepare(&*format!("SELECT id, dir, mtime_ns, name, type FROM Node where dir=? and type={rtype}"))?;
+        let stmt = self.prepare(&*format!("SELECT id, dir, type, name, mtime_ns FROM Node where dir=? and type={rtype}"))?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodes,
@@ -596,6 +592,14 @@ impl LibSqlPrepare for Connection {
             tok: FindParentRule,
         })
     }
+    fn find_node_by_path_prepare(&self) -> Result<SqlStatement> {
+        let stmtstr = format!("SELECT Node.id from Node where Node.name = ? and dir in (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)");
+        let stmt = self.prepare(stmtstr.as_str())?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNodeByPath,
+        })
+    }
 
     fn update_mtime_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("UPDATE Node Set mtime_ns = ? where id = ?")?;
@@ -621,32 +625,36 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(
-            "delete from StickyLink where from_id = ? or to_id  = ?;\
-            delete from NodeLink where from_id = ? or to_id  = ?",
+    fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)> {
+        let stmt1 = self.prepare(
+            "delete from StickyLink where from_id = ? or to_id  = ?"
         )?;
-        Ok(SqlStatement {
-            stmt,
-            tok: DeleteRuleLinks,
-        })
+        let stmt2 = self.prepare(
+            "delete from StickyLink where from_id = ? or to_id  = ?"
+        )?;
+        Ok((SqlStatement {
+            stmt: stmt1,
+            tok: DeleteStickyRuleLinks,
+        }, SqlStatement { stmt: stmt2, tok: DeleteNormalRuleLinks })
+        )
     }
 
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(" SELECT id from Node where id in (SELECT to_id from NormalLink where from_id=?")?;
+        let stmt = self.prepare(" SELECT id from Node where id in (SELECT to_id from NormalLink where from_id=?)")?;
         Ok(SqlStatement { stmt, tok: ImmediateDeps })
     }
 
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement> {
-        let ttype = TupF as u8;
         let rtype = Rule as u8;
         let stmt = self.prepare(&*format!(
-            "SELECT id, dir, mtime_ns, name, type  from Node where type={ttype} and dir in (SELECT dir from Node where type = {rtype} and id in (WITH RECURSIVE dependants(x) AS (
+            "SELECT id, dir, name from TUPPATHBUF where dir in
+             (SELECT dir from Node where type = {rtype} and id in
+            (WITH RECURSIVE dependants(x) AS (
    SELECT ?
    UNION
   SELECT to_id FROM NormalLink JOIN dependants ON NormalLink.from_id=x
 )
-SELECT DISTINCT x FROM dependants;))",
+SELECT DISTINCT x FROM dependants));",
         ))?;
         Ok(SqlStatement { stmt, tok: RuleDepRules })
     }
@@ -838,15 +846,6 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
-    fn delete_rule_links(&mut self, rule_id: i64) -> Result<()> {
-        anyhow::ensure!(
-            self.tok == DeleteRuleLinks,
-            "wrong token for delete rule links"
-        );
-        self.stmt.execute([rule_id, rule_id, rule_id, rule_id])?;
-        Ok(())
-    }
-
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()> {
         anyhow::ensure!(
             self.tok == ImmediateDeps,
@@ -855,7 +854,6 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute([rule_id])?;
         Ok(())
     }
-
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
         anyhow::ensure!(
             self.tok == RuleDepRules,
@@ -864,10 +862,40 @@ impl LibSqlExec for SqlStatement<'_> {
         let mut rows = self.stmt.query([rule_id])?;
         let mut vs = Vec::new();
         while let Some(r) = rows.next()? {
-            let n = make_node(r)?;
+            let n = make_tup_node(r)?;
             vs.push(n);
         }
         Ok(vs)
+    }
+
+    fn delete_sticky_rule_links(&mut self, rule_id: i64) -> Result<()> {
+        anyhow::ensure!(
+            self.tok == DeleteStickyRuleLinks,
+            "wrong token for delete rule links"
+        );
+        self.stmt.execute([rule_id, rule_id])?;
+        Ok(())
+    }
+
+    fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()> {
+        anyhow::ensure!(
+             self.tok == DeleteNormalRuleLinks,
+             "wrong token for delete rule links"
+         );
+        self.stmt.execute([rule_id, rule_id])?;
+        Ok(())
+    }
+    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<i64> {
+        anyhow::ensure!(
+             self.tok == FindNodeByPath,
+             "wrong token for find by path"
+         );
+        let dp = SqlStatement::db_path_str(dir_path);
+        let id = self.stmt.query_row([name, dp.as_str()], |r: &rusqlite::Row| -> Result<i64, rusqlite::Error>{
+            let id: i64 = r.get(0)?;
+            Ok(id)
+        })?;
+        Ok(id)
     }
 }
 
@@ -1028,10 +1056,7 @@ impl ForEachClauses for Connection {
         let mut rows = stmt.query(p)?;
         let mut mut_f = f;
         while let Some(row) = rows.next()? {
-            let i = row.get(0)?;
-            let dir: i64 = row.get(1)?;
-            let name: String = row.get(2)?;
-            mut_f(Node::new(i, dir, 0, name, TupF))?;
+            mut_f(make_tup_node(row)?)?
         }
         Ok(())
     }

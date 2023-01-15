@@ -33,6 +33,7 @@ use db::{Node, RowType};
 use db::RowType::{Dir, Grp};
 
 use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
+use crate::db::RowType::TupF;
 use crate::parse::{find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
 mod db;
@@ -71,6 +72,13 @@ enum Action {
 
 fn is_tupfile(s: &OsStr) -> bool {
     s == "Tupfile" || s == "Tupfile.lua"
+}
+
+fn make_tup_node(row: &Row) -> rusqlite::Result<Node> {
+    let i = row.get(0)?;
+    let dir: i64 = row.get(1)?;
+    let name: String = row.get(2)?;
+    Ok(Node::new(i, dir, 0, name, TupF))
 }
 
 fn make_node(row: &Row) -> rusqlite::Result<Node> {
