@@ -518,9 +518,10 @@ fn insert_nodes(
                 .as_path()
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| panic!("missing name:{:?}", path.as_path()));
+                .unwrap_or_else(|| panic!("missing name:{:?} for a path to insert", path.as_path()));
             if let Ok(nodeid) = find_nodeid.fetch_node_id(&name, dir) {
                 //path_db_id.insert(p, nodeid);
+                debug!("found {} in dir:{} to id:{}", name, dir, nodeid);
                 crossref.add_path_xref(*p, nodeid);
                 paths_to_update.insert(nodeid, mtime_ns);
             } else {
@@ -550,7 +551,8 @@ fn insert_nodes(
                     }
                 }
             }
-
+        }
+        for r in rules_in_tup_file.iter() {
             debug!(
                 "Cross referencing inputs to insert with the db ids with same name and directory"
             );

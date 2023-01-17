@@ -640,7 +640,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(" SELECT id from Node where id in (SELECT to_id from NormalLink where from_id=?)")?;
+        let stmt = self.prepare(" DELETE from Node WHERE id in (SELECT to_id from NormalLink where from_id=?)")?;
         Ok(SqlStatement { stmt, tok: ImmediateDeps })
     }
 
