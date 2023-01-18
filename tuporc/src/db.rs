@@ -285,7 +285,7 @@ pub(crate) trait LibSqlExec {
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
     fn delete_sticky_rule_links(&mut self, rule_id: i64) -> Result<()>;
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()>;
-    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<i64>;
+    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -593,7 +593,7 @@ impl LibSqlPrepare for Connection {
         })
     }
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement> {
-        let stmtstr = format!("SELECT Node.id from Node where Node.name = ? and dir in (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)");
+        let stmtstr = format!("SELECT Node.id, Node.dir from Node where Node.name = ? and dir in (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)");
         let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
             stmt,
@@ -885,17 +885,18 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
-    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<i64> {
+    fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)> {
         anyhow::ensure!(
              self.tok == FindNodeByPath,
              "wrong token for find by path"
          );
         let dp = SqlStatement::db_path_str(dir_path);
-        let id = self.stmt.query_row([name, dp.as_str()], |r: &rusqlite::Row| -> Result<i64, rusqlite::Error>{
+        let (id, pid) = self.stmt.query_row([name, dp.as_str()], |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error>{
             let id: i64 = r.get(0)?;
-            Ok(id)
+            let pid: i64 = r.get(1)?;
+            Ok((id, pid))
         })?;
-        Ok(id)
+        Ok((id, pid))
     }
 }
 

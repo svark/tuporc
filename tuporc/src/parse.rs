@@ -12,7 +12,7 @@ use tupparser::{
     ResolvedLink, RuleDescriptor, TupParser, TupPathDescriptor,
 };
 use tupparser::decode::{
-    get_resolved_path_desc, GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
+    GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
     PathSearcher, RuleRef,
 };
 use tupparser::errors::Error;
@@ -64,9 +64,11 @@ impl CrossRefMaps {
     }
 }
 
+/// Path searcher that scans the sqlite database for matching paths
+/// This is used to resolve globs and wildcards.
+/// It is used by the parser to resolve paths and globs. It also contains a cache of the `GeneratedFiles`
 struct DbPathSearcher {
     conn: Connection,
-    //glob_query: std::cell::RefCell<SqlStatement<'a>>,
     psx: OutputHolder,
 }
 
@@ -138,7 +140,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     e: bool,
 ) -> Result<Vec<ResolvedLink>> {
     let mut crossref = CrossRefMaps::default();
-    let (arts, mut rwbufs, mut outs) = {
+    let (arts, mut rwbufs, mut outs, ) = {
         let conn = Connection::open(".tup/db")
             .expect("Connection to tup database in .tup/db could not be established");
 
@@ -194,12 +196,38 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     add_links_to_groups(&mut conn, &arts, &crossref)?;
     fetch_group_provider_outputs(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
     add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    // add links from glob inputs to tupfiles's directory
+    add_link_glob_dir_to_rules(&mut conn, &rwbufs, &arts, &mut crossref)?;
+
+
     //let rules = gather_rules_to_run(conn)?;
     if e {
         exec_rules_to_run(&mut conn, root.as_ref())?;
     }
 
     Ok(Vec::new())
+}
+
+fn add_link_glob_dir_to_rules(conn: &mut Connection, rw_buf: &ReadWriteBufferObjects, arts: &Artifacts, crossref: &mut CrossRefMaps) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut insert_link = tx.insert_sticky_link_prepare()?;
+        let mut links_to_add = HashMap::new();
+        for rlink in arts.get_resolved_links() {
+            let rule_id = crossref.get_rule_db_id(rlink.get_rule_desc()).expect("tupfile dir not found");
+            rlink.for_each_glob_path_desc(|glob_path_desc|
+                {
+                    let glob_dir_desc = rw_buf.get_parent_id(&glob_path_desc).unwrap();
+                    links_to_add.insert(glob_dir_desc, rule_id);
+                });
+        }
+        for (glob_dir_desc, tupfile_dir) in links_to_add {
+            let glob_dir = crossref.get_path_db_id(&glob_dir_desc).unwrap_or_else(|| panic!("glob dir not found:{:?} ", glob_dir_desc));
+            insert_link.insert_sticky_link(glob_dir, tupfile_dir)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
@@ -429,7 +457,7 @@ fn fetch_group_provider_outputs(
     Ok(())
 }
 
-fn find_by_path(path: &Path, find_stmt: &mut SqlStatement) -> Result<i64> {
+fn find_by_path(path: &Path, find_stmt: &mut SqlStatement) -> Result<(i64, i64)> {
     let parent = path
         .parent()
         .unwrap_or_else(|| panic!("No parent folder found for file {:?}", path));
@@ -507,6 +535,7 @@ fn insert_nodes(
                 .as_path()
                 .parent()
                 .unwrap_or_else(|| panic!("No parent folder found for file {:?}", path.as_path()));
+            let dir_desc = read_write_buf.get_parent_id(p).unwrap_or_else(|| panic!("descriptor not found for path:{:?}", parent));
             let dir = {
                 let x = find_dirid.fetch_dirid(parent);
                 if x.is_err() {
@@ -514,6 +543,8 @@ fn insert_nodes(
                 }
                 x?
             };
+            crossref.add_path_xref(dir_desc, dir);
+
             let name = path
                 .as_path()
                 .file_name()
@@ -558,14 +589,16 @@ fn insert_nodes(
             );
             for rl in r.iter() {
                 for i in rl.get_sources() {
-                    let p = get_resolved_path_desc(i);
+                    let inp = read_write_buf.get_input_path_str(i);
+                    let p = i.get_resolved_path_desc();
                     if let Some(p) = p {
-                        let inp = read_write_buf.get_input_path_str(i);
                         if processed.insert(p) {
-                            if let Ok(nodeid) =
+                            if let Ok((nodeid, dirid)) =
                                 find_by_path(Path::new(inp.as_str()), &mut find_by_path_stmt)
                             {
+                                let parent_id = read_write_buf.get_parent_id(p).unwrap_or_else(|| panic!("no parent id found for:{:?}", p));
                                 crossref.add_path_xref(*p, nodeid);
+                                crossref.add_path_xref(parent_id, dirid);
                             } else {
                                 anyhow::ensure!(
                                     false,
