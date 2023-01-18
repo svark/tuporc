@@ -65,8 +65,7 @@ impl CrossRefMaps {
 }
 
 /// Path searcher that scans the sqlite database for matching paths
-/// This is used to resolve globs and wildcards.
-/// It is used by the parser to resolve paths and globs. It also contains a cache of the `GeneratedFiles`
+/// It is used by the parser to resolve paths and globs. Resolved outputs are dumped in OutputHolder
 struct DbPathSearcher {
     conn: Connection,
     psx: OutputHolder,
