@@ -275,7 +275,8 @@ pub(crate) trait LibSqlExec {
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>>;
     fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
         where
-            F: FnMut(&String) -> MatchingPath, P: AsRef<Path>;
+            F: FnMut(&String) -> MatchingPath,
+            P: AsRef<Path>;
     fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>>;
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
@@ -420,7 +421,6 @@ CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
     Ok(())
 }
 
-
 // creates a temp table for groups
 pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
     let stmt = format!(
@@ -556,7 +556,9 @@ impl LibSqlPrepare for Connection {
 
     fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
         let rtype = Rule as u8;
-        let stmt = self.prepare(&*format!("SELECT id, dir, type, name, mtime_ns FROM Node where dir=? and type={rtype}"))?;
+        let stmt = self.prepare(&*format!(
+            "SELECT id, dir, type, name, mtime_ns FROM Node where dir=? and type={rtype}"
+        ))?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodes,
@@ -626,22 +628,28 @@ impl LibSqlPrepare for Connection {
     }
 
     fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)> {
-        let stmt1 = self.prepare(
-            "delete from StickyLink where from_id = ? or to_id  = ?"
-        )?;
-        let stmt2 = self.prepare(
-            "delete from StickyLink where from_id = ? or to_id  = ?"
-        )?;
-        Ok((SqlStatement {
-            stmt: stmt1,
-            tok: DeleteStickyRuleLinks,
-        }, SqlStatement { stmt: stmt2, tok: DeleteNormalRuleLinks })
-        )
+        let stmt1 = self.prepare("delete from StickyLink where from_id = ? or to_id  = ?")?;
+        let stmt2 = self.prepare("delete from StickyLink where from_id = ? or to_id  = ?")?;
+        Ok((
+            SqlStatement {
+                stmt: stmt1,
+                tok: DeleteStickyRuleLinks,
+            },
+            SqlStatement {
+                stmt: stmt2,
+                tok: DeleteNormalRuleLinks,
+            },
+        ))
     }
 
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(" DELETE from Node WHERE id in (SELECT to_id from NormalLink where from_id=?)")?;
-        Ok(SqlStatement { stmt, tok: ImmediateDeps })
+        let stmt = self.prepare(
+            " DELETE from Node WHERE id in (SELECT to_id from NormalLink where from_id=?)",
+        )?;
+        Ok(SqlStatement {
+            stmt,
+            tok: ImmediateDeps,
+        })
     }
 
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement> {
@@ -656,11 +664,17 @@ impl LibSqlPrepare for Connection {
 )
 SELECT DISTINCT x FROM dependants));",
         ))?;
-        Ok(SqlStatement { stmt, tok: RuleDepRules })
+        Ok(SqlStatement {
+            stmt,
+            tok: RuleDepRules,
+        })
     }
     fn restore_deleted_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(&*format!("DELETE from DeletedList where id = ?"))?;
-        Ok(SqlStatement { stmt, tok: RestoreDeleted })
+        Ok(SqlStatement {
+            stmt,
+            tok: RestoreDeleted,
+        })
     }
 }
 
@@ -706,7 +720,7 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == InsertLink, "wrong token for insert link");
-        debug!("Normal link: {} -> {}" , from_id, to_id);
+        debug!("Normal link: {} -> {}", from_id, to_id);
         self.stmt.insert([from_id, to_id])?;
         Ok(())
     }
@@ -786,10 +800,15 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(nodes)
     }
 
-    fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, mut f: F) -> Result<Vec<MatchingPath>>
+    fn fetch_glob_nodes<F, P>(
+        &mut self,
+        glob_path: P,
+        gname: P,
+        mut f: F,
+    ) -> Result<Vec<MatchingPath>>
         where
             F: FnMut(&String) -> MatchingPath,
-            P: AsRef<Path>
+            P: AsRef<Path>,
     {
         anyhow::ensure!(
             self.tok == FindGlobNodes,
@@ -879,23 +898,23 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()> {
         anyhow::ensure!(
-             self.tok == DeleteNormalRuleLinks,
-             "wrong token for delete rule links"
-         );
+            self.tok == DeleteNormalRuleLinks,
+            "wrong token for delete rule links"
+        );
         self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
     fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)> {
-        anyhow::ensure!(
-             self.tok == FindNodeByPath,
-             "wrong token for find by path"
-         );
+        anyhow::ensure!(self.tok == FindNodeByPath, "wrong token for find by path");
         let dp = SqlStatement::db_path_str(dir_path);
-        let (id, pid) = self.stmt.query_row([name, dp.as_str()], |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error>{
-            let id: i64 = r.get(0)?;
-            let pid: i64 = r.get(1)?;
-            Ok((id, pid))
-        })?;
+        let (id, pid) = self.stmt.query_row(
+            [name, dp.as_str()],
+            |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error> {
+                let id: i64 = r.get(0)?;
+                let pid: i64 = r.get(1)?;
+                Ok((id, pid))
+            },
+        )?;
         Ok((id, pid))
     }
 }

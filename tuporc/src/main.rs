@@ -420,7 +420,7 @@ fn send_children(mut dir_children: DirChildren, pid: i64, ds: &Sender<ProtoNode>
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
-    log::debug!("Inserting/updating directory entries to db");
+    log::debug!("Inserting/updatng directory entries to db");
     db::create_temptables(conn)?;
     {
         let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
