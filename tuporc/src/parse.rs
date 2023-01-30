@@ -21,7 +21,7 @@ use crate::db::{
     create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
     ForEachClauses, LibSqlExec, SqlStatement,
 };
-use crate::db::RowType::GenF;
+use crate::db::RowType::{Env, GenF};
 use crate::RowType::Rule;
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
@@ -32,6 +32,7 @@ pub struct CrossRefMaps {
     pbo: BiMap<PathDescriptor, i64>,
     rbo: BiMap<RuleDescriptor, i64>,
     dbo: BiMap<TupPathDescriptor, i64>,
+    ebo: BiMap<String, i64>,
 }
 
 impl CrossRefMaps {
@@ -49,9 +50,17 @@ impl CrossRefMaps {
         self.dbo.get_by_left(r).copied()
     }
 
+    pub fn get_env_db_id(&self, e: &String) -> Option<i64> {
+        self.ebo.get_by_left(e).copied()
+    }
+
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64) {
         self.gbo.insert(g, db_id);
     }
+    pub fn add_env_xref(&mut self, e: String, db_id: i64) {
+        self.ebo.insert(e, db_id);
+    }
+
     pub fn add_path_xref(&mut self, p: PathDescriptor, db_id: i64) {
         self.pbo.insert(p, db_id);
     }
@@ -152,7 +161,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
                 let (mut del_sticky_link, mut del_normal_link) =
                     tx.delete_tup_rule_links_prepare()?;
                 let mut s = tx.fetch_rules_nodes_prepare_by_dirid()?;
-                let mut deloutputs = tx.mark_outputs_deleted_prepare()?;
+                let mut del_outputs = tx.mark_outputs_deleted_prepare()?;
                 let mut fetch_rule_deps = tx.get_rule_deps_tupfiles_prepare()?;
                 let mut tupfile_to_process = VecDeque::from(tupfiles);
                 while let Some(tupfile) = tupfile_to_process.pop_front() {
@@ -166,7 +175,7 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
                                 .extend(deps.into_iter().filter(|n| !visited.contains(&n)));
                             del_sticky_link.delete_sticky_rule_links(r.get_id())?;
                             del_normal_link.delete_normal_rule_links(r.get_id())?;
-                            deloutputs.mark_rule_outputs_deleted(r.get_id())?;
+                            del_outputs.mark_rule_outputs_deleted(r.get_id())?;
                         }
                     }
                 }
@@ -347,6 +356,17 @@ fn add_rule_links(
                     .expect("rule dbid fetch failed");
                 let mut processed = std::collections::HashSet::new();
                 let mut processed_group = std::collections::HashSet::new();
+                let env_desc = rl.get_env_desc();
+                let environs = rbuf.get_envs(env_desc);
+                log::debug!("adding links from envs  {:?} to rule: {:?}", env_desc, rule_node_id);
+                for env_var in environs.get_keys() {
+                    if let Some(env_id) = crossref.get_env_db_id(&env_var) {
+                        inp_linker.insert_sticky_link(env_id, rule_node_id)?;
+                    } else {
+                        debug!("db env not found with descriptor {:?}", env_var);
+                    }
+                }
+                log::debug!("adding links from inputs  {:?} to rule: {:?}", rl.get_sources(), rule_node_id);
                 for i in rl.get_sources() {
                     let mut added: bool = false;
                     match i {
@@ -417,6 +437,7 @@ fn add_rule_links(
                     }
                 }
                 {
+                    log::debug!("adding links from rule  {:?} to outputs: {:?}", rule_node_id, rl.get_targets());
                     for t in rl.get_targets() {
                         let p = crossref
                             .get_path_db_id(t)
@@ -486,6 +507,7 @@ fn insert_nodes(
     let mut paths_to_insert = BTreeSet::new();
     let mut rules_to_insert = Vec::new();
     let mut paths_to_update: HashMap<i64, i64> = HashMap::new();
+    let mut envs_to_insert = HashMap::new();
 
     // collect all un-added groups and add them in a single transaction.
     {
@@ -589,6 +611,9 @@ fn insert_nodes(
                         collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
                     }
                 }
+                let env_desc = rl.get_env_desc();
+                let environs = read_write_buf.get_envs(env_desc);
+                envs_to_insert.extend(environs.getenv());
             }
         }
         for r in rules_in_tup_file.iter() {
@@ -658,6 +683,23 @@ fn insert_nodes(
                 crossref.add_rule_xref(RuleDescriptor::new(desc), db_id);
             } else {
                 crossref.add_path_xref(PathDescriptor::new(desc), db_id);
+            }
+        }
+        let mut inst_env_stmt = tx.insert_env_prepare()?;
+        let mut fetch_env_stmt = tx.fetch_env_id_prepare()?;
+        let mut update_env_stmt = tx.update_env_prepare()?;
+        let mut add_to_modify_env_stmt = tx.add_to_modify_prepare()?;
+        for (env_var, env_val) in envs_to_insert {
+            if let Ok((env_id, env_val_db)) = fetch_env_stmt.fetch_env_id(env_var.as_str()) {
+                if !env_val_db.eq(&env_val) {
+                    update_env_stmt.update_env_exec(env_id, env_val)?;
+                    add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
+                }
+                crossref.add_env_xref(env_var, env_id);
+            } else {
+                let env_id = inst_env_stmt.insert_env_exec(env_var.as_str(), env_val.as_str())?;
+                crossref.add_env_xref(env_var, env_id);
+                add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
             }
         }
     }

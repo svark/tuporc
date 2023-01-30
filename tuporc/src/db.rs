@@ -9,7 +9,7 @@ use rusqlite::{Connection, Params, Statement};
 use tupparser::decode::MatchingPath;
 
 use crate::{make_node, make_tup_node};
-use crate::db::RowType::{Grp, TupF};
+use crate::db::RowType::{Env, Grp, TupF};
 use crate::db::StatementType::*;
 use crate::RowType::Rule;
 
@@ -32,6 +32,8 @@ pub enum RowType {
     //< Group
     GenD = 7, //< Generated Directory
 }
+
+const ENVDIR: i8 = -2;
 
 impl ToString for RowType {
     fn to_string(&self) -> String {
@@ -203,6 +205,7 @@ pub enum StatementType {
     InsertDir,
     InsertDirAux,
     InsertFile,
+    InsertEnv,
     InsertLink,
     InsertStickyLink,
     FindDirId,
@@ -210,6 +213,7 @@ pub enum StatementType {
     FindNode,
     FindNodeId,
     FindNodeById,
+    FindEnvId,
     FindNodes,
     FindGlobNodes,
     FindNodePath,
@@ -217,6 +221,7 @@ pub enum StatementType {
     FindParentRule,
     UpdMTime,
     UpdDirId,
+    UpdEnv,
     DeleteId,
     DeleteNormalRuleLinks,
     DeleteStickyRuleLinks,
@@ -239,11 +244,13 @@ pub(crate) trait LibSqlPrepare {
     fn insert_sticky_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_node_prepare(&self) -> Result<SqlStatement>;
+    fn insert_env_prepare(&self) -> Result<SqlStatement>;
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_env_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
@@ -251,6 +258,7 @@ pub(crate) trait LibSqlPrepare {
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
+    fn update_env_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
@@ -267,11 +275,13 @@ pub(crate) trait LibSqlExec {
     fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
     fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64>;
+    fn insert_env_exec(&mut self, env: &str, val: &str) -> Result<i64>;
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64>;
     fn fetch_group_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
+    fn fetch_env_id(&mut self, env_name_val: &str) -> Result<(i64, String)>;
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>>;
     fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
         where
@@ -281,6 +291,7 @@ pub(crate) trait LibSqlExec {
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
+    fn update_env_exec(&mut self, id: i64, val: String) -> Result<()>;
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
@@ -515,6 +526,16 @@ impl LibSqlPrepare for Connection {
         })
     }
 
+    fn insert_env_prepare(&self) -> Result<SqlStatement> {
+        let rtype = Env as u8;
+        let e = ENVDIR;
+        let stmt = self.prepare(&*format!("INSERT into Node (dir, name, type, display_str) Values ({e}, ?, {rtype}, ?)"))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertEnv,
+        })
+    }
+
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT id FROM DirPathBuf where name=?")?;
         Ok(SqlStatement {
@@ -551,6 +572,15 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: FindNodeById,
+        })
+    }
+
+    fn fetch_env_id_prepare(&self) -> Result<SqlStatement> {
+        let e = ENVDIR;
+        let stmt = self.prepare(&*format!("select id, display_str from node where name=? and dir={e}"))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindEnvId,
         })
     }
 
@@ -616,6 +646,13 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: UpdDirId,
+        })
+    }
+    fn update_env_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("Update Node Set display_str = ? where id=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdEnv,
         })
     }
 
@@ -749,6 +786,12 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(r)
     }
 
+    fn insert_env_exec(&mut self, env: &str, val: &str)  -> Result<i64> {
+        anyhow::ensure!(self.tok == InsertEnv, "wrong token for Insert env");
+        let r = self.stmt.insert( (env,val))?;
+        Ok(r)
+    }
+
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
         anyhow::ensure!(self.tok == FindDirId, "wrong token for find dir");
         let path_str = Self::db_path_str(p);
@@ -787,6 +830,15 @@ impl LibSqlExec for SqlStatement<'_> {
         log::debug!("query:{:?}, {:?}", node_name, dir);
         let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
         Ok(nodeid)
+    }
+
+    fn fetch_env_id(&mut self, env_name: &str) -> Result<(i64, String)> {
+        anyhow::ensure!(self.tok == FindEnvId, "wrong token for fetch env");
+        log::debug!("query env:{:?}", env_name);
+        let (nodeid, val) = self.stmt.query_row((env_name,), |r|
+                Ok((r.get(0)?, r.get(1)?))
+        )?;
+        Ok((nodeid, val))
     }
 
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>> {
@@ -856,6 +908,11 @@ impl LibSqlExec for SqlStatement<'_> {
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()> {
         anyhow::ensure!(self.tok == UpdDirId, "wrong token for dirid update");
         self.stmt.execute([dirid, id])?;
+        Ok(())
+    }
+    fn update_env_exec(&mut self, id: i64, val: String) -> Result<()> {
+        anyhow::ensure!(self.tok == UpdEnv, "wrong token for env display_str update");
+        self.stmt.execute((id, val.as_str()))?;
         Ok(())
     }
 
