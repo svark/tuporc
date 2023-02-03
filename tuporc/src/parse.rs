@@ -270,12 +270,6 @@ fn gather_rules_from_tupfiles(
         debug!("parsing {}", tupfile_node.get_name());
         let arts = p.parse(tupfile_node.get_name())?;
         new_arts.extend(arts)?;
-        //new_outputs.merge(&o)?;
-        //   let dir_id = tupfile_node.get_pid();
-        //    del_stmt.delete_rule_links(dir_id)?; // XTODO: Mark nodes as being deleted, track unreachable leaves in the graph that depend on this node.
-        //db_rules.extend(conn.fetch_db_rules(dir_id)?);
-        // need to mark generated nodes from rules of this tupfile as deleted unless resurrected below
-        //rules_in_tup_file.push(ParsedLinks::new(tupfile_node.clone(), rlinks));
     }
     Ok(new_arts)
 }
@@ -358,7 +352,11 @@ fn add_rule_links(
                 let mut processed_group = std::collections::HashSet::new();
                 let env_desc = rl.get_env_desc();
                 let environs = rbuf.get_envs(env_desc);
-                log::debug!("adding links from envs  {:?} to rule: {:?}", env_desc, rule_node_id);
+                log::debug!(
+                    "adding links from envs  {:?} to rule: {:?}",
+                    env_desc,
+                    rule_node_id
+                );
                 for env_var in environs.get_keys() {
                     if let Some(env_id) = crossref.get_env_db_id(&env_var) {
                         inp_linker.insert_sticky_link(env_id, rule_node_id)?;
@@ -366,7 +364,11 @@ fn add_rule_links(
                         debug!("db env not found with descriptor {:?}", env_var);
                     }
                 }
-                log::debug!("adding links from inputs  {:?} to rule: {:?}", rl.get_sources(), rule_node_id);
+                log::debug!(
+                    "adding links from inputs  {:?} to rule: {:?}",
+                    rl.get_sources(),
+                    rule_node_id
+                );
                 for i in rl.get_sources() {
                     let mut added: bool = false;
                     match i {
@@ -437,7 +439,11 @@ fn add_rule_links(
                     }
                 }
                 {
-                    log::debug!("adding links from rule  {:?} to outputs: {:?}", rule_node_id, rl.get_targets());
+                    log::debug!(
+                        "adding links from rule  {:?} to outputs: {:?}",
+                        rule_node_id,
+                        rl.get_targets()
+                    );
                     for t in rl.get_targets() {
                         let p = crossref
                             .get_path_db_id(t)
