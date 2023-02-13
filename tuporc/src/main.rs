@@ -3,6 +3,7 @@ extern crate clap;
 extern crate crossbeam;
 extern crate env_logger;
 extern crate execute;
+extern crate parking_lot;
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -93,7 +94,7 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
         2 => Dir,
         3 => RowType::Env,
         4 => RowType::GenF,
-        5 => RowType::TupF,
+        5 => TupF,
         6 => Grp,
         7 => RowType::GenD,
         _ => panic!("Invalid type {} for row with id:{}", rtype, id),
@@ -534,7 +535,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                 // for a node already in db, check the diffs in mtime
                                 // otherwise insert node in db
                                 let rtype = if is_tupfile(f.file_name()) {
-                                    RowType::TupF
+                                    TupF
                                 } else {
                                     RowType::File
                                 };

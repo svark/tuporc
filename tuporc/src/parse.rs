@@ -1,10 +1,14 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use bimap::BiMap;
+use crossbeam::sync::WaitGroup;
 use execute::shell;
 use log::debug;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use tupparser::{
@@ -16,7 +20,7 @@ use tupparser::decode::{
 };
 use tupparser::errors::Error;
 
-use crate::{get_dir_id, LibSqlPrepare, Node, RowType};
+use crate::{get_dir_id, LibSqlPrepare, MAX_THRS_DIRS, Node, RowType};
 use crate::db::{
     create_dir_path_buf_temptable, create_group_path_buf_temptable, create_tup_path_buf_temptable,
     ForEachClauses, LibSqlExec, SqlStatement,
@@ -74,15 +78,16 @@ impl CrossRefMaps {
 
 /// Path searcher that scans the sqlite database for matching paths
 /// It is used by the parser to resolve paths and globs. Resolved outputs are dumped in OutputHolder
+#[derive(Debug, Clone)]
 struct DbPathSearcher {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
     psx: OutputHolder,
 }
 
 impl DbPathSearcher {
     pub fn new(conn: Connection) -> DbPathSearcher {
         DbPathSearcher {
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             psx: OutputHolder::new(),
         }
     }
@@ -105,7 +110,8 @@ impl DbPathSearcher {
                 MatchingPath::new(pd)
             }
         };
-        let mut glob_query = self.conn.fetch_glob_nodes_prepare()?;
+        let conn = self.conn.deref().lock();
+        let mut glob_query = conn.fetch_glob_nodes_prepare()?;
         let mps =
             glob_query.fetch_glob_nodes(base_path.as_path(), diff_path.as_path(), fetch_row)?;
         Ok(mps)
@@ -135,9 +141,6 @@ impl PathSearcher for DbPathSearcher {
         OutputHandler::merge(&mut self.psx, o)
     }
 
-    fn acquire(&mut self, t: OutputHolder) {
-        self.psx.acquire(t)
-    }
 }
 
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
@@ -155,8 +158,9 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
         let mut visited = BTreeSet::new();
         {
-            let mut dbref = parser.get_mut_searcher();
-            let tx = dbref.conn.transaction()?;
+            let dbref = parser.get_mut_searcher();
+            let mut conn = dbref.conn.deref().lock();
+            let tx = conn.transaction()?;
             {
                 let (mut del_sticky_link, mut del_normal_link) =
                     tx.delete_tup_rule_links_prepare()?;
@@ -265,13 +269,31 @@ fn gather_rules_from_tupfiles(
 ) -> Result<Artifacts> {
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let mut new_arts = Artifacts::new();
-    for tupfile_node in tupfiles.iter() {
-        // try fetching statements in this tupfile already in the database to avoid inserting same rules again
-        debug!("parsing {}", tupfile_node.get_name());
-        let arts = p.parse(tupfile_node.get_name())?;
-        new_arts.extend(arts)?;
-    }
-    Ok(new_arts)
+    let (sender, receiver) = crossbeam::channel::unbounded();
+    let x = crossbeam::thread::scope(|s| -> Result<Artifacts> {
+        let wg = WaitGroup::new();
+        for ithread in 0..MAX_THRS_DIRS {
+            for tupfile in tupfiles.iter().filter(|x| !x.get_name().ends_with(".lua")).cloned().skip(ithread as usize).step_by(MAX_THRS_DIRS as usize) {
+                let mut p = p.clone();
+                let sender = sender.clone();
+                let wg = wg.clone();
+                s.spawn(move |_| -> Result<()> {
+                    p.send_tupfile(tupfile.get_name(), sender)?;
+                    drop(wg);
+                    Ok(())
+                });
+            }
+        }
+        drop(sender);
+        for tupfile_lua in tupfiles.iter().filter(|x| x.get_name().ends_with(".lua")).cloned() {
+            let arts = p.parse(tupfile_lua.get_name())?;
+            new_arts.extend(arts);
+        }
+        new_arts.extend(p.receive_resolved_statements(receiver)?);
+        wg.wait();
+        Ok(new_arts)
+    });
+    x.unwrap()
 }
 pub(crate) fn exec_rules_to_run(conn: &mut Connection, root: &Path) -> Result<()> {
     let rule_nodes = conn.rules_to_run()?;
