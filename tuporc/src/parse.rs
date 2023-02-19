@@ -1,12 +1,13 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs::read;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use execute::shell;
+use eyre::{eyre, Report, Result};
 use log::debug;
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -278,7 +279,12 @@ fn gather_rules_from_tupfiles(
                 let sender = sender.clone();
                 let wg = wg.clone();
                 s.spawn(move |_| -> Result<()> {
-                    p.send_tupfile(tupfile.get_name(), sender)?;
+                    p.send_tupfile(tupfile.get_name(), sender)
+                        .map_err(|error| {
+                            let rwbuf = p.read_write_buffers();
+                            let display_str = rwbuf.display_str(&error);
+                            Report::new(error).wrap_err(format!("Error while parsing tupfile: {}:\n {}", tupfile.get_name(), display_str))
+                        })?;
                     drop(wg);
                     Ok(())
                 });
@@ -289,11 +295,16 @@ fn gather_rules_from_tupfiles(
             let arts = p.parse(tupfile_lua.get_name())?;
             new_arts.extend(arts);
         }
-        new_arts.extend(p.receive_resolved_statements(receiver)?);
+        new_arts.extend(p.receive_resolved_statements(receiver).map_err(|error| {
+            let read_write_buffers = p.read_write_buffers();
+            let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor()).to_string_lossy().to_string();
+            let display_str = read_write_buffers.display_str(error.get_error_ref());
+            Report::new(error.get_error()).wrap_err(format!("Unable to resolve statements in tupfile {}:\n{}", tup_node.as_str(), display_str))
+        })?);
         wg.wait();
         Ok(new_arts)
     });
-    x.unwrap()
+    x.expect("Threading error while fetching artifacts from tupfiles")
 }
 pub(crate) fn exec_rules_to_run(conn: &mut Connection, root: &Path) -> Result<()> {
     let rule_nodes = conn.rules_to_run()?;
@@ -342,7 +353,7 @@ fn check_uniqueness_of_parent_rule(
                 let tup_path = read_buf.get_tup_path(parent_rule_ref.get_tupfile_desc());
                 //let rule_str = parent_rule_ref.to_string();
                 {
-                    return Err(anyhow::Error::msg(
+                    return Err(eyre!(
                         format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
                                 node.get_name(), tup_path.to_string_lossy(), parent_rule_ref.get_line()
                         )
@@ -374,7 +385,7 @@ fn add_rule_links(
                 let mut processed_group = std::collections::HashSet::new();
                 let env_desc = rl.get_env_desc();
                 let environs = rbuf.get_envs(env_desc);
-                log::debug!(
+                debug!(
                     "adding links from envs  {:?} to rule: {:?}",
                     env_desc,
                     rule_node_id
@@ -451,7 +462,7 @@ fn add_rule_links(
                     if !added {
                         let fname = rbuf.get_input_path_str(&i);
 
-                        anyhow::ensure!(
+                        eyre::ensure!(
                             false,
                             format!(
                                 "could not add a link from input {} to ruleid:{}",
@@ -628,7 +639,7 @@ fn insert_nodes(
                 let rule_ref = rl.get_rule_ref();
                 let tup_desc = rule_ref.get_tupfile_desc();
                 let dir = crossref.get_tup_dir(tup_desc).ok_or_else(|| {
-                    anyhow::Error::msg(format!(
+                    eyre::Error::msg(format!(
                         "No tup directory found in db for tup descriptor:{:?}",
                         tup_desc
                     ))
@@ -663,7 +674,7 @@ fn insert_nodes(
                                 crossref.add_path_xref(*p, nodeid);
                                 crossref.add_path_xref(parent_id, dirid);
                             } else {
-                                anyhow::ensure!(
+                                eyre::ensure!(
                                     false,
                                     "unresolved input found:{:?} for rule: {:?}",
                                     inp,
@@ -672,7 +683,7 @@ fn insert_nodes(
                             }
                         }
                     } else {
-                        anyhow::ensure!(
+                        eyre::ensure!(
                             false,
                             "unresolved input found:{:?} for rule: {:?}",
                             p,
@@ -751,7 +762,7 @@ pub(crate) fn find_upsert_node(
                 .insert_node_exec(node)
                 .map(|i| Node::copy_from(i, node))?;
             add_to_modify.add_to_modify_exec(node.get_id(), *node.get_type())?;
-            Ok::<Node, anyhow::Error>(node)
+            Ok::<Node, eyre::Error>(node)
         })
         .and_then(|existing_node| {
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 2 {

@@ -12,7 +12,7 @@ rusqlite = { version = "0.28.0", features = ["bundled"] }
 tupparser = { path = "../tuprs" }
 tupsetuphook = { path = "../tupsetuphook" }
 walkdir = "2.3.2"
-anyhow = "1.0.68"
+eyre = "0.6.8"
 bimap = "0.6.1"
 crossbeam = "0.8.2"
 env_logger = "0.10.0"

@@ -3,6 +3,7 @@ extern crate clap;
 extern crate crossbeam;
 extern crate env_logger;
 extern crate execute;
+extern crate eyre;
 extern crate parking_lot;
 
 use std::borrow::Borrow;
@@ -13,18 +14,18 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
 use std::hash::{Hash, Hasher};
 use std::hash::BuildHasher;
-use std::io::Error;
+use std::io::Error as IOError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 use std::vec::Drain;
 
-use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::WaitGroup;
 use crossbeam::thread;
+use eyre::{eyre, Result};
 use rusqlite::{Connection, Row};
 use walkdir::DirEntry;
 use walkdir::WalkDir;
@@ -124,7 +125,7 @@ fn main() -> Result<()> {
                 let mut conn = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 if !is_initialized(&conn) {
-                    return Err(anyhow::Error::msg(
+                    return Err(eyre!(
                         "Tup database is not initialized, use `tup init' to initialize",
                     ));
                 }
@@ -141,7 +142,7 @@ fn main() -> Result<()> {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
                     if !is_initialized(&conn) {
-                        return Err(anyhow::Error::msg(
+                        return Err(eyre!(
                             "Tup database is not initialized, use `tup init' to initialize",
                         ));
                     }
@@ -158,7 +159,7 @@ fn main() -> Result<()> {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
                     if !is_initialized(&conn) {
-                        return Err(anyhow::Error::msg(
+                        return Err(eyre!(
                             "Tup database is not initialized, use `tup init' to initialize",
                         ));
                     }
@@ -190,7 +191,7 @@ pub(crate) fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P)
 }
 
 /// mtime stored wrt 1-1-1970
-fn time_since_unix_epoch(meta_data: &Metadata) -> Result<Duration, Error> {
+fn time_since_unix_epoch(meta_data: &Metadata) -> Result<Duration, IOError> {
     let st = meta_data.modified()?;
     Ok(st
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -425,13 +426,13 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     db::create_temptables(conn)?;
     {
         let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
-        let n = n.ok_or_else(|| anyhow::Error::msg("no such node : '.'"));
+        let n = n.ok_or_else(|| eyre!("no such node : '.'"));
         let n = n.or_else(|_| -> Result<i64> {
             let mut insert_dir = conn.insert_dir_prepare()?;
             let i = insert_dir.insert_dir_exec(".", 0)?;
             Ok(i)
         })?;
-        anyhow::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
+        eyre::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
         conn.add_to_present_prepare()?.add_to_present_exec(n, Dir)?;
     }
 
