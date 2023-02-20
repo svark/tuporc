@@ -98,13 +98,17 @@ impl DbPathSearcher {
         glob_path: &GlobPath,
     ) -> Result<Vec<MatchingPath>> {
         let has_glob_pattern = glob_path.has_glob_pattern();
+        if has_glob_pattern {
+            debug!("looking for matches in db for glob pattern: {:?}", glob_path.get_abs_path());
+        }
         let base_path = ph.get_path(glob_path.get_base_desc()).clone();
         let diff_path = ph.get_rel_path(glob_path.get_path_desc(), glob_path.get_base_desc());
         let fetch_row = |s: &String| {
             debug!("found:{} at {:?}", s, base_path.as_path());
             let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
             if has_glob_pattern {
-                let grps = glob_path.group(s.as_str());
+                let full_path = glob_path.get_base_abs_path().join(s.as_str());
+                let grps = glob_path.group(full_path.as_path());
                 MatchingPath::with_captures(pd, grps)
             } else {
                 MatchingPath::new(pd)
