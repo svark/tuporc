@@ -557,7 +557,7 @@ fn insert_nodes(
         let mut find_group_id = conn.fetch_groupid_prepare()?;
         read_write_buf.for_each_group(|(group_path, grp_id)| {
             let parent = tupparser::transform::get_parent_str(group_path.as_path());
-            if let Some(dir) = get_dir_id(&mut find_dirid, parent) {
+            if let Some(dir) = get_dir_id(&mut find_dirid, parent.to_cow_str().as_ref()) {
                 let grp_name = group_path.file_name();
                 let id = find_group_id.fetch_group_id(grp_name.as_str(), dir).ok();
                 if let Some(i) = id {
