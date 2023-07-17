@@ -4,12 +4,13 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 use eyre::Result;
 use log::debug;
+use pathdiff::diff_paths;
 use rusqlite::{Connection, Params, Statement};
 
 use tupparser::decode::MatchingPath;
 
 use crate::{make_node, make_tup_node};
-use crate::db::RowType::{Env, Grp, TupF};
+use crate::db::RowType::{Env, Grp};
 use crate::db::StatementType::*;
 use crate::RowType::Rule;
 
@@ -30,7 +31,19 @@ pub enum RowType {
     //< Tupfile or lua
     Grp = 6,
     //< Group
-    GenD = 7, //< Generated Directory
+    DirGen = 7, //< Generated Directory
+}
+
+impl PartialOrd<Self> for RowType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (*self as u8).partial_cmp(&(*other as u8))
+    }
+}
+
+impl Ord for RowType {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (*self as u8).cmp(&(*other as u8))
+    }
 }
 
 const ENVDIR: i8 = -2;
@@ -59,7 +72,7 @@ impl TryFrom<u8> for RowType {
         } else if value == 6 {
             Ok(Self::Grp)
         } else if value == 7 {
-            Ok(Self::GenD)
+            Ok(Self::DirGen)
         } else {
             Err(value)
         }
@@ -202,12 +215,13 @@ pub enum StatementType {
     AddToMod,
     AddToDel,
     AddToPres,
+    AddToTempIds,
     InsertDir,
     InsertDirAux,
     InsertFile,
     InsertEnv,
     InsertLink,
-    InsertStickyLink,
+    //InsertFnTrace,
     FindDirId,
     FindGroupId,
     FindNode,
@@ -219,15 +233,20 @@ pub enum StatementType {
     FindNodePath,
     FindNodeByPath,
     FindParentRule,
+    //FindIo,
     UpdMTime,
     UpdDirId,
     UpdEnv,
     DeleteId,
     DeleteNormalRuleLinks,
-    DeleteStickyRuleLinks,
     ImmediateDeps,
     RuleDepRules,
     RestoreDeleted,
+    FetchIO,
+    FetchEnvsForRule,
+    RemovePresents,
+    FetchOutputsForRule,
+    FetchInputsForRule,
 }
 
 pub struct SqlStatement<'conn> {
@@ -239,9 +258,9 @@ pub(crate) trait LibSqlPrepare {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement>;
     fn add_to_delete_prepare(&self) -> Result<SqlStatement>;
     fn add_to_present_prepare(&self) -> Result<SqlStatement>;
+    fn remove_presents_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
-    fn insert_sticky_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_node_prepare(&self) -> Result<SqlStatement>;
     fn insert_env_prepare(&self) -> Result<SqlStatement>;
@@ -260,47 +279,93 @@ pub(crate) trait LibSqlPrepare {
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn update_env_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
-    fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)>;
+    fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
     fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
+    fn mark_deleted_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_io_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_envs_for_rule_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement>;
 }
 
 pub(crate) trait LibSqlExec {
-    fn add_to_modify_exec(&mut self, id: i64, rtyp: RowType) -> Result<()>;
-    fn add_to_delete_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
-    fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
+    /// Add a node to the modify list. These are nodes(files rules, etc) that have been modified since the last run
+    fn add_to_modify_exec(&mut self, node_id: i64, rtyp: RowType) -> Result<()>;
+    /// Add a node to the delete list. These are nodes(files rules, etc) that have been deleted since the last run
+    fn add_to_delete_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
+    /// Add a node to the present list. These are nodes(files rules, etc) that still exist after the last run
+    fn add_to_present_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
+    fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
+    fn remove_presents_exec(&mut self) -> Result<()>;
+    /// Insert a directory node into the database
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
+    /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxillary table
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
-    fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
-    fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
+    /// Insert a link between two nodes into the database. This is used to keep track of the dependencies between nodes and build a graph
+    fn insert_link(&mut self, from_id: i64, to_id: i64, is_sticky: bool, to_type: RowType) -> Result<()>;
+    /// Insert a sticky link between two nodes into the database. This is used to keep track of the dependencies between nodes and build a graph
+    //fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()>;
+    /// insert a node into the database
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64>;
+    /// Insert an env key value pair into the database
     fn insert_env_exec(&mut self, env: &str, val: &str) -> Result<i64>;
+    /// fetch directory node id from its path.
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64>;
+    /// fetch group id from its name and directory
     fn fetch_group_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
+    /// fetch a node from its name and directory
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
+    /// fetch a node by its id
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node>;
+    /// fetch id of a node from its name and directory
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
+    /// fetch id of an env key from its name
     fn fetch_env_id(&mut self, env_name_val: &str) -> Result<(i64, String)>;
+    /// fetch all the nodes that are rules and are in the given directory
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>>;
-    fn fetch_glob_nodes<F, P>(&mut self, glob_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
+    /// fetch all the nodes that match the given glob pattern and are in the given directory
+    fn fetch_glob_nodes<F, P>(&mut self, base_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
         where
-            F: FnMut(&String) -> MatchingPath,
+            F: FnMut(&String) -> Option<MatchingPath>,
             P: AsRef<Path>;
+    /// fetch rule that produces the given node
     fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>>;
+    /// fetch node path from its name and directory id
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
-    fn update_mtime_exec(&mut self, dirid: i64, mtime_ns: i64) -> Result<()>;
+    /// update modified time for a node with the given id
+    fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()>;
+    /// update directory id for a node with the given id
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
+    /// update env value  for a env node with the given id
     fn update_env_exec(&mut self, id: i64, val: String) -> Result<()>;
+    /// delete a node with the given id
     fn delete_exec(&mut self, id: i64) -> Result<()>;
+    /// deleted nodes that are outputs of a rule with the given rule id
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
+    /// fetch all tupfiles that depend on the given rule (usually via a group output)
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
-    fn delete_sticky_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    /// delete normal links between nodes that are inputs and outputs of a rule with the given rule id
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()>;
+    /// find node by path
     fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)>;
+    /// fetch all read write operations performed by a process with given pid
+    fn fetch_io(&mut self, proc_id: i32) -> Result<Vec<(String, u8)>>;
+    /// fetch all envs necessary for the given rule
+    fn fetch_envs(&mut self, rule_id: i32) -> Result<Vec<String>>;
+    /// fetch all inputs of the given rule
+    fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
+    /// fetch all outputs of the given rule
+    fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
+    fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
+    fn prune_present_list(&self) -> Result<()>;
+    fn prune_modified_list(&self) -> Result<()>;
+    fn insert_trace<P: AsRef<Path>>(&mut self, filepath: P, pid: u32, gen: u32, typ: i8, childcnt: i32) -> Result<i64>;
+    fn remove_modified_list(&self) -> Result<()>;
 }
 pub(crate) trait ForEachClauses {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
@@ -343,28 +408,32 @@ pub(crate) trait ForEachClauses {
     fn fetch_db_outputs(&self, rule_id: i64) -> Result<Vec<i64>>;
 
     fn for_tupid_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(Node) -> Result<()>;
+        where
+            P: Params,
+            F: FnMut(Node) -> Result<()>;
     fn for_id<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(i64) -> Result<()>;
+        where
+            P: Params,
+            F: FnMut(i64) -> Result<()>;
     fn for_node<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
-    where
-        P: Params,
-        F: FnMut(Node) -> Result<()>;
+        where
+            P: Params,
+            F: FnMut(Node) -> Result<()>;
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>>;
+    fn for_each_link<F>(&mut self, f: F) -> Result<()>
+        where F: FnMut(i32, i32) -> Result<()>;
+    fn rules_to_run_1st_pass(&self) -> Result<Vec<Node>>;
     //fn populate_delete_list(&self) -> Result<()>;
-    fn rules_to_run(&self) -> Result<Vec<Node>>;
+    fn rules_to_run_no_target(&self) -> Result<Vec<Node>>;
+    fn get_target_ids(&self, root: &Path, target_ids: &Vec<String>) -> Result<Vec<i64>>;
 }
 
 // Check if the node table exists in .tup/db
-pub fn is_initialized(conn: &Connection) -> bool {
+pub fn is_initialized(conn: &Connection, table_name: &str) -> bool {
     if let Ok(mut stmt) =
         conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?; ")
     {
-        stmt.query_row(["Node"], |_x| Ok(true)).is_ok()
+        stmt.query_row([table_name], |_x| Ok(true)).is_ok()
     } else {
         false
     }
@@ -376,118 +445,70 @@ pub fn init_db() {
     //use std::fs;
     std::fs::create_dir_all(".tup").expect("Unable to access .tup dir");
     let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
-    conn.execute(
-        "CREATE TABLE Node(id  INTEGER PRIMARY KEY not NULL, dir INTEGER not NULL, type INTEGER not NULL,\
-                         name VARCHAR(4096),  mtime_ns INTEGER DEFAULT 0, display_str VARCHAR(4096), flags VARCHAR(256), srcid INTEGER default -1, unique(dir, name));",
-        (),
+    conn.execute_batch(
+        include_str!("sql/node_table.sql")
     )
-        .expect("Node table already exists.");
+        .expect("failed to create tables in tup database.");
 
-    // NormalLink has links between tup files/rules/groups etc
-    conn.execute(
-        "CREATE TABLE NormalLink (from_id INTEGER, to_id INTEGER, \
-          unique (from_id, to_id) ); ",
-        (),
-    )
-    .expect("Failed to create NormalLink Table");
-
-    // Above table is indexed based on to_id
-    conn.execute("CREATE INDEX NormalLinkIdx ON NormalLink(to_id);", ())
-        .expect("Failed to create index on NormalLink Table");
-
-    // StickyLinks are static links
-    conn.execute(
-        "CREATE TABLE StickyLink (from_id INTEGER, to_id INTEGER,\
-      unique (from_id, to_id)); ",
-        (),
-    )
-    .expect("Failed to create StickyLink Table");
-
-    // Var table has env variables
-    conn.execute(
-        "CREATE TABLE Var ( id INTEGER PRIMARY KEY, value VARCHAR);",
-        (),
-    )
-    .expect("Failed to create Var table");
     let _ = File::create("Tupfile.ini").expect("could not open Tupfile.ini for write");
     println!("Finished creating tables");
 }
 
 // create a temp table from directories paths to their node ids
-pub fn create_dir_path_buf_temptable(conn: &Connection) -> Result<()> {
+pub fn create_path_buf_temptable(conn: &Connection) -> Result<()> {
     // https://gist.github.com/jbrown123/b65004fd4e8327748b650c77383bf553
-    let stmt = format!(
-        "DROP TABLE IF EXISTS DIRPATHBUF;
-CREATE TABLE DIRPATHBUF AS WITH RECURSIVE full_path(id, name) AS
-(
-    VALUES(1, '.')
-    UNION ALL
-	SELECT  node.id id, full_path.name || '/' || node.name name
-           FROM node JOIN full_path ON node.dir=full_path.id
-            where node.type={}
- ) SELECT  id, name from full_path",
-        RowType::Dir as u8
-    );
-    conn.execute_batch(stmt.as_str())?;
+    //let dir : u8 = RowType::Dir as u8;
+    let s = include_str!("sql/dirpathbuf_temptable.sql");
+    conn.execute_batch(s)?;
     Ok(())
 }
 
-// creates a temp table for groups
-pub fn create_group_path_buf_temptable(conn: &Connection) -> Result<()> {
-    let stmt = format!(
-        "
-    DROP TABLE IF EXISTS GRPPATHBUF;
-CREATE  TABLE GRPPATHBUF AS
-   SELECT  node.id id ,DIRPATHBUF.name || '/' || node.name Name from node inner join DIRPATHBUF on
-       (node.dir=DIRPATHBUF.id and node.type={})",
-        RowType::Grp as u8
-    );
-    conn.execute_batch(stmt.as_str())?;
+
+pub fn create_dyn_io_temp_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("sql/dynio.sql"))?;
     Ok(())
 }
 
-//creates a temp table for tup file paths
-pub fn create_tup_path_buf_temptable(conn: &Connection) -> Result<()> {
-    let stmt = format!("
-DROP TABLE IF EXISTS TUPPATHBUF;
-CREATE TABLE TUPPATHBUF AS
-SELECT node.id id, node.dir dir, node.mtime_ns mtime_ns, DIRPATHBUF.name || '/' || node.name name from Node inner join DIRPATHBUF ON
-(NODE.dir = DIRPATHBUF.id and node.type={})", TupF as u8);
-    conn.execute_batch(stmt.as_str())?;
-    Ok(())
-}
-
+//creates a temp table
 pub fn create_temptables(conn: &Connection) -> Result<()> {
-    let stmt = "DROP TABLE IF EXISTS PresentList; CREATE TABLE PresentList(id  INTEGER PRIMARY KEY not NULL, type INTEGER); \
-    Drop Table If Exists ModifyList; Create Table ModifyList(id INTEGER PRIMARY KEY not NULL, type INTEGER);\
-    Drop Table If Exists DeleteList; Create Table DeleteList(id INTEGER PRIMARY KEY not NULL, type INTEGER);\
-";
+    let stmt = include_str!("sql/temptables.sql");
     conn.execute_batch(stmt)?;
     Ok(())
 }
 
 impl LibSqlPrepare for Connection {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into ModifyList(id, type) Values (?,?)")?;
+        let stmt = self.prepare("INSERT or IGNORE into ModifyList(id, type) Values (?,?)")?;
         Ok(SqlStatement {
             stmt,
             tok: AddToMod,
         })
     }
     fn add_to_delete_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into DeleteList(id, type) Values (?,?)")?;
+        let stmt = self.prepare("INSERT or IGNORE into DeleteList(id, type) Values (?,?)")?;
         Ok(SqlStatement {
             stmt,
             tok: AddToDel,
         })
     }
     fn add_to_present_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into PresentList(id, type) Values(?,?)")?;
+        let stmt = self.prepare("INSERT or IGNORE into PresentList(id, type) Values(?,?)")?;
         Ok(SqlStatement {
             stmt,
             tok: AddToPres,
         })
     }
+
+    fn remove_presents_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(
+            "DELETE from DeleteList where id in (SELECT id from PresentList)"
+        )?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RemovePresents,
+        })
+    }
+
     fn insert_dir_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into Node (name, dir, type) Values (?,?,?);")?;
         Ok(SqlStatement {
@@ -503,15 +524,9 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn insert_sticky_link_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into StickyLink (from_id, to_id) Values (?,?)")?;
-        Ok(SqlStatement {
-            stmt,
-            tok: InsertStickyLink,
-        })
-    }
+
     fn insert_link_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("INSERT into NormalLink (from_id, to_id) Values (?,?)")?;
+        let stmt = self.prepare("INSERT OR IGNORE into NormalLink (from_id, to_id, issticky, to_type) Values (?,?,?, ?)")?;
         Ok(SqlStatement {
             stmt,
             tok: InsertLink,
@@ -577,7 +592,7 @@ impl LibSqlPrepare for Connection {
 
     fn fetch_env_id_prepare(&self) -> Result<SqlStatement> {
         let e = ENVDIR;
-        let stmt = self.prepare(&*format!("select id, display_str from node where name=? and dir={e}"))?;
+        let stmt = self.prepare(&*format!("Select id, display_str from node where name=? and dir={e}"))?;
         Ok(SqlStatement {
             stmt,
             tok: FindEnvId,
@@ -625,7 +640,8 @@ impl LibSqlPrepare for Connection {
         })
     }
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement> {
-        let stmtstr = format!("SELECT Node.id, Node.dir from Node where Node.name = ? and dir in (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)");
+        let stmtstr = format!("SELECT Node.id, Node.dir from Node where Node.name = ? and dir in \
+        (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)");
         let stmt = self.prepare(stmtstr.as_str())?;
         Ok(SqlStatement {
             stmt,
@@ -664,30 +680,27 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn delete_tup_rule_links_prepare(&self) -> Result<(SqlStatement, SqlStatement)> {
-        let stmt1 = self.prepare("delete from StickyLink where from_id = ? or to_id  = ?")?;
-        let stmt2 = self.prepare("delete from StickyLink where from_id = ? or to_id  = ?")?;
-        Ok((
+    fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE from NormalLink where from_id = ? or to_id  = ?")?;
+        Ok(
             SqlStatement {
-                stmt: stmt1,
-                tok: DeleteStickyRuleLinks,
-            },
-            SqlStatement {
-                stmt: stmt2,
+                stmt,
                 tok: DeleteNormalRuleLinks,
             },
-        ))
+        )
     }
 
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(
-            " DELETE from Node WHERE id in (SELECT to_id from NormalLink where from_id=?)",
+            " INSERT into DeleteList (id) \
+             SELECT to_id from NormalLink where from_id=?",
         )?;
         Ok(SqlStatement {
             stmt,
             tok: ImmediateDeps,
         })
     }
+
 
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement> {
         let rtype = Rule as u8;
@@ -701,11 +714,14 @@ impl LibSqlPrepare for Connection {
 )
 SELECT DISTINCT x FROM dependants));",
         ))?;
+
+        // placeholder ? here is the rule_id which initiates the search (base case in recursive query)
         Ok(SqlStatement {
             stmt,
             tok: RuleDepRules,
         })
     }
+
     fn restore_deleted_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(&*format!("DELETE from DeletedList where id = ?"))?;
         Ok(SqlStatement {
@@ -713,17 +729,69 @@ SELECT DISTINCT x FROM dependants));",
             tok: RestoreDeleted,
         })
     }
+
+    fn mark_deleted_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&*format!("Insert into DeletedList (id) VALUES(?)"))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RestoreDeleted,
+        })
+    }
+    // get the files written or read by a process (pid) in the latest generation. Latest gen is the one with the highest generation value
+    // Latest gen filtering happens after the query results are returned
+    fn fetch_io_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT path, typ, gen from DYNIO where pid = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchIO,
+        })
+    }
+
+    // Envs that this rule depends. The `Export` keyword in Tupfile makes the envs available to the rule
+    fn fetch_envs_for_rule_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT name from ENV where id in (SELECT from_id from NormalLink where to_id = ?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchEnvsForRule,
+        })
+    }
+
+    fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement> {
+        let typ = RowType::GenF as u8;
+        let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type,\
+         (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         where  Node.id in \
+        (SELECT to_id from NormalLink where from_id  = ? and to_type={typ}"))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchOutputsForRule,
+        })
+    }
+
+    fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement> {
+        let typ = RowType::File as u8;
+        let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type, \
+        (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         where Node.type = {typ} and Node.id in \
+        (SELECT from_id from NormalLink where to_id  = ?"))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchInputsForRule,
+        })
+    }
 }
 
 impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         eyre::ensure!(self.tok == AddToMod, "wrong token for update to modifylist");
-        self.stmt.insert((id, (rtype as u8)))?;
+        // statement ignores input if already present. So we call the method execute here rather than insert
+        self.stmt.execute((id, (rtype as u8)))?;
         Ok(())
     }
     fn add_to_delete_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         eyre::ensure!(self.tok == AddToDel, "wrong token for update to deletelist");
-        self.stmt.insert((id, (rtype as u8)))?;
+        // statement ignores input if already present. So we call the method execute here rather than insert
+        self.stmt.execute((id, (rtype as u8)))?;
         Ok(())
     }
     fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
@@ -731,7 +799,22 @@ impl LibSqlExec for SqlStatement<'_> {
             self.tok == AddToPres,
             "wrong token for update to presentlist"
         );
+        self.stmt.execute((id, (rtype as u8)))?;
+        Ok(())
+    }
+
+    fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
+        eyre::ensure!(
+            self.tok == AddToTempIds,
+            "wrong token for update to tempidslist"
+        );
         self.stmt.insert((id, (rtype as u8)))?;
+        Ok(())
+    }
+
+    fn remove_presents_exec(&mut self) -> Result<()> {
+        eyre::ensure!(self.tok == RemovePresents, "wrong token for removing presents");
+        self.stmt.execute([])?;
         Ok(())
     }
 
@@ -750,27 +833,18 @@ impl LibSqlExec for SqlStatement<'_> {
             self.tok == InsertDirAux,
             "wrong token for Insert Dir Into DirPathBuf"
         );
-        let path_str = SqlStatement::db_path_str(path);
+        let path_str = db_path_str(path);
         self.stmt.insert((id, path_str))?;
         Ok(())
     }
 
-    fn insert_link(&mut self, from_id: i64, to_id: i64) -> Result<()> {
+    fn insert_link(&mut self, from_id: i64, to_id: i64, is_sticky: bool, to_type: RowType) -> Result<()> {
         eyre::ensure!(self.tok == InsertLink, "wrong token for insert link");
         debug!("Normal link: {} -> {}", from_id, to_id);
-        self.stmt.insert([from_id, to_id])?;
+        self.stmt.execute((from_id, to_id, is_sticky as u8, to_type as u8))?;
         Ok(())
     }
 
-    fn insert_sticky_link(&mut self, from_id: i64, to_id: i64) -> Result<()> {
-        eyre::ensure!(
-            self.tok == InsertStickyLink,
-            "wrong token for insert sticky link"
-        );
-        debug!("Sticky link : {} -> {}", from_id, to_id);
-        self.stmt.insert([from_id, to_id])?;
-        Ok(())
-    }
 
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
         eyre::ensure!(self.tok == InsertFile, "wrong token for Insert file");
@@ -794,7 +868,7 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
         eyre::ensure!(self.tok == FindDirId, "wrong token for find dir");
-        let path_str = Self::db_path_str(p);
+        let path_str = db_path_str(p);
         let path_str = path_str.as_str();
         debug!("find dir id for :{}", path_str);
         let id = self.stmt.query_row([path_str], |r| r.get(0))?;
@@ -854,27 +928,31 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn fetch_glob_nodes<F, P>(
         &mut self,
-        glob_path: P,
+        base_path: P,
         gname: P,
         mut f: F,
     ) -> Result<Vec<MatchingPath>>
         where
-            F: FnMut(&String) -> MatchingPath,
+            F: FnMut(&String) -> Option<MatchingPath>,
             P: AsRef<Path>,
     {
         eyre::ensure!(
             self.tok == FindGlobNodes,
             "wrong token for fetch glob nodes"
         );
-        let path_str = SqlStatement::db_path_str(glob_path);
-        let gname_str = gname.as_ref().to_string_lossy().to_string();
-        let mut rows = self.stmt.query((gname_str.replace('*', "%"), path_str))?;
+        let path_str = db_path_str(base_path);
+        use regex::Regex;
+        let gname_str = gname.as_ref().to_string_lossy().replace('*', "%");
+        let re = Regex::new(r"\[.*?\]").unwrap();
+        let gname_str = re.replace_all(&gname_str, "%");
+        debug!("query glob:{:?}", gname_str);
+        let mut rows = self.stmt.query((gname_str.into_owned(), path_str))?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             let node: String = row.get(0)?;
-            //nodes.push(node);
-            let id = f(&node);
-            nodes.push(id);
+            if let Some(id) = f(&node) {
+                nodes.push(id);
+            }
         }
         Ok(nodes)
     }
@@ -885,7 +963,7 @@ impl LibSqlExec for SqlStatement<'_> {
             "wrong token for fetch parent rule"
         );
         let mut ids = Vec::new();
-        let mut rows = self.stmt.query([id])?;
+        let mut rows = self.stmt.query([id, id])?;
         while let Ok(Some(r)) = rows.next() {
             let id: i64 = r.get(0)?;
             ids.push(id);
@@ -944,15 +1022,6 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(vs)
     }
 
-    fn delete_sticky_rule_links(&mut self, rule_id: i64) -> Result<()> {
-        eyre::ensure!(
-            self.tok == DeleteStickyRuleLinks,
-            "wrong token for delete rule links"
-        );
-        self.stmt.execute([rule_id, rule_id])?;
-        Ok(())
-    }
-
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()> {
         eyre::ensure!(
             self.tok == DeleteNormalRuleLinks,
@@ -963,7 +1032,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
     fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)> {
         eyre::ensure!(self.tok == FindNodeByPath, "wrong token for find by path");
-        let dp = SqlStatement::db_path_str(dir_path);
+        let dp = db_path_str(dir_path);
         let (id, pid) = self.stmt.query_row(
             [name, dp.as_str()],
             |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error> {
@@ -974,33 +1043,86 @@ impl LibSqlExec for SqlStatement<'_> {
         )?;
         Ok((id, pid))
     }
-}
 
-impl SqlStatement<'_> {
-    fn db_path_str<P: AsRef<Path>>(p: P) -> String {
-        let input_path_str = p.as_ref().to_string_lossy().to_string();
-        static UNIX_SEP: char = '/';
-        static UNIX_SEP_STR: &str = "/";
-        static CD_UNIX_SEP_STR: &str = "./";
-        let mut path_str = if MAIN_SEPARATOR != UNIX_SEP {
-            input_path_str.replace(MAIN_SEPARATOR.to_string().as_str(), UNIX_SEP_STR)
-        } else {
-            input_path_str
-        };
-        if path_str.as_str() != "." && !path_str.starts_with(CD_UNIX_SEP_STR) {
-            path_str.insert_str(0, CD_UNIX_SEP_STR)
+
+    fn fetch_io(&mut self, proc_id: i32) -> Result<Vec<(String, u8)>> {
+        eyre::ensure!(self.tok == FetchIO, "wrong token for fetchio");
+        let mut rows = self.stmt.query([proc_id])?;
+        let mut vs = Vec::new();
+        let mut lgen = 0;
+        while let Some(r) = rows.next()? {
+            let s: String = r.get(0)?;
+            let i: u8 = r.get(1)?;
+            let gen: u32 = r.get(2)?;
+            if lgen != gen {
+                //  keep only the latest generation's io
+                vs.clear();
+            }
+            vs.push((s, i));
+            lgen = gen;
         }
-        path_str
-            .strip_suffix(UNIX_SEP_STR)
-            .unwrap_or(path_str.as_str())
-            .to_string()
+        Ok(vs)
+    }
+
+    fn fetch_envs(&mut self, rule_id: i32) -> Result<Vec<String>> {
+        eyre::ensure!(self.tok == FetchEnvsForRule, "wrong token for fetchenvs");
+        let mut rows = self.stmt.query([rule_id])?;
+        let mut vs = Vec::new();
+        while let Some(r) = rows.next()? {
+            let s: String = r.get(0)?;
+            vs.push(s);
+        }
+        Ok(vs)
+    }
+
+    fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
+        eyre::ensure!(self.tok == FetchInputsForRule, "wrong token for FetchInputsForRule");
+        let mut rows = self.stmt.query([rule_id])?;
+        let mut vs = Vec::new();
+        while let Some(r) = rows.next()? {
+            let n = make_node(r)?;
+            vs.push(n);
+        }
+        Ok(vs)
+    }
+
+    fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
+        eyre::ensure!(self.tok == FetchOutputsForRule, "wrong token for FetchOutputsForRule");
+        let mut rows = self.stmt.query([rule_id])?;
+        let mut vs = Vec::new();
+        while let Some(r) = rows.next()? {
+            let n = make_node(r)?;
+            vs.push(n);
+        }
+        Ok(vs)
     }
 }
 
+fn db_path_str<P: AsRef<Path>>(p: P) -> String {
+    let input_path_str = p.as_ref().to_string_lossy();
+    static UNIX_SEP: char = '/';
+    static UNIX_SEP_STR: &str = "/";
+    static CD_UNIX_SEP_STR: &str = "./";
+    let mut path_str = if MAIN_SEPARATOR != UNIX_SEP {
+        input_path_str.into_owned().replace(std::path::MAIN_SEPARATOR_STR, UNIX_SEP_STR)
+    } else {
+        input_path_str.to_string()
+    };
+    if !path_str.starts_with(".") && !path_str.starts_with(CD_UNIX_SEP_STR) {
+        path_str.insert_str(0, CD_UNIX_SEP_STR)
+    }
+    path_str
+        .strip_suffix(UNIX_SEP_STR)
+        .unwrap_or(path_str.as_str())
+        .to_string()
+}
+
+impl SqlStatement<'_> {}
+
 impl ForEachClauses for Connection {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
-    where
-        F: FnMut(i64) -> Result<()>,
+        where
+            F: FnMut(i64) -> Result<()>,
     {
         let mut stmt = self.prepare("SELECT id from Node where type={} or type={}")?;
         let mut rows = stmt.query([RowType::File as u8, RowType::Dir as u8])?;
@@ -1025,11 +1147,15 @@ impl ForEachClauses for Connection {
         }
         Ok(())
     }
+
     fn for_changed_or_created_tup_node_with_path<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>,
     {
-        let mut stmt = self.prepare("SELECT id,dir,name from TUPPATHBUF")?;
+        let tuptype = RowType::TupF as u8;
+        let mut stmt = self.prepare(&*format!("SELECT id,dir,name from TUPPATHBUF where id in
+        (SELECT id from ModifyList where type = {tuptype})")
+        )?;
         Self::for_tupid_and_path([], f, &mut stmt)?;
         Ok(())
     }
@@ -1046,15 +1172,15 @@ impl ForEachClauses for Connection {
         if let Some(rty) = rtype {
             let rty = rty as u8;
             let mut stmt = self.prepare(&format!(
-                "SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
-         where  Node.type = {rty} and Node.id in\
+                "SELECT id from NODE \
+         where  type = {rty} and id in\
          (SELECT from_id from NormalLink where to_id = {group_id} "
             ))?;
             Self::for_id([], f, &mut stmt)?;
         } else {
             let mut stmt = self.prepare(&format!(
-                "SELECT Node.id id from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
-         where  Node.id in\
+                "SELECT id from NODE \
+         where  id in\
          (SELECT from_id from NormalLink where to_id  = {group_id}",
             ))?;
             Self::for_id([], f, &mut stmt)?;
@@ -1176,6 +1302,20 @@ impl ForEachClauses for Connection {
         Ok(())
     }
 
+    fn for_each_link<F>(&mut self, f: F) -> Result<()>
+        where F: FnMut(i32, i32) -> Result<()>
+    {
+        let mut stmt = self.prepare("SELECT from_id, to_id from NormalLink")?;
+        let mut rows = stmt.query([])?;
+        let mut mut_f = f;
+        while let Some(row) = rows.next()? {
+            let i: i32 = row.get(0)?;
+            let j: i32 = row.get(1)?;
+            mut_f(i, j)?;
+        }
+        Ok(())
+    }
+
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>> {
         let mut inputs = Vec::new();
 
@@ -1186,29 +1326,156 @@ impl ForEachClauses for Connection {
         })?;
         Ok(inputs)
     }
+    fn rules_to_run_1st_pass(&self) -> Result<Vec<Node>> {
+        let rtype = RowType::Rule as u8;
+        let grptype = RowType::Grp as u8;
 
-    fn rules_to_run(&self) -> Result<Vec<Node>> {
-        let stmt = "DROP TABLE IF EXISTS ModLink;
-        Create TEMPORARY TABLE ModLink as
-        SELECT NormalLink.to_id to_id  from NormalLink inner join ModifyList on ModifyList.id = NormalLink.from_id;
-        select Node.id, Node.dir, Node.name, Node.display_str, Node.flags from Node INNER join ModLink on (Node.id = ModLink.to_id) and Node.type = ?";
-        let mut stmt = self.prepare(stmt)?;
+        let stmt = &*format!("
+        DROP TABLE IF EXISTS ModLink;
+        Create  TABLE ModLink as
+        SELECT NormalLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type to_type  from NormalLink inner join ModifyList on ModifyList.id = NormalLink.from_id;
+DROP TABLE IF Exists LinkOverGrp;
+CREATE TABLE LinkOverGrp as
+SELECT ModLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type from ModLink inner join NormalLink on NormalLink.from_id = ModLink.to_id where ModLink.to_type = {grptype} and NormalLink.to_type = {rtype}; \
+DROP TABLE IF EXISTS RULESTORUN;
+CREATE TABLE RulesToRun (
+  node_id INTEGER PRIMARY KEY
+);
+INSERT INTO RulesToRun (node_id)
+SELECT DISTINCT r.node_id
+FROM (SELECT to_id node_id from ModLink where ModLink.to_type = {rtype}
+ UNION
+SELECT to_id node_id from LinkOverGrp where LinkOverGrp.to_type = {rtype} ) r
+  ");
+        self.execute_batch(stmt)?;
+
+        let mut stmt = self.prepare("SELECT * from RulesToRun")?;
         let mut rules = Vec::new();
-        let _ = stmt.query_map([Rule as u8], |r| -> rusqlite::Result<()> {
+        let _ = stmt.query_map([], |r| -> rusqlite::Result<()> {
             let id = crate::make_rule_node(r)?;
             rules.push(id);
             Ok(())
         })?;
         Ok(rules)
     }
+
+    fn rules_to_run_no_target(&self) -> Result<Vec<Node>> {
+        let rtype = RowType::Rule as u8;
+        let grptype = RowType::Grp as u8;
+        let stmt = &*format!("
+        DROP TABLE IF EXISTS ModLink;
+        Create  TABLE ModLink as
+        SELECT NormalLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type to_type  from NormalLink inner join ModifyList on ModifyList.id = NormalLink.from_id;
+DROP TABLE IF Exists LinkOverGrp;
+CREATE TABLE LinkOverGrp as
+SELECT ModLink.from_id from_id ModLink.to_id to_id ModLink.to_type from ModLink inner join NormalLink on NormalLink.from_id = ModLink.to_id where ModLink.to_type = {grptype} and NormalLink.to_type = {rtype}; \
+DROP TABLE IF EXISTS RULESTORUN
+        CREATE TABLE RULESTORUN  as \
+        select to_id node_id LinkOverGrp
+UNION
+        select to_id node_id ModLink where  ModLink.to_type = {rtype};
+
+WITH RECURSIVE topological_sort(node_id, sort_order) AS (
+  -- Base case: Nodes without any incoming edges within RulesToRun
+  SELECT r.node_id, 1 AS sort_order
+  FROM RulesToRun AS r
+  WHERE r.node_id NOT IN (
+    SELECT e2.to_id
+    FROM edges AS e2
+    JOIN RulesToRun AS r2 ON e2.to_id = r2.node_id
+  )
+
+  UNION ALL
+
+  -- Recursive case: Nodes with incoming edges within RulesToRun
+  SELECT e.from_id, t.sort_order + 1
+  FROM topological_sort AS t
+  JOIN edges AS e ON t.node_id = e.to_id
+  JOIN RulesToRun AS r ON e.from_id = r.node_id
+)
+SELECT Node.* from Node INNER JOIN (SELECT node_id, sort_order
+FROM topological_sort
+ORDER BY sort_order) as sorted_rules on sorted_rules.node_id = Node.id;
+  ");
+        let mut stmt = self.prepare(stmt)?;
+        let mut rules = Vec::new();
+        let _ = stmt.query_map([], |r| -> rusqlite::Result<()> {
+            let n = crate::make_rule_node(r)?;
+            rules.push(n);
+            Ok(())
+        })?;
+        Ok(rules)
+    }
+
+    fn get_target_ids(&self, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
+        let dir = std::env::current_dir().unwrap();
+        let dirc = dir.clone();
+        let dir = diff_paths(dir, root).ok_or(eyre::Error::msg(format!("Could not get relative path for:{:?}", dirc.as_path())))?;
+        let mut fd = self.fetch_dirid_prepare()?;
+        let mut fnode_stmt = self.fetch_node_by_id_prepare()?;
+        let mut dirids = Vec::new();
+        for t in targets {
+            let path = dir.join(t.as_str());
+            if let Ok(id) = fd.fetch_dirid(dir.join(&targets[0])) {
+                dirids.push(id);
+            } else {
+                // get the parent dir id and fetch the node by its name
+                let parent = path.parent().ok_or(eyre::Error::msg(format!("Could not get parent for:{:?}",
+                                                                          path)))?;
+                if let Some(parent_id) = fd.fetch_dirid(parent).ok() {
+                    if let Ok(nodeid) = fnode_stmt.fetch_node_id(&*path.file_name().unwrap().to_string_lossy().to_string(),
+                                                                 parent_id)
+                    {
+                        dirids.push(nodeid);
+                    } else {
+                        return Err(eyre::Error::msg(format!("Could not find target node id for:{:?}", path)));
+                    }
+                }
+            }
+        }
+        Ok(dirids)
+    }
 }
 
 impl MiscStatements for Connection {
     fn populate_delete_list(&self) -> Result<()> {
+        let ftype = RowType::File as u8;
+        let dtype = RowType::Dir as u8;
         let mut stmt = self.prepare(
-            "Insert into DeleteList SELECT id, type from Node Except \
-         SELECT id, type from PresentList Union Select id, type from ModifyList",
-        )?;
+            &*format!("Insert into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
+         SELECT id from PresentList Union Select id from ModifyList)",
+            ))?;
+        stmt.execute([])?;
+        Ok(())
+    }
+
+    fn remove_id_from_delete_list(&self, id: i64) -> Result<()> {
+        let mut stmt = self.prepare_cached("DELETE FROM DeleteList WHERE id = ?")?;
+        stmt.execute([id])?;
+        Ok(())
+    }
+
+    fn prune_present_list(&self) -> Result<()> {
+        let mut stmt = self.prepare_cached("DELETE FROM PresentList WHERE id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        Ok(())
+    }
+
+    fn prune_modified_list(&self) -> Result<()> {
+        let mut stmt = self.prepare_cached("DELETE FROM ModifyList WHERE id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        Ok(())
+    }
+
+    fn insert_trace<P: AsRef<Path>>(&mut self, filepath: P, pid: u32, gen: u32, typ: i8, childcnt: i32) -> Result<i64> {
+        let mut stmt = self.prepare_cached("INSERT INTO DYNIO (path, pid, gen, typ, childcnt) VALUES (?, ?, ?, ?, ?)")?;
+        let filepath = db_path_str(filepath);
+        let id = stmt.insert((filepath, pid, gen, typ, childcnt))?;
+        Ok(id)
+    }
+
+    fn remove_modified_list(&self) -> Result<()> {
+        let mut stmt = self.prepare_cached("DELETE FROM ModifyList")?;
         stmt.execute([])?;
         Ok(())
     }

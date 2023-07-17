@@ -1,10 +1,15 @@
 extern crate bimap;
 extern crate clap;
 extern crate crossbeam;
+extern crate ctrlc;
 extern crate env_logger;
 extern crate execute;
 extern crate eyre;
+extern crate incremental_topo;
+extern crate num_cpus;
 extern crate parking_lot;
+extern crate regex;
+extern crate termcolor;
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -34,9 +39,12 @@ use db::{Node, RowType};
 //use db::ForEachClauses;
 use db::RowType::{Dir, Grp};
 
-use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
+use crate::db::{
+    create_dyn_io_temp_tables, init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements,
+    SqlStatement,
+};
 use crate::db::RowType::TupF;
-use crate::parse::{find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
+use crate::parse::{exec_rules_to_run, find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
 mod db;
 mod parse;
@@ -69,6 +77,8 @@ enum Action {
     Upd {
         /// Space separated targets to build
         target: Vec<String>,
+        /// keep_going when set, allows builds to continue on error
+        keep_going: bool,
     },
 }
 
@@ -97,11 +107,13 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
         4 => RowType::GenF,
         5 => TupF,
         6 => Grp,
-        7 => RowType::GenD,
+        7 => RowType::DirGen,
         _ => panic!("Invalid type {} for row with id:{}", rtype, id),
     };
     Ok(Node::new(id, pid, mtime, name, rtype))
 }
+
+
 fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;
     let pid: i64 = row.get(1)?;
@@ -124,7 +136,7 @@ fn main() -> Result<()> {
             Action::Scan => {
                 let mut conn = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
-                if !is_initialized(&conn) {
+                if !is_initialized(&conn, "Node") {
                     return Err(eyre!(
                         "Tup database is not initialized, use `tup init' to initialize",
                     ));
@@ -138,41 +150,76 @@ fn main() -> Result<()> {
             }
             Action::Parse => {
                 let root = current_dir()?;
-                let tupfiles = {
-                    let mut conn = Connection::open(".tup/db")
-                        .expect("Connection to tup database in .tup/db could not be established");
-                    if !is_initialized(&conn) {
-                        return Err(eyre!(
-                            "Tup database is not initialized, use `tup init' to initialize",
-                        ));
-                    }
-                    println!("Parsing tupfiles in database");
-                    scan_root(root.as_path(), &mut conn)?;
-                    gather_tupfiles(&mut conn)?
-                };
-                parse_tupfiles_in_db(tupfiles, root.as_path(), false)?;
+                let tupfiles = scan_and_get_tupfiles(&root)?;
+                parse_tupfiles_in_db(tupfiles, root.as_path())?;
             }
-            Action::Upd { target } => {
+            Action::Upd { target, keep_going } => {
                 println!("Updating db {}", target.join(" "));
                 let root = current_dir()?;
-                let tupfiles = {
-                    let mut conn = Connection::open(".tup/db")
-                        .expect("Connection to tup database in .tup/db could not be established");
-                    if !is_initialized(&conn) {
-                        return Err(eyre!(
-                            "Tup database is not initialized, use `tup init' to initialize",
-                        ));
-                    }
-                    println!("Parsing tupfiles in database");
-                    scan_root(root.as_path(), &mut conn)?;
-                    gather_tupfiles(&mut conn)?
-                };
-                parse_tupfiles_in_db(tupfiles, root.as_path(), true)?;
+                let tupfiles = scan_and_get_tupfiles(&root)?;
+                parse_tupfiles_in_db(tupfiles, root.as_path())?;
+                let (mut conn, dag, node_bimap) = parse::prepare_for_execution(root.as_path())?;
+
+                create_dyn_io_temp_tables(&conn)?;
+                let (tx, rx) = crossbeam::channel::unbounded();
+                let mut tracker = tupetw::DynDepTracker::build(std::process::id(), tx);
+                // start tracking file io by subprocesses.
+                tracker.start_and_process()?;
+
+                let (child_ids, rules) = exec_rules_to_run(
+                    &mut conn,
+                    &node_bimap,
+                    &dag,
+                    root.as_path(),
+                    &target,
+                    keep_going,
+                )?;
+
+                // receive events from subprocesses.
+                while let Ok(evt_header) = rx.recv() {
+                    let file_path = evt_header.get_file_path();
+                    let rel_path =
+                        pathdiff::diff_paths(Path::new(file_path), root.as_path()).unwrap_or(
+                            PathBuf::from(file_path));
+                    let process_id = evt_header.get_process_id();
+                    let process_gen = evt_header.get_process_gen();
+                    let event_type = evt_header.get_event_type();
+                    let child_cnt = evt_header.get_child_cnt() as i32;
+                    conn.insert_trace(
+                        rel_path.as_path(),
+                        process_id,
+                        process_gen,
+                        event_type,
+                        child_cnt,
+                    )?;
+                }
+                crate::parse::verify_child_processes_io(&conn, &rules, &child_ids)?;
+                conn.remove_modified_list()?;
+
+                tracker.stop();
+
+
+                // build a dag of rules and files from the ModifyList in the database
+                // and the tupfiles in the filesystem.
             }
         }
     }
     println!("Done");
     Ok(())
+}
+
+
+fn scan_and_get_tupfiles(root: &PathBuf) -> Result<Vec<Node>> {
+    let mut conn = Connection::open(".tup/db")
+        .expect("Connection to tup database in .tup/db could not be established");
+    if !is_initialized(&conn, "Node") {
+        return Err(eyre!(
+            "Tup database is not initialized, use `tup init' to initialize",
+        ));
+    }
+    println!("Parsing tupfiles in database");
+    scan_root(root.as_path(), &mut conn)?;
+    gather_tupfiles(&mut conn)
 }
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.

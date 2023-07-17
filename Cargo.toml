@@ -3,10 +3,9 @@
 
 members = [
     "tuprs",
-    "tupinject",
-    "tupsetuphook",
     "tuporc",
-    "tuplua"
+    "tuplua",
+    "tupetw"
 ]
 
 [patch.crates-io]
