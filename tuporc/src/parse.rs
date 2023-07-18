@@ -584,6 +584,14 @@ pub(crate) fn verify_child_processes_io(
             } else if *ty == EventType::Write as u8 {
                 let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
                 for out in outs.iter() {
+                    if out.get_type().eq(&Excluded) {
+                        let exclude_pattern = out.get_name().to_string();
+                        use regex::Regex;
+                        let re = Regex::new(&*exclude_pattern).unwrap();
+                        if re.is_match(fnode) {
+                            continue 'outer;
+                        }
+                    }
                     if out.get_name() == fnode {
                         continue 'outer;
                     }

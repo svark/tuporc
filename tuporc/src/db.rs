@@ -364,6 +364,7 @@ pub(crate) trait LibSqlExec {
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
+    fn enrich_modified_list_with_outside_mods(&self) -> Result<()>;
     fn enrich_modified_list(&self) -> Result<()>;
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
     fn prune_present_list(&self) -> Result<()>;
@@ -614,7 +615,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT name from Node where name like ? and dir in (SELECT id FROM DirPathBuf where name = ?)")?;
+        let stmt = self.prepare("SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name = ?)")?;
         Ok(SqlStatement {
             stmt,
             tok: FindGlobNodes,
@@ -944,12 +945,8 @@ impl LibSqlExec for SqlStatement<'_> {
             "wrong token for fetch glob nodes"
         );
         let path_str = db_path_str(base_path);
-        use regex::Regex;
-        let gname_str = gname.as_ref().to_string_lossy().replace('*', "%");
-        let re = Regex::new(r"\[.*?\]").unwrap();
-        let gname_str = re.replace_all(&gname_str, "%");
-        debug!("query glob:{:?}", gname_str);
-        let mut rows = self.stmt.query((gname_str.into_owned(), path_str))?;
+        debug!("query glob:{:?}", gname.as_ref());
+        let mut rows = self.stmt.query((gname.as_ref().to_string_lossy().as_ref(), path_str))?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
             let node: String = row.get(0)?;
@@ -1157,11 +1154,10 @@ impl ForEachClauses for Connection {
     {
         let tuptype = RowType::TupF as u8;
         let dirtype = RowType::Dir as u8;
-        let mut stmt = self.prepare(&*format!("SELECT id,dir,name from TUPPATHBUF where id in
-        (SELECT id from ModifyList where type = {tuptype}
-        UNION
-(SELECT id from TupPathBuf where dir in (SELECT to_id from NormalLink where to_type={dirtype} from_id in
-(SELECT id from ModifyList where type = {dirtype} UNION (SELECT id from DeleteList where type = {dirtype})))))",
+        let mut stmt = self.prepare(&*format!("SELECT id,dir,name from TUPPATHBUF where id in \
+        (SELECT id from ModifyList where type = {tuptype}) UNION \
+        SELECT id,dir,name from TUPPATHBUF where dir in \
+        (SELECT id from ModifyList where type = {dirtype})"
         ))?;
         Self::for_tupid_and_path([], f, &mut stmt)?;
         Ok(())
@@ -1391,6 +1387,17 @@ impl MiscStatements for Connection {
         Ok(())
     }
 
+    // if a directory is in the modify list, add all its children to the modify list
+    fn enrich_modified_list_with_outside_mods(&self) -> Result<()> {
+        // mark rules as Modified if any of its outputs are in the deletelist
+        let rtype = RowType::Rule as u8;
+        let mut stmt = self.prepare(
+            &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
+            (SELECT from_id from NormalLink where to_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
+        )?;
+        stmt.execute([])?;
+        Ok(())
+    }
     fn enrich_modified_list(&self) -> Result<()> {
 // add parent dirs to modify list if children of that directory are already in it
         let ftype = RowType::File as u8;
@@ -1402,24 +1409,26 @@ impl MiscStatements for Connection {
         {
             // add parent dirs to modify list if any child of that directory is in the delete list
             let mut stmt = self.prepare(
-                &*format!("Insert or IGNORE into ModifyList  SELECT dir,type from Node where id in \
-            (SELECT id from ModifyList where type = {ftype} or type = {gentype} UNION \
-            (SELECT id from DeleteList where type = {ftype} or type = {gentype}) )"),
+                &*format!("Insert or IGNORE into ModifyList  SELECT dir, {dtype} from Node where id in \
+            (SELECT id from ModifyList where type = {ftype}  UNION \
+            SELECT id from DeleteList where type = {ftype} )"),
+            )?;
+            stmt.execute([])?;
+
+            let mut stmt = self.prepare(
+                &*format!("Insert or IGNORE into ModifyList  SELECT dir, {gdtype} from Node where id in \
+            (SELECT id from ModifyList where type = {gentype}  UNION \
+            SELECT id from DeleteList where type = {gentype} )"),
             )?;
             stmt.execute([])?;
 
             // mark groups as Modified if any of its inputs are in the deletelist or modified list
             let mut stmt = self.prepare(
                 &*format!("Insert or IGNORE into ModifyList SELECT id, {grptype} from Node where  type = {rtype} and id in \
-            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {gentype} UNION SELECT id from ModifyList where type = {gentype} ) )"),
+            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {gentype} UNION SELECT id from ModifyList where type = {gentype}) )"),
             )?;
             stmt.execute([])?;
-            // mark rules as Modified if any of its outputs are in the deletelist
-            let mut stmt = self.prepare(
-                &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
-            (SELECT from_id from NormalLink where to_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
-            )?;
-            stmt.execute([])?;
+
             // mark rules as Modified if any of its inputs are in the deletelist
             let mut stmt = self.prepare(
                 &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \

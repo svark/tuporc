@@ -240,14 +240,16 @@ impl DynDepTracker {
                             let fo = parser.try_parse::<u64>("FileObject").unwrap_or(0);
                             println!(" fileobj:{}", fo);
                             let pid = gen_proc(event.process_id());
-                            ctx_io.send(EventHeader {
-                                process_id: pid,
-                                parent_process_id: *parent_ids.get(&pid).unwrap_or(&0),
-                                event_type: EventType::Open,
-                                file_path: open_path.to_str().unwrap_or("").to_string(),
-                                child_count: 0,
-                            }).unwrap();
-                            fileobject_to_file_path.insert(fo, open_path);
+                            if event.process_id() != root_process_id {
+                                ctx_io.send(EventHeader {
+                                    process_id: pid,
+                                    parent_process_id: *parent_ids.get(&pid).unwrap_or(&0),
+                                    event_type: EventType::Open,
+                                    file_path: open_path.to_str().unwrap_or("").to_string(),
+                                    child_count: 0,
+                                }).unwrap();
+                                fileobject_to_file_path.insert(fo, open_path);
+                            }
                         }
                     } else if event.opcode() == 65 {
                         if let Ok(ofile) = parser.try_parse::<String>("FileKey") {
@@ -260,13 +262,15 @@ impl DynDepTracker {
 
                             let pid = gen_proc(event.process_id());
                             let file_path = fileobject_to_file_path.get(&open_path_fo).unwrap_or(&PathBuf::new()).clone();
-                            ctx_io.send(EventHeader {
-                                process_id: pid,
-                                parent_process_id: *parent_ids.get(&pid).unwrap_or(&0),
-                                event_type: EventType::Write,
-                                file_path: file_path.to_string_lossy().to_string(),
-                                child_count: 0,
-                            }).unwrap();
+                            if event.process_id() != root_process_id {
+                                ctx_io.send(EventHeader {
+                                    process_id: pid,
+                                    parent_process_id: *parent_ids.get(&pid).unwrap_or(&0),
+                                    event_type: EventType::Write,
+                                    file_path: file_path.to_string_lossy().to_string(),
+                                    child_count: 0,
+                                }).unwrap();
+                            }
                         }
                     }
                 }

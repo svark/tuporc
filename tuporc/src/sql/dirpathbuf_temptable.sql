@@ -43,4 +43,20 @@ from Node
          inner join DIRPATHBUF ON
     (NODE.dir = DIRPATHBUF.id and node.type = (SELECT id from NodeType N where N.type = 'TupF'));
 
+DROP TABLE IF EXISTS PresentList;
+CREATE TABLE PresentList
+(
+    id   INTEGER PRIMARY KEY not NULL,
+    type INTEGER
+);
+Create Table IF NOT EXISTS ModifyList
+(
+    id   INTEGER PRIMARY KEY not NULL,
+    type INTEGER
+);
+Create Table IF NOT EXISTS DeleteList
+(
+    id   INTEGER PRIMARY KEY not NULL,
+    type INTEGER
+);
 
