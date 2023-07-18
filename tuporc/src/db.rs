@@ -1451,6 +1451,7 @@ impl MiscStatements for Connection {
         let ftype = RowType::File as u8;
         let gentype = RowType::GenF as u8;
         let dtype = RowType::Dir as u8;
+        let rtype = RowType::Rule as u8;
         // add all files and directories to delete list that are not in the present list or modify list
         let mut stmt = self.prepare(
             &*format!("Insert  or IGNORE into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
@@ -1468,6 +1469,14 @@ impl MiscStatements for Connection {
         let mut stmt = self.prepare(
             &*format!("Insert or IGNORE into ModifyList SELECT dir, {dtype} from Node where id in \
             (SELECT id from DeleteList and type = {ftype} or type = {gentype}))"),
+        )?;
+
+
+        stmt.execute([])?;
+        // mark rules as Modified if any of its outputs are in the deletelist
+        let mut stmt = self.prepare(
+            &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
+            (SELECT from_id from NormalLink where to_id in (SELECT id from DeleteList and type = {gentype}) )"),
         )?;
         stmt.execute([])?;
 
