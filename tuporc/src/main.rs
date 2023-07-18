@@ -37,7 +37,7 @@ use walkdir::WalkDir;
 
 use db::{Node, RowType};
 //use db::ForEachClauses;
-use db::RowType::{Dir, Grp};
+use db::RowType::Dir;
 
 use crate::db::{
     create_dyn_io_temp_tables, init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements,
@@ -78,6 +78,7 @@ enum Action {
         /// Space separated targets to build
         target: Vec<String>,
         /// keep_going when set, allows builds to continue on error
+        #[arg(short = 'k', default_value = "false")]
         keep_going: bool,
     },
 }
@@ -96,20 +97,15 @@ fn make_tup_node(row: &Row) -> rusqlite::Result<Node> {
 fn make_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;
     let pid: i64 = row.get(1)?;
-    let rtype: i8 = row.get(2)?;
+    let rtype: u8 = row.get(2)?;
     let name: String = row.get(3)?;
     let mtime: i64 = row.get(4)?;
-    let rtype = match rtype {
-        0 => RowType::File,
-        1 => RowType::Rule,
-        2 => Dir,
-        3 => RowType::Env,
-        4 => RowType::GenF,
-        5 => TupF,
-        6 => Grp,
-        7 => RowType::DirGen,
-        _ => panic!("Invalid type {} for row with id:{}", rtype, id),
-    };
+    let rtype = RowType::try_from(rtype).unwrap_or_else(|_| {
+        panic!(
+            "Invalid row type {} for node {}",
+            rtype, name
+        )
+    });
     Ok(Node::new(id, pid, mtime, name, rtype))
 }
 
@@ -487,16 +483,13 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
     thread::scope(|s| -> Result<()> {
         let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
         let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-        // channel for communicating that we are done with finding ids of directories.
-        //let (send_dirs_done, recv_dirs_done) = crossbeam::channel::bounded(0);
-        // channel for communicating  that we are done with finding children of directories.
-        //let (send_done, recv_done) = crossbeam::channel::bounded(0);
         // Map of children of  directories as returned by walkdir. `DirChildren`
         let mut dir_children_set = HashSet::new();
         // map of database ids of directories
         let mut dir_id_by_path = HashMap::new();
         // channel for  tracking children of a directory `DirChildren`.
         let (dir_children_sender, dir_children_receiver) = crossbeam::channel::unbounded();
+        // channel for tracking db ids of directories. This is an essential pre-step for inserting files into db.
         let (dirid_sender, dirid_receiver) = crossbeam::channel::unbounded();
         let root_hp = HashedPath::from(root.to_path_buf());
         let root_hash_path = root_hp.clone();
@@ -508,44 +501,48 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                 let mut end_dir_children = false;
                 loop {
                     let mut sel = crossbeam::channel::Select::new();
-                    let index_dir_receiver = if end_dirs {
+                    let index_dir = if end_dirs {
                         usize::MAX
                     } else {
                         sel.recv(&dirid_receiver)
                     };
 
-                    let index_dir_children_recv = if end_dir_children {
+                    let index_dir_children = if end_dir_children {
                         usize::MAX
                     } else {
                         sel.recv(&dir_children_receiver)
                     };
                     let mut changed = false;
                     while let Ok(oper) = sel.try_select() {
-                        if oper.index() == index_dir_receiver {
-                            oper.recv(&dirid_receiver).map_or_else(
-                                |_| {
-                                    log::debug!("no more dirs  expected");
-                                    end_dirs = true;
-                                },
-                                |(p, id)| {
-                                    dir_id_by_path.insert(p, id);
-                                    changed = true;
-                                },
-                            );
-                        } else if oper.index() == index_dir_children_recv {
-                            oper.recv(&dir_children_receiver).map_or_else(
-                                |_| {
-                                    log::debug!("no more dir children expected");
-                                    end_dir_children = true;
-                                },
-                                |p| {
-                                    dir_children_set.insert(p);
-                                    changed = true;
-                                },
-                            );
-                        } else {
-                            eprintln!("unknown index returned in select");
-                            break;
+                        match oper.index() {
+                            i if i == index_dir => {
+                                oper.recv(&dirid_receiver).map_or_else(
+                                    |_| {
+                                        log::debug!("no more dirs  expected");
+                                        end_dirs = true;
+                                    },
+                                    |(p, id)| {
+                                        dir_id_by_path.insert(p, id);
+                                        changed = true;
+                                    },
+                                );
+                            },
+                            i if i == index_dir_children => {
+                                oper.recv(&dir_children_receiver).map_or_else(
+                                    |_| {
+                                        log::debug!("no more dir children expected");
+                                        end_dir_children = true;
+                                    },
+                                    |p| {
+                                        dir_children_set.insert(p);
+                                        changed = true;
+                                    },
+                                );
+                            },
+                            _ => {
+                                eprintln!("unknown index returned in select");
+                                break;
+                            }
                         }
                         if end_dirs || end_dir_children {
                             break;
@@ -697,8 +694,8 @@ fn add_modify_nodes(
             }
         }
     }
+    tx.populate_delete_list()?;
     tx.commit()?;
-    conn.populate_delete_list()?;
 
     Ok(())
 }

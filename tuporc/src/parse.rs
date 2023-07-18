@@ -28,8 +28,7 @@ use crate::db::{
     create_path_buf_temptable,
     ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
 };
-use crate::db::RowType::{Env, GenF};
-use crate::RowType::Rule;
+use crate::db::RowType::{Env, Excluded, GenF, Rule};
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
@@ -232,6 +231,8 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
     // add links from glob inputs to tupfiles's directory
     add_link_glob_dir_to_rules(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    // mark rules as Modified if their inputs were deleted.
+    // add or update rules if new glob inputs were discovered
 
     // now check if the outputs (deleted or modified) trigger any other rules
     // and if so, add them to the list of tupfiles to be processed
@@ -252,12 +253,18 @@ fn add_link_glob_dir_to_rules(
         let mut insert_link = tx.insert_link_prepare()?;
         let mut links_to_add = HashMap::new();
         for rlink in arts.get_resolved_links() {
-            let rule_id = crossref
-                .get_rule_db_id(rlink.get_rule_desc())
-                .expect("tupfile dir not found");
+            let tupfile_desc = rlink.get_rule_ref().get_tupfile_desc();
+            let tupfile_dir = crossref.get_tup_dir(tupfile_desc).unwrap_or_else(|| {
+                panic!(
+                    "tupfile dir not found:{:?} mentioned in rule {:?}",
+                    tupfile_desc,
+                    rlink.get_rule_ref()
+                )
+            });
+
             rlink.for_each_glob_path_desc(|glob_path_desc| {
                 let glob_dir_desc = rw_buf.get_parent_id(&glob_path_desc).unwrap();
-                links_to_add.insert(glob_dir_desc, rule_id);
+                links_to_add.insert(glob_dir_desc, tupfile_dir);
             });
         }
         for (glob_dir_desc, tupfile_dir) in links_to_add {
@@ -858,6 +865,12 @@ fn add_rule_links(
                             out_linker.insert_link(rule_node_id, p, true, RowType::GenF)?;
                         }
                     }
+                    for t in rl.get_excluded_targets() {
+                        let p = crossref
+                            .get_path_db_id(t)
+                            .unwrap_or_else(|| panic!("failed to fetch db id of path {}", t));
+                        out_linker.insert_link(rule_node_id, p, true, RowType::Excluded)?;
+                    }
                 }
             }
         }
@@ -996,7 +1009,6 @@ fn insert_nodes(
                                            -> Result<()> {
             let isz: usize = (*p).into();
             let path = read_write_buf.get_path(p);
-            //debug!("np:{:?}", path.as_path());
             let parent = path
                 .as_path()
                 .parent()
@@ -1051,6 +1063,11 @@ fn insert_nodes(
                 for p in rl.get_targets() {
                     if processed.insert(p) {
                         collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
+                    }
+                }
+                for p in rl.get_excluded_targets() {
+                    if processed.insert(p) {
+                        collect_nodes_to_insert(p, &Excluded, 0, dir, crossref, &mut find_nodeid)?;
                     }
                 }
                 let env_desc = rl.get_env_desc();

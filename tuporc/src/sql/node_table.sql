@@ -53,6 +53,7 @@ VALUES ('File', 0),
        ('GenF', 4),
        ('TupF', 5),
        ('Grp', 6),
-       ('DirGen', 7)
+       ('DirGen', 7),
+       ('Excl', 8)
 
 

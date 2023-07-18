@@ -17,21 +17,24 @@ use crate::RowType::Rule;
 #[repr(u8)]
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum RowType {
+    /// File
     File = 0,
-    //< File
+    /// Rule
     Rule = 1,
-    //< Rule
+    /// Directory
     Dir = 2,
-    //< Directory
+    /// Env var
     Env = 3,
-    //< Env var
+    /// Generated file
     GenF = 4,
-    //< Generated file
+    /// Tupfile or Tupfile.lua
     TupF = 5,
-    //< Tupfile or lua
+    /// Group
     Grp = 6,
-    //< Group
-    DirGen = 7, //< Generated Directory
+    /// Generated Directory
+    DirGen = 7,
+    /// Excluded file pattern
+    Excluded = 8,
 }
 
 impl PartialOrd<Self> for RowType {
@@ -73,6 +76,8 @@ impl TryFrom<u8> for RowType {
             Ok(Self::Grp)
         } else if value == 7 {
             Ok(Self::DirGen)
+        } else if value == 8 {
+            Ok(Self::Excluded)
         } else {
             Err(value)
         }
@@ -1153,9 +1158,13 @@ impl ForEachClauses for Connection {
         F: FnMut(Node) -> Result<()>,
     {
         let tuptype = RowType::TupF as u8;
+        let dirtype = RowType::Dir as u8;
         let mut stmt = self.prepare(&*format!("SELECT id,dir,name from TUPPATHBUF where id in
-        (SELECT id from ModifyList where type = {tuptype})")
-        )?;
+        (SELECT id from ModifyList where type = {tuptype}
+        UNION
+(SELECT id from TupPathBuf where dir in (SELECT to_id from NormalLink where to_type={dirtype} from_id in
+(SELECT id from ModifyList where type = {dirtype} UNION (SELECT id from DeleteList where type = {dirtype})))))",
+        ))?;
         Self::for_tupid_and_path([], f, &mut stmt)?;
         Ok(())
     }
@@ -1440,12 +1449,30 @@ ORDER BY sort_order) as sorted_rules on sorted_rules.node_id = Node.id;
 impl MiscStatements for Connection {
     fn populate_delete_list(&self) -> Result<()> {
         let ftype = RowType::File as u8;
+        let gentype = RowType::GenF as u8;
         let dtype = RowType::Dir as u8;
+        // add all files and directories to delete list that are not in the present list or modify list
         let mut stmt = self.prepare(
-            &*format!("Insert into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
+            &*format!("Insert  or IGNORE into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
          SELECT id from PresentList Union Select id from ModifyList)",
             ))?;
         stmt.execute([])?;
+
+        // add parent dirs to modify list if children of that directory are already in it
+        let mut stmt = self.prepare(
+            &*format!("Insert or IGNORE into ModifyList  SELECT dir, {dtype} from Node where  id in (SELECT id from ModifyList and type = {ftype} or type = {gentype}))"),
+        )?;
+        stmt.execute([])?;
+
+        // add parent dirs to modify list if any child of that directory is in the delete list
+        let mut stmt = self.prepare(
+            &*format!("Insert or IGNORE into ModifyList SELECT dir, {dtype} from Node where id in \
+            (SELECT id from DeleteList and type = {ftype} or type = {gentype}))"),
+        )?;
+        stmt.execute([])?;
+
+        self.prune_modified_list()?;
+
         Ok(())
     }
 
