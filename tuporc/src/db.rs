@@ -10,9 +10,7 @@ use rusqlite::{Connection, Params, Statement};
 use tupparser::decode::MatchingPath;
 
 use crate::{make_node, make_tup_node};
-use crate::db::RowType::{Env, Grp};
 use crate::db::StatementType::*;
-use crate::RowType::Rule;
 
 #[repr(u8)]
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -171,7 +169,7 @@ impl Node {
             pid,
             mtime: 0,
             name,
-            rtype: Rule,
+            rtype: RowType::Rule,
             display_str,
             flags,
             srcid: -1,
@@ -183,7 +181,7 @@ impl Node {
             pid,
             mtime: 0,
             name,
-            rtype: Grp,
+            rtype: RowType::Grp,
             display_str: "".to_string(),
             flags: "".to_string(),
             srcid: -1,
@@ -366,6 +364,7 @@ pub(crate) trait LibSqlExec {
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
+    fn enrich_modified_list(&self) -> Result<()>;
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
     fn prune_present_list(&self) -> Result<()>;
     fn prune_modified_list(&self) -> Result<()>;
@@ -427,7 +426,6 @@ pub(crate) trait ForEachClauses {
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>>;
     fn for_each_link<F>(&mut self, f: F) -> Result<()>
         where F: FnMut(i32, i32) -> Result<()>;
-    fn rules_to_run_1st_pass(&self) -> Result<Vec<Node>>;
     //fn populate_delete_list(&self) -> Result<()>;
     fn rules_to_run_no_target(&self) -> Result<Vec<Node>>;
     fn get_target_ids(&self, root: &Path, target_ids: &Vec<String>) -> Result<Vec<i64>>;
@@ -547,7 +545,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn insert_env_prepare(&self) -> Result<SqlStatement> {
-        let rtype = Env as u8;
+        let rtype = RowType::Env as u8;
         let e = ENVDIR;
         let stmt = self.prepare(&*format!("INSERT into Node (dir, name, type, display_str) Values ({e}, ?, {rtype}, ?)"))?;
         Ok(SqlStatement {
@@ -605,7 +603,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement> {
-        let rtype = Rule as u8;
+        let rtype = RowType::Rule as u8;
         let stmt = self.prepare(&*format!(
             "SELECT id, dir, type, name, mtime_ns FROM Node where dir=? and type={rtype}"
         ))?;
@@ -632,7 +630,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement> {
-        let rty = Rule as u8;
+        let rty = RowType::Rule as u8;
         let stmtstr = format!(
             "SELECT id FROM Node where type={} and id in \
         (SELECT from_id from NormalLink where to_id = ?)",
@@ -708,7 +706,7 @@ impl LibSqlPrepare for Connection {
 
 
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement> {
-        let rtype = Rule as u8;
+        let rtype = RowType::Rule as u8;
         let stmt = self.prepare(&*format!(
             "SELECT id, dir, name from TUPPATHBUF where dir in
              (SELECT dir from Node where type = {rtype} and id in
@@ -1335,77 +1333,10 @@ impl ForEachClauses for Connection {
         })?;
         Ok(inputs)
     }
-    fn rules_to_run_1st_pass(&self) -> Result<Vec<Node>> {
-        let rtype = RowType::Rule as u8;
-        let grptype = RowType::Grp as u8;
-
-        let stmt = &*format!("
-        DROP TABLE IF EXISTS ModLink;
-        Create  TABLE ModLink as
-        SELECT NormalLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type to_type  from NormalLink inner join ModifyList on ModifyList.id = NormalLink.from_id;
-DROP TABLE IF Exists LinkOverGrp;
-CREATE TABLE LinkOverGrp as
-SELECT ModLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type from ModLink inner join NormalLink on NormalLink.from_id = ModLink.to_id where ModLink.to_type = {grptype} and NormalLink.to_type = {rtype}; \
-DROP TABLE IF EXISTS RULESTORUN;
-CREATE TABLE RulesToRun (
-  node_id INTEGER PRIMARY KEY
-);
-INSERT INTO RulesToRun (node_id)
-SELECT DISTINCT r.node_id
-FROM (SELECT to_id node_id from ModLink where ModLink.to_type = {rtype}
- UNION
-SELECT to_id node_id from LinkOverGrp where LinkOverGrp.to_type = {rtype} ) r
-  ");
-        self.execute_batch(stmt)?;
-
-        let mut stmt = self.prepare("SELECT * from RulesToRun")?;
-        let mut rules = Vec::new();
-        let _ = stmt.query_map([], |r| -> rusqlite::Result<()> {
-            let id = crate::make_rule_node(r)?;
-            rules.push(id);
-            Ok(())
-        })?;
-        Ok(rules)
-    }
 
     fn rules_to_run_no_target(&self) -> Result<Vec<Node>> {
         let rtype = RowType::Rule as u8;
-        let grptype = RowType::Grp as u8;
-        let stmt = &*format!("
-        DROP TABLE IF EXISTS ModLink;
-        Create  TABLE ModLink as
-        SELECT NormalLink.from_id from_id NormalLink.to_id to_id NormalLink.to_type to_type  from NormalLink inner join ModifyList on ModifyList.id = NormalLink.from_id;
-DROP TABLE IF Exists LinkOverGrp;
-CREATE TABLE LinkOverGrp as
-SELECT ModLink.from_id from_id ModLink.to_id to_id ModLink.to_type from ModLink inner join NormalLink on NormalLink.from_id = ModLink.to_id where ModLink.to_type = {grptype} and NormalLink.to_type = {rtype}; \
-DROP TABLE IF EXISTS RULESTORUN
-        CREATE TABLE RULESTORUN  as \
-        select to_id node_id LinkOverGrp
-UNION
-        select to_id node_id ModLink where  ModLink.to_type = {rtype};
-
-WITH RECURSIVE topological_sort(node_id, sort_order) AS (
-  -- Base case: Nodes without any incoming edges within RulesToRun
-  SELECT r.node_id, 1 AS sort_order
-  FROM RulesToRun AS r
-  WHERE r.node_id NOT IN (
-    SELECT e2.to_id
-    FROM edges AS e2
-    JOIN RulesToRun AS r2 ON e2.to_id = r2.node_id
-  )
-
-  UNION ALL
-
-  -- Recursive case: Nodes with incoming edges within RulesToRun
-  SELECT e.from_id, t.sort_order + 1
-  FROM topological_sort AS t
-  JOIN edges AS e ON t.node_id = e.to_id
-  JOIN RulesToRun AS r ON e.from_id = r.node_id
-)
-SELECT Node.* from Node INNER JOIN (SELECT node_id, sort_order
-FROM topological_sort
-ORDER BY sort_order) as sorted_rules on sorted_rules.node_id = Node.id;
-  ");
+        let stmt = &*format!("SELECT id from ModifyList where type = {rtype}");
         let mut stmt = self.prepare(stmt)?;
         let mut rules = Vec::new();
         let _ = stmt.query_map([], |r| -> rusqlite::Result<()> {
@@ -1449,9 +1380,7 @@ ORDER BY sort_order) as sorted_rules on sorted_rules.node_id = Node.id;
 impl MiscStatements for Connection {
     fn populate_delete_list(&self) -> Result<()> {
         let ftype = RowType::File as u8;
-        let gentype = RowType::GenF as u8;
         let dtype = RowType::Dir as u8;
-        let rtype = RowType::Rule as u8;
         // add all files and directories to delete list that are not in the present list or modify list
         let mut stmt = self.prepare(
             &*format!("Insert  or IGNORE into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
@@ -1459,28 +1388,45 @@ impl MiscStatements for Connection {
             ))?;
         stmt.execute([])?;
 
-        // add parent dirs to modify list if children of that directory are already in it
-        let mut stmt = self.prepare(
-            &*format!("Insert or IGNORE into ModifyList  SELECT dir, {dtype} from Node where  id in (SELECT id from ModifyList and type = {ftype} or type = {gentype}))"),
-        )?;
-        stmt.execute([])?;
+        Ok(())
+    }
 
-        // add parent dirs to modify list if any child of that directory is in the delete list
-        let mut stmt = self.prepare(
-            &*format!("Insert or IGNORE into ModifyList SELECT dir, {dtype} from Node where id in \
-            (SELECT id from DeleteList and type = {ftype} or type = {gentype}))"),
-        )?;
+    fn enrich_modified_list(&self) -> Result<()> {
+// add parent dirs to modify list if children of that directory are already in it
+        let ftype = RowType::File as u8;
+        let gentype = RowType::GenF as u8;
+        let dtype = RowType::Dir as u8;
+        let rtype = RowType::Rule as u8;
+        let gdtype = RowType::DirGen as u8;
+        let grptype = RowType::Grp as u8;
+        {
+            // add parent dirs to modify list if any child of that directory is in the delete list
+            let mut stmt = self.prepare(
+                &*format!("Insert or IGNORE into ModifyList  SELECT dir,type from Node where id in \
+            (SELECT id from ModifyList where type = {ftype} or type = {gentype} UNION \
+            (SELECT id from DeleteList where type = {ftype} or type = {gentype}) )"),
+            )?;
+            stmt.execute([])?;
 
-
-        stmt.execute([])?;
-        // mark rules as Modified if any of its outputs are in the deletelist
-        let mut stmt = self.prepare(
-            &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
-            (SELECT from_id from NormalLink where to_id in (SELECT id from DeleteList and type = {gentype}) )"),
-        )?;
-        stmt.execute([])?;
-
-        self.prune_modified_list()?;
+            // mark groups as Modified if any of its inputs are in the deletelist or modified list
+            let mut stmt = self.prepare(
+                &*format!("Insert or IGNORE into ModifyList SELECT id, {grptype} from Node where  type = {rtype} and id in \
+            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {gentype} UNION SELECT id from ModifyList where type = {gentype} ) )"),
+            )?;
+            stmt.execute([])?;
+            // mark rules as Modified if any of its outputs are in the deletelist
+            let mut stmt = self.prepare(
+                &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
+            (SELECT from_id from NormalLink where to_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
+            )?;
+            stmt.execute([])?;
+            // mark rules as Modified if any of its inputs are in the deletelist
+            let mut stmt = self.prepare(
+                &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
+            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
+            )?;
+            stmt.execute([])?;
+        }
 
         Ok(())
     }

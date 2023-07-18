@@ -1165,9 +1165,11 @@ fn insert_nodes(
                 add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
             }
         }
+        // keep delete list node ids updated by removing output nodes that are alive
         for n in nodeids.iter() {
             tx.remove_id_from_delete_list(n.0)?;
         }
+        tx.enrich_modified_list()?;
         tx.prune_present_list()?; // removes deletelist entries from present
         tx.prune_modified_list()?; // removes deletelist entries from modified
         //conn.remove_presents_prepare()?.remove_presents_exec()?;

@@ -695,6 +695,8 @@ fn add_modify_nodes(
         }
     }
     tx.populate_delete_list()?;
+    tx.enrich_modified_list()?;
+    tx.prune_modified_list()?;
     tx.commit()?;
 
     Ok(())
