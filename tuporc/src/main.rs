@@ -12,13 +12,13 @@ extern crate regex;
 extern crate termcolor;
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
 use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
-use std::hash::{Hash, Hasher};
 use std::hash::BuildHasher;
+use std::hash::{Hash, Hasher};
 use std::io::Error as IOError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,11 +39,11 @@ use db::{Node, RowType};
 //use db::ForEachClauses;
 use db::RowType::Dir;
 
+use crate::db::RowType::TupF;
 use crate::db::{
     create_dyn_io_temp_tables, init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements,
     SqlStatement,
 };
-use crate::db::RowType::TupF;
 use crate::parse::{exec_rules_to_run, find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
 mod db;
@@ -100,24 +100,19 @@ fn make_node(row: &Row) -> rusqlite::Result<Node> {
     let rtype: u8 = row.get(2)?;
     let name: String = row.get(3)?;
     let mtime: i64 = row.get(4)?;
-    let rtype = RowType::try_from(rtype).unwrap_or_else(|_| {
-        panic!(
-            "Invalid row type {} for node {}",
-            rtype, name
-        )
-    });
+    let rtype = RowType::try_from(rtype)
+        .unwrap_or_else(|_| panic!("Invalid row type {} for node {}", rtype, name));
     Ok(Node::new(id, pid, mtime, name, rtype))
 }
 
-
 fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;
-    let pid: i64 = row.get(1)?;
+    let dirid: i64 = row.get(1)?;
     let name: String = row.get(2)?;
     let display_str: String = row.get(3)?;
     let flags: String = row.get(4)?;
 
-    Ok(Node::new_rule(id, pid, name, display_str, flags))
+    Ok(Node::new_rule(id, dirid, name, display_str, flags))
 }
 
 fn main() -> Result<()> {
@@ -174,9 +169,8 @@ fn main() -> Result<()> {
                 // receive events from subprocesses.
                 while let Ok(evt_header) = rx.recv() {
                     let file_path = evt_header.get_file_path();
-                    let rel_path =
-                        pathdiff::diff_paths(Path::new(file_path), root.as_path()).unwrap_or(
-                            PathBuf::from(file_path));
+                    let rel_path = pathdiff::diff_paths(Path::new(file_path), root.as_path())
+                        .unwrap_or(PathBuf::from(file_path));
                     let process_id = evt_header.get_process_id();
                     let process_gen = evt_header.get_process_gen();
                     let event_type = evt_header.get_event_type();
@@ -194,7 +188,6 @@ fn main() -> Result<()> {
 
                 tracker.stop();
 
-
                 // build a dag of rules and files from the ModifyList in the database
                 // and the tupfiles in the filesystem.
             }
@@ -203,7 +196,6 @@ fn main() -> Result<()> {
     println!("Done");
     Ok(())
 }
-
 
 fn scan_and_get_tupfiles(root: &PathBuf) -> Result<Vec<Node>> {
     let mut conn = Connection::open(".tup/db")
@@ -526,7 +518,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                         changed = true;
                                     },
                                 );
-                            },
+                            }
                             i if i == index_dir_children => {
                                 oper.recv(&dir_children_receiver).map_or_else(
                                     |_| {
@@ -538,7 +530,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
                                         changed = true;
                                     },
                                 );
-                            },
+                            }
                             _ => {
                                 eprintln!("unknown index returned in select");
                                 break;

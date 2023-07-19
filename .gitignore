@@ -11,3 +11,11 @@ tuporc/.vscode/*
 .vs/VSWorkspaceState.json
 .fleet/settings.json
 tuplua/
+etw_rs.txt
+out.txt
+ptrace_nix.txt
+ptrace_nix1.txt
+ptrace_nix2.txt
+ptrace_nix3.txt
+ptrace_nix4_audit.txt
+ptrace_nix5_traceread_recursive.txt

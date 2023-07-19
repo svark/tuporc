@@ -20,14 +20,14 @@ CREATE TABLE IF NOT EXISTS NodeType
 DROP TABLE IF EXISTS DIRPATHBUF;
 
 CREATE TABLE DIRPATHBUF AS
-WITH RECURSIVE full_path(id, name) AS
-                   (VALUES (1, '.')
+WITH RECURSIVE full_path(id, dir, name) AS
+                   (VALUES (1, 0, '.')
                     UNION ALL
-                    SELECT node.id id, full_path.name || '/' || node.name name
+                    SELECT node.id id, node.dir dir, full_path.name || '/' || node.name name
                     FROM node
                              JOIN full_path ON node.dir = full_path.id
                     where node.type = (SELECT id from NodeType N where N.type LIKE 'Dir%'))
-SELECT id, name
+SELECT id, dir, name
 from full_path;
 DROP TABLE IF EXISTS GRPPATHBUF;
 CREATE TABLE GRPPATHBUF AS
