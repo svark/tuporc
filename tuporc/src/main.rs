@@ -20,6 +20,7 @@ use std::fs::{FileType, Metadata};
 use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Error as IOError;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::yield_now;
@@ -41,8 +42,8 @@ use db::RowType::Dir;
 
 use crate::db::RowType::TupF;
 use crate::db::{
-    create_dyn_io_temp_tables, init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements,
-    SqlStatement,
+    create_dyn_io_temp_tables, init_db, is_initialized, ForEachClauses, LibSqlExec, LibSqlPrepare,
+    MiscStatements, SqlStatement,
 };
 use crate::parse::{exec_rules_to_run, find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
@@ -111,8 +112,16 @@ fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
     let name: String = row.get(2)?;
     let display_str: String = row.get(3)?;
     let flags: String = row.get(4)?;
+    let srcid: i64 = row.get(5)?;
 
-    Ok(Node::new_rule(id, dirid, name, display_str, flags))
+    Ok(Node::new_rule(
+        id,
+        dirid,
+        name,
+        display_str,
+        flags,
+        srcid as u32,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -141,52 +150,38 @@ fn main() -> Result<()> {
             }
             Action::Parse => {
                 let root = current_dir()?;
-                let tupfiles = scan_and_get_tupfiles(&root)?;
+                let mut connection = Connection::open(".tup/db")
+                    .expect("Connection to tup database in .tup/db could not be established");
+                let tupfiles = scan_and_get_tupfiles(&root, &mut connection)?;
                 parse_tupfiles_in_db(tupfiles, root.as_path())?;
             }
             Action::Upd { target, keep_going } => {
                 println!("Updating db {}", target.join(" "));
                 let root = current_dir()?;
-                let tupfiles = scan_and_get_tupfiles(&root)?;
+                let mut conn = Connection::open(".tup/db")
+                    .expect("Connection to tup database in .tup/db could not be established");
+                let tupfiles = scan_and_get_tupfiles(&root, &mut conn)?;
                 parse_tupfiles_in_db(tupfiles, root.as_path())?;
-                let (mut conn, dag, node_bimap) = parse::prepare_for_execution(root.as_path())?;
+                let (dag, node_bimap) = parse::prepare_for_execution(&mut conn)?;
 
                 create_dyn_io_temp_tables(&conn)?;
-                let (tx, rx) = crossbeam::channel::unbounded();
-                let mut tracker = tupetw::DynDepTracker::build(std::process::id(), tx);
                 // start tracking file io by subprocesses.
-                tracker.start_and_process()?;
-
-                let (child_ids, rules) = exec_rules_to_run(
-                    &mut conn,
+                let rule_nodes = conn.rules_to_run_no_target()?;
+                if rule_nodes.is_empty() {
+                    println!("Nothing to do");
+                    return Ok(());
+                }
+                let _ = exec_rules_to_run(
+                    conn,
+                    rule_nodes,
                     &node_bimap,
                     &dag,
                     root.as_path(),
                     &target,
                     keep_going,
                 )?;
-
                 // receive events from subprocesses.
-                while let Ok(evt_header) = rx.recv() {
-                    let file_path = evt_header.get_file_path();
-                    let rel_path = pathdiff::diff_paths(Path::new(file_path), root.as_path())
-                        .unwrap_or(PathBuf::from(file_path));
-                    let process_id = evt_header.get_process_id();
-                    let process_gen = evt_header.get_process_gen();
-                    let event_type = evt_header.get_event_type();
-                    let child_cnt = evt_header.get_child_cnt() as i32;
-                    conn.insert_trace(
-                        rel_path.as_path(),
-                        process_id,
-                        process_gen,
-                        event_type,
-                        child_cnt,
-                    )?;
-                }
-                crate::parse::verify_child_processes_io(&conn, &rules, &child_ids)?;
-                conn.remove_modified_list()?;
-
-                tracker.stop();
+                //conn.remove_modified_list()?;
 
                 // build a dag of rules and files from the ModifyList in the database
                 // and the tupfiles in the filesystem.
@@ -197,9 +192,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn scan_and_get_tupfiles(root: &PathBuf) -> Result<Vec<Node>> {
-    let mut conn = Connection::open(".tup/db")
-        .expect("Connection to tup database in .tup/db could not be established");
+fn scan_and_get_tupfiles(root: &PathBuf, connection: &mut Connection) -> Result<Vec<Node>> {
+    let mut conn = connection;
     if !is_initialized(&conn, "Node") {
         return Err(eyre!(
             "Tup database is not initialized, use `tup init' to initialize",
@@ -653,36 +647,18 @@ fn add_modify_nodes(
 ) -> Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut insert_new_node = tx.insert_node_prepare()?;
-        let mut find_node = tx.fetch_node_prepare()?;
-        let mut add_to_present = tx.add_to_present_prepare()?;
-        let mut update_mtime = tx.update_mtime_prepare()?;
-        let mut add_to_modify = tx.add_to_modify_prepare()?;
-
+        let mut node_statements = parse::NodeStatements::new(tx.deref())?;
+        let mut add_ids_statements = parse::AddIdsStatements::new(tx.deref())?;
         for tnode in nodereceiver.iter() {
             let node = tnode.get_node();
             log::debug!("recvd {}, {:?}", node.get_name(), node.get_type());
             if node.get_type() == &Dir {
-                let id: i64 = find_upsert_node(
-                    &mut insert_new_node,
-                    &mut find_node,
-                    &mut update_mtime,
-                    &mut add_to_present,
-                    &mut add_to_modify,
-                    node,
-                )?
-                .get_id();
+                let id: i64 =
+                    find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?.get_id();
 
                 dirid_sender.send((tnode.get_hashed_path().clone(), id))?;
             } else {
-                find_upsert_node(
-                    &mut insert_new_node,
-                    &mut find_node,
-                    &mut update_mtime,
-                    &mut add_to_present,
-                    &mut add_to_modify,
-                    node,
-                )?;
+                find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
             }
         }
     }

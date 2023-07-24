@@ -1,21 +1,24 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bimap::{BiHashMap, BiMap};
+use crossbeam::channel::Receiver;
 use crossbeam::sync::WaitGroup;
 use eyre::{eyre, Report, Result};
 use incremental_topo::IncrementalTopo;
 use log::debug;
 use num_cpus;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rusqlite::Connection;
 
-use tupetw::EventType;
+use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::decode::{
-    GlobPath, MatchingPath, OutputHandler, OutputHolder, PathBuffers, PathSearcher, RuleRef,
+    GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
+    PathSearcher, RuleRef,
 };
 use tupparser::errors::Error;
 use tupparser::{
@@ -23,7 +26,7 @@ use tupparser::{
     ResolvedLink, RuleDescriptor, TupParser, TupPathDescriptor,
 };
 
-use crate::db::RowType::{Env, Excluded, GenF, Rule};
+use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
     create_path_buf_temptable, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
 };
@@ -57,6 +60,11 @@ impl CrossRefMaps {
 
     pub fn get_env_db_id(&self, e: &String) -> Option<i64> {
         self.ebo.get_by_left(e).copied()
+    }
+
+    pub fn get_glob_db_id(&self, s: &GlobPathDescriptor) -> Option<(i64, i64)> {
+        let p = PathDescriptor::new((*s).into());
+        self.pbo.get_by_left(&p).copied()
     }
 
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64, par_db_id: i64) {
@@ -106,7 +114,7 @@ impl DbPathSearcher {
             );
         }
         let base_path = ph.get_path(glob_path.get_base_desc()).clone();
-        let diff_path = ph.get_rel_path(glob_path.get_path_desc(), glob_path.get_base_desc());
+        let diff_path = ph.get_rel_path(&glob_path.get_path_desc(), glob_path.get_base_desc());
         let fetch_row = |s: &String| -> Option<MatchingPath> {
             debug!("found:{} at {:?}", s, base_path.as_path());
             let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
@@ -114,7 +122,11 @@ impl DbPathSearcher {
                 let full_path = glob_path.get_base_abs_path().join(s.as_str());
                 if glob_path.is_match(full_path.as_path()) {
                     let grps = glob_path.group(full_path.as_path());
-                    Some(MatchingPath::with_captures(pd, grps))
+                    Some(MatchingPath::with_captures(
+                        pd,
+                        glob_path.get_glob_desc(),
+                        grps,
+                    ))
                 } else {
                     None
                 }
@@ -241,6 +253,9 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
     Ok(Vec::new())
 }
 
+/// adds links from glob patterns specified at each directory that are inputs to rules  to the tupfile directory
+/// We dont directly add links from glob patterns to rules, because already have resolved the glob patterns to paths in a previous iterations of parsing.
+/// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a  re-iteration parsing phase of Tupfile which the glob pattern links to
 fn add_link_glob_dir_to_rules(
     conn: &mut Connection,
     rw_buf: &ReadWriteBufferObjects,
@@ -250,7 +265,6 @@ fn add_link_glob_dir_to_rules(
     let tx = conn.transaction()?;
     {
         let mut insert_link = tx.insert_link_prepare()?;
-        let mut links_to_add = HashMap::new();
         for rlink in arts.get_resolved_links() {
             let tupfile_desc = rlink.get_rule_ref().get_tupfile_desc();
             let (tupfile_db_id, _) = crossref.get_tup_db_id(tupfile_desc).unwrap_or_else(|| {
@@ -261,16 +275,25 @@ fn add_link_glob_dir_to_rules(
                 )
             });
 
-            rlink.for_each_glob_path_desc(|glob_path_desc| {
-                let glob_dir_desc = rw_buf.get_parent_id(&glob_path_desc).unwrap();
-                links_to_add.insert(glob_dir_desc, tupfile_db_id);
-            });
-        }
-        for (glob_dir_desc, tupfile_dir) in links_to_add {
-            let (glob_dir, _) = crossref
-                .get_path_db_id(&glob_dir_desc)
-                .unwrap_or_else(|| panic!("glob dir not found:{:?} ", glob_dir_desc));
-            insert_link.insert_link(glob_dir, tupfile_dir, true, RowType::Dir)?;
+            rlink.for_each_glob_path_desc(|glob_path_desc| -> Result<(), Error> {
+                //               links_to_add.insert(glob_path_desc, tupfile_db_id);
+                let (glob_pattern_id, _) =
+                    crossref.get_glob_db_id(&glob_path_desc).unwrap_or_else(|| {
+                        panic!(
+                            "glob path not found:{:?} in tup db",
+                            rw_buf.get_glob_path(&glob_path_desc)
+                        )
+                    });
+                insert_link
+                    .insert_link(glob_pattern_id, tupfile_db_id, true, RowType::TupF)
+                    .map_err(|e| {
+                        Error::new_path_search_error(
+                            e.to_string().as_str(),
+                            rlink.get_rule_ref().clone(),
+                        )
+                    })?;
+                Ok(())
+            })?;
         }
     }
     tx.commit()?;
@@ -355,75 +378,84 @@ fn gather_rules_from_tupfiles(
 }
 
 pub(crate) fn exec_rules_to_run(
-    conn: &Connection,
+    mut conn: Connection,
+    mut rule_nodes: Vec<Node>,
     fwd_refs: &BiMap<i32, incremental_topo::Node>,
     dag: &IncrementalTopo,
     root: &Path,
     target: &Vec<String>,
     keep_going: bool,
-) -> Result<(VecDeque<u32>, Vec<Node>)> {
-    let mut rule_nodes = conn.rules_to_run_no_target()?;
+) -> Result<()> {
     // order the rules based on their dependencies
     let target_ids = conn.get_target_ids(root, target)?;
+    let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
+    let (child_id_sender, child_id_receiver) = crossbeam::channel::unbounded();
     let mut valid_rules = Vec::new();
     if target_ids.is_empty() {
         valid_rules = rule_nodes;
     } else {
         for r in rule_nodes.drain(..) {
             let id = r.get_id() as i32;
-            let rule_node_in_dag = fwd_refs.get_by_left(&id).unwrap();
-            for target_id in target_ids.iter() {
-                let t = *target_id as i32;
-                if let Some(target_node_in_dag) = fwd_refs.get_by_left(&t) {
-                    if dag.contains_transitive_dependency(rule_node_in_dag, target_node_in_dag) {
-                        valid_rules.push(r);
-                        break;
+            if let Some(rule_node_in_dag) = fwd_refs.get_by_left(&id) {
+                for target_id in target_ids.iter() {
+                    let t = *target_id as i32;
+                    if let Some(target_node_in_dag) = fwd_refs.get_by_left(&t) {
+                        if dag.contains_transitive_dependency(rule_node_in_dag, target_node_in_dag)
+                        {
+                            valid_rules.push(r);
+                            break;
+                        }
                     }
                 }
             }
         }
         if valid_rules.is_empty() {
             println!("No rules to run!");
-            return Ok((VecDeque::new(), Vec::new()));
+            return Ok(());
         }
     }
     let mut topo_order = HashMap::new();
+    let rule_ids = valid_rules
+        .iter()
+        .map(|r| r.get_id() as i32)
+        .collect::<BTreeSet<i32>>();
     for r in valid_rules.iter() {
         let id = r.get_id() as i32;
-        let rule_node_in_dag = fwd_refs.get_by_left(&id).unwrap();
-        dag.descendants_unsorted(rule_node_in_dag)
-            .map(|x| {
-                x.for_each(|(order, ref dag_node)| {
-                    let id = fwd_refs.get_by_right(dag_node).unwrap();
-                    let o = topo_order.entry(id).or_insert(order);
-                    if order.cmp(o) == std::cmp::Ordering::Greater {
-                        *o = order;
-                    }
-                });
-            })
-            .expect(&*format!(
-                "unable to sort rules to run from {}",
-                r.get_name()
-            ));
+        debug!("checking rule {} descendants in dag", id);
+        fwd_refs
+            .get_by_left(&id)
+            .map(|rule_node_in_dag| -> Result<()> {
+                let _ = topo_order.entry(id).or_insert(0);
+                dag.descendants_unsorted(rule_node_in_dag)
+                    .map(|x| {
+                        x.for_each(|(order, ref dag_node)| {
+                            let id = fwd_refs.get_by_right(dag_node).unwrap();
+                            if rule_ids.contains(id) {
+                                let o = topo_order.entry(*id).or_insert(order);
+                                if order.cmp(o) == std::cmp::Ordering::Greater {
+                                    *o = order;
+                                }
+                            }
+                        });
+                    })
+                    .expect(&*format!(
+                        "unable to sort rules to run from {}",
+                        r.get_name()
+                    ));
+                Ok(())
+            });
     }
-    let descendant_count = topo_order.len();
-    let mut max_topo_order = 0;
-    let mut min_topo_oder = usize::MAX;
-    for (_, v) in topo_order.iter() {
-        max_topo_order = std::cmp::max(max_topo_order, *v);
-        min_topo_oder = std::cmp::min(min_topo_oder, *v);
+    //let descendant_count = topo_order.len();
+    let mut topo_orders_set = BTreeSet::new();
+    for v in valid_rules.iter() {
+        topo_orders_set.insert(topo_order.get(&(v.get_id() as i32)).unwrap());
     }
-    let mut childids = VecDeque::new();
+    //let mut childids = Vec::new();
     let poisoned = Arc::new(RwLock::new(0));
     let num_threads = std::cmp::min(num_cpus::get(), valid_rules.len());
     {
         let poisoned = poisoned.clone();
-        ctrlc::set_handler(move || {
-            if let Ok(mut poisoned) = poisoned.write() {
-                *poisoned = 1_u8;
-            }
-        })
-        .expect("Error setting Ctrl-C handler");
+        ctrlc::set_handler(move || *poisoned.write() = 1).expect("Error setting Ctrl-C handler");
     }
     valid_rules.sort_by(|x, y| {
         let xid = x.get_id() as i32;
@@ -434,10 +466,12 @@ pub(crate) fn exec_rules_to_run(
             .cmp(topo_order.get(&yid).unwrap())
     });
     let mut dirpaths = Vec::new();
-    let mut dirpath = conn.fetch_node_path_prepare()?;
-    for r in valid_rules.iter() {
-        let path = dirpath.fetch_node_path(r.get_name(), r.get_dir())?;
-        dirpaths.push(path);
+    {
+        let mut dirpath = conn.fetch_node_path_prepare()?;
+        for r in valid_rules.iter() {
+            let path = dirpath.fetch_node_dir_path(r.get_dir())?;
+            dirpaths.push(path);
+        }
     }
     let mut min_idx = 0;
     /* let mut stream = termcolor::BufferedStandardStream::stdout(termcolor::ColorChoice::Always);
@@ -448,203 +482,384 @@ pub(crate) fn exec_rules_to_run(
     )
         .unwrap(); */
 
-    for o in min_topo_oder..max_topo_order {
-        let max_idx = valid_rules.partition_point(|x| {
-            let id = x.get_id() as i32;
-            topo_order.get(&id).unwrap().cmp(&o) == std::cmp::Ordering::Less
-        }); // we limit ourselves to nodes with same topo order, so that dependent rules are run later
+    let rule_for_child_id = Arc::new(RwLock::new(BTreeMap::new()));
+    let mut tracker = tupetw::DynDepTracker::build(std::process::id(), trace_sender);
+    tracker.start_and_process()?;
+    crossbeam::scope(|s| -> Result<()> {
+        {
+            let poisoned = poisoned.clone();
+            let trace_receiver = trace_receiver.clone();
+            let child_id_receiver = child_id_receiver.clone();
+            s.spawn(move |_| -> Result<()> {
+                listen_to_processes(
+                    &mut conn,
+                    root,
+                    keep_going,
+                    tracker,
+                    poisoned,
+                    &trace_receiver,
+                    &child_id_receiver,
+                )?;
+                Ok(())
+            });
+        }
+        drop(trace_receiver);
+        drop(child_id_receiver);
+        for o in topo_orders_set {
+            let max_idx = valid_rules.partition_point(|x| {
+                let id = x.get_id() as i32;
+                topo_order.get(&id).unwrap().cmp(&o) == std::cmp::Ordering::Less
+            }); // we limit ourselves to nodes with same topo order, so that dependent rules are run later
 
-        let mut children = Vec::new();
-        (0..num_threads).for_each(|_| {
-            children.push(Vec::<Arc<Mutex<Child>>>::new());
-        });
-        for j in min_idx..max_idx {
-            let rule_node = &valid_rules[j];
-            if let Ok(poisoned) = poisoned.read() {
-                if *poisoned == 1 {
+            rule_for_child_id.write().clear();
+            let mut children = Vec::new();
+            (0..num_threads).for_each(|_| {
+                children.push(Vec::<Arc<Mutex<(Child, String)>>>::new());
+            });
+            for j in min_idx..max_idx {
+                let rule_node = &valid_rules[j];
+                if *poisoned.read() == 1 {
                     return Err(eyre!("Aborted executing rule: \n{}", rule_node.get_name()));
                 }
-            }
-            let mut cmd = execute::command(rule_node.get_name());
-            cmd.current_dir(dirpaths[j].as_path());
-            if rule_node.get_display_str().is_empty() {
-                println!("{:?}", cmd);
-            } else {
-                println!("{}", rule_node.get_display_str());
-            }
-            let ch = cmd.spawn()?;
-            let ch_id = ch.id();
-            children[j % num_threads].push(Arc::new(Mutex::new(ch)));
-            childids.push_back(ch_id);
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-        }
-
-        crossbeam::scope(|s| -> Result<()> {
-            for i in 0..num_threads {
-                {
-                    let poisoned = poisoned.clone();
-                    let num_threads = num_threads.clone();
-                    let i = i.clone();
-                    let min_idx = min_idx.clone();
-                    let max_idx = max_idx.clone();
-                    let children = children[i].drain(..).collect::<Vec<_>>();
-                    s.spawn(move |_| -> Result<()> {
-                        poisoned
-                            .read()
-                            .ok() // Convert Result to Option
-                            .and_then(|guard| if *guard == 0 { Some(Ok(())) } else { None })
-                            .unwrap_or_else(|| {
-                                for j in (i + min_idx..max_idx).step_by(num_threads) {
-                                    let ch = children[j].clone();
-                                    ch.lock().kill()?;
-                                }
-                                Ok::<(), Report>(())
-                            })
-                    });
+                let mut cmd = execute::shell(rule_node.get_name());
+                cmd.current_dir(dirpaths[j].as_path());
+                if rule_node.get_display_str().is_empty() {
+                    println!("{:?}", cmd);
+                } else {
+                    println!("{}", rule_node.get_display_str());
                 }
-                {
-                    let poisoned = poisoned.clone();
-                    let num_threads = num_threads.clone();
-                    let i = i.clone();
-                    let min_idx = min_idx.clone();
-                    let max_idx = max_idx.clone();
-                    let children = children[i].clone();
-                    let ref valid_rules = valid_rules;
-                    s.spawn(move |_| -> Result<()> {
-                        for j in (i + min_idx..max_idx).step_by(num_threads) {
-                            let ref exit_status = children[j].lock().wait()?;
-                            if !exit_status.success() {
-                                if let Ok(mut poisoned) = poisoned.write() {
-                                    if *poisoned == 0 {
-                                        *poisoned = 2_u8;
-                                    }
+                let ch = cmd.spawn()?;
+                let ch_id = ch.id();
+
+                let rule_id = rule_node.get_id();
+                rule_for_child_id
+                    .write()
+                    .insert(ch_id, (rule_id, rule_node.get_name().to_owned()));
+                children[j % num_threads]
+                    .push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned()))));
+                //childids.push_back(ch_id);
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+            }
+
+            {
+                let wg = WaitGroup::new();
+                let poisoned = poisoned.clone();
+                for i in 0..num_threads {
+                    let done = Arc::new(RwLock::new(false));
+                    {
+                        let mut poisoned = poisoned.clone();
+                        let i = i.clone();
+                        let children = children[i].clone();
+
+                        let done = done.clone();
+                        // in this thread we check for user breaks or poisoned state and attempt to kill all children
+                        s.spawn(move |_| -> Result<()> {
+                            loop {
+                                if *done.read() {
+                                    break;
                                 }
-                                if !keep_going {
-                                    //eprintln!("{}", String::from_utf8_lossy(&exit_status.stderr));
-                                    return Err(eyre!(
-                                        "Error executing rule: \n{:?}",
-                                        valid_rules[j].get_name()
-                                    ));
+                                if kill_poisoned(&mut poisoned, &children, keep_going) {
+                                    break;
                                 }
                             }
-                        }
-                        Ok(())
-                    });
+                            Ok(())
+                        });
+                    }
+                    {
+                        let poisoned = poisoned.clone();
+                        let i = i.clone();
+                        let children = children[i].clone();
+                        // in this thread we wait for children to finish
+                        let child_id_sender = child_id_sender.clone();
+                        let rule_for_child_id = rule_for_child_id.clone();
+                        let wg = wg.clone();
+                        s.spawn(move |_| -> Result<()> {
+                            let finished = wait_for_children(keep_going, poisoned, children)?;
+                            for id in finished {
+                                let rule_for_child_id = rule_for_child_id.read();
+                                if let Some((rule_id, rule_name)) =
+                                    rule_for_child_id.get(&id).cloned()
+                                {
+                                    child_id_sender.send((id, (rule_id, rule_name)))?;
+                                }
+                            }
+                            *done.write() = true;
+                            drop(wg);
+                            Ok(())
+                        });
+                    }
                 }
+                wg.wait(); // wait for all processes to finish before next topo order rules are executed
             }
-            Ok(())
-        })
-        .unwrap()
-        .expect(" panic message");
-        min_idx = max_idx;
+            min_idx = max_idx;
 
-        if let Ok(poisoned) = poisoned.read() {
-            if *poisoned != 0 {
+            let p = poisoned.read();
+            if *p != 0 {
                 return Err(eyre!("Stopping further rule executions"));
             }
-        }
-    } // min_topo_order..max topo order
-    Ok((childids, valid_rules))
+        } // min_topo_order..max topo order
+        drop(child_id_sender);
+        Ok(())
+    })
+    .unwrap()
+    .expect(" panic message");
+
+    Ok(())
 }
 
-pub(crate) fn verify_child_processes_io(
-    conn: &Connection,
-    rule_nodes: &Vec<Node>,
-    childids: &VecDeque<u32>,
-) -> Result<()> {
-    let mut input_getter = conn.fetch_inputs_for_rule_prepare()?;
-    let mut output_getter = conn.fetch_outputs_for_rule_prepare()?;
-    let mut fetch_io_stmt = conn.fetch_io_prepare()?;
-    for (i, r) in rule_nodes.iter().enumerate() {
-        let ch_id = childids[i];
-        let io_vec = fetch_io_stmt.fetch_io(ch_id as i32)?; // this will fail if the child process failed
-        let inps = input_getter.fetch_inputs(r.get_id() as i32)?;
-        let outs = output_getter.fetch_outputs(r.get_id() as i32)?;
-        'outer: for (fnode, ty) in io_vec.iter() {
-            if *ty == EventType::Read as u8 {
-                let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
-                for inp in inps.iter() {
-                    if *inp.get_type() == RowType::Dir
-                        || *inp.get_type() == RowType::Grp
-                        || *inp.get_type() == RowType::Env
-                        || *inp.get_type() == RowType::DirGen
-                    {
+fn kill_poisoned(
+    poisoned: &mut Arc<RwLock<u8>>,
+    children: &Vec<Arc<Mutex<(Child, String)>>>,
+    keep_going: bool,
+) -> bool {
+    let guard = poisoned.read();
+    if *guard == 1 || *guard != 0 && !keep_going {
+        children.into_iter().for_each(|ch| {
+            let ref mut ch = ch.lock().0;
+            let id = ch.id();
+            ch.kill().ok();
+            eprintln!("Killed child process {}", id);
+        });
+        true
+    } else {
+        false
+    }
+}
+
+fn wait_for_children(
+    keep_going: bool,
+    poisoned: Arc<RwLock<u8>>,
+    mut children: Vec<Arc<Mutex<(Child, String)>>>,
+) -> Result<Vec<u32>, Report> {
+    let mut finished = Vec::new();
+    while !children.is_empty() {
+        let mut tryagain = Vec::new();
+
+        for child in children {
+            let ref mut ch = child.lock();
+            let id = ch.0.id();
+            if let Some(ref exit_status) = ch.0.try_wait()? {
+                if !exit_status.success() {
+                    if *poisoned.read() != 0 {
                         continue;
                     }
-                    if inp.get_name() == fnode {
-                        continue 'outer;
+                    let mut poisoned = poisoned.write();
+                    if *poisoned == 0 {
+                        *poisoned = 2_u8;
                     }
+                    if !keep_going {
+                        //eprintln!("{}", String::from_utf8_lossy(&exit_status.stderr));
+                        return Err(eyre!("Error executing rule: \n{:?}", ch.1));
+                    }
+                } else {
+                    debug!("finished executing rule: \n{:?}", ch.1);
+                    finished.push(id);
                 }
-                return Err(eyre!(
-                    "File {} being read was not an input to rule {}",
-                    fnode,
-                    r.get_name()
-                ));
-            } else if *ty == EventType::Write as u8 {
-                let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
-                for out in outs.iter() {
-                    if out.get_type().eq(&Excluded) {
-                        let exclude_pattern = out.get_name().to_string();
-                        use regex::Regex;
-                        let re = Regex::new(&*exclude_pattern).unwrap();
-                        if re.is_match(fnode) {
-                            continue 'outer;
+            } else {
+                tryagain.push(child.clone());
+            }
+        }
+        children = tryagain;
+        if !children.is_empty() {
+            std::thread::sleep(std::time::Duration::from_nanos(100));
+        }
+    }
+    Ok(finished)
+}
+
+fn listen_to_processes(
+    conn: &mut Connection,
+    root: &Path,
+    keep_going: bool,
+    mut tracker: DynDepTracker,
+    poisoned: Arc<RwLock<u8>>,
+    trace_receiver: &Receiver<EventHeader>,
+    child_id_receiver: &Receiver<(u32, (i64, String))>,
+) -> Result<(), Report> {
+    let mut io_conn = Connection::open_in_memory().expect("Failed to open in memory db");
+    let mut end_child_ids = false;
+    let mut end_trace = false;
+    let mut input_getter = conn.fetch_inputs_for_rule_prepare()?;
+    let mut output_getter = conn.fetch_outputs_for_rule_prepare()?;
+    let mut marke_failed_stmt = conn.mark_rule_failed_prepare()?;
+    loop {
+        let mut sel = crossbeam::channel::Select::new();
+        let index_child_ids = if end_child_ids {
+            usize::MAX
+        } else {
+            sel.recv(&child_id_receiver)
+        };
+
+        let index_trace = if end_trace {
+            usize::MAX
+        } else {
+            sel.recv(&trace_receiver)
+        };
+        while let Ok(oper) = sel.try_select() {
+            if !keep_going && *poisoned.read() != 0 {
+                break;
+            }
+            match oper.index() {
+                i if i == index_child_ids => {
+                    if let Ok((child_id, (rule_id, rule_name))) =
+                        oper.recv(&child_id_receiver).map_err(|_| {
+                            log::debug!("no more children  expected");
+                            end_child_ids = true;
+                            tracker.stop();
+                        })
+                    {
+                        let mut fetch_io_stmt = io_conn.fetch_io_prepare()?;
+                        //dir_id_by_path.insert(p, id);
+                        if let Err(e) = verify_rule_io(
+                            child_id,
+                            rule_id as _,
+                            rule_name.as_str(),
+                            &mut input_getter,
+                            &mut output_getter,
+                            &mut fetch_io_stmt,
+                        ) {
+                            eprintln!("Error verifying rule io: {}", e.to_string());
+                            marke_failed_stmt
+                                .mark_rule_failed(rule_id as _)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "Could not write failed rule {} with id :{} to db, \n {}",
+                                        rule_name,
+                                        rule_id,
+                                        e.to_string()
+                                    )
+                                });
+                            *poisoned.write() = 2;
                         }
                     }
-                    if out.get_name() == fnode {
-                        continue 'outer;
+                }
+                i if i == index_trace => {
+                    if let Ok(evt_header) = oper.recv(&trace_receiver).map_err(|_| {
+                        log::debug!("no more trace events expected");
+                        end_trace = true;
+                    }) {
+                        //dir_children_set.insert(p);
+                        let file_path = evt_header.get_file_path();
+                        if let Some(rel_path) = pathdiff::diff_paths(Path::new(file_path), root) {
+                            let process_id = evt_header.get_process_id();
+                            let process_gen = evt_header.get_process_gen();
+                            let event_type = evt_header.get_event_type();
+                            let child_cnt = evt_header.get_child_cnt() as i32;
+                            io_conn
+                                .insert_trace(
+                                    rel_path.as_path(),
+                                    process_id,
+                                    process_gen,
+                                    event_type,
+                                    child_cnt,
+                                )
+                                .expect("Failed to insert trace");
+                        }
                     }
                 }
-                return Err(eyre!(
-                    "File {} being written was not an output to rule {}",
-                    fnode,
-                    r.get_name()
-                ));
-            }
-        }
-        'outer2: for inp in inps.iter() {
-            let fname = inp.get_name();
-            let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
-            for (fnode, ty) in io_vec.iter() {
-                if ty == &(EventType::Read as u8) && fnode == fname {
-                    continue 'outer2;
+                _ => {
+                    eprintln!("unknown index returned in select:{}", oper.index());
+                    break;
                 }
             }
-            return Err(eyre!(
-                "File {} was not read by rule {}",
-                fname,
-                r.get_name()
-            ));
-        }
-        'outer3: for out in outs.iter() {
-            let fname = out.get_name();
-            let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
-            for (fnode, ty) in io_vec.iter() {
-                if ty == &(EventType::Write as u8) && fnode == fname {
-                    continue 'outer3;
-                }
+            if end_child_ids || end_trace {
+                break;
             }
-            return Err(eyre!(
-                "File {} was not written by rule {}",
-                fname,
-                r.get_name()
-            ));
+        }
+        if !keep_going && *poisoned.read() != 0 {
+            break;
+        }
+        if end_child_ids || end_trace {
+            break;
         }
     }
     Ok(())
 }
 
-pub(crate) fn prepare_for_execution(
-    root: &Path,
-) -> Result<(
-    Connection,
-    IncrementalTopo,
-    BiHashMap<i32, incremental_topo::Node>,
-)> {
-    let mut conn = Connection::open(root.join(".tup/db"))
-        .expect("Connection to tup database in .tup/db could not be established");
+fn verify_rule_io(
+    ch_id: u32,
+    rule_id: i32,
+    rule_name: &str,
+    input_getter: &mut SqlStatement,
+    output_getter: &mut SqlStatement,
+    fetch_io_stmt: &mut SqlStatement,
+) -> Result<()> {
+    let io_vec = fetch_io_stmt.fetch_io(ch_id as i32)?; // this will fail if the child process failed
+    let inps = input_getter.fetch_inputs(rule_id)?;
+    let outs = output_getter.fetch_outputs(rule_id)?;
+    'outer: for (fnode, ty) in io_vec.iter() {
+        if *ty == EventType::Read as u8 {
+            let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
+            for inp in inps.iter() {
+                if *inp.get_type() == RowType::Dir
+                    || *inp.get_type() == RowType::Grp
+                    || *inp.get_type() == RowType::Env
+                    || *inp.get_type() == RowType::DirGen
+                {
+                    continue;
+                }
+                if inp.get_name() == fnode {
+                    continue 'outer;
+                }
+            }
+            return Err(eyre!(
+                "File {} being read was not an input to rule {}",
+                fnode,
+                rule_name
+            ));
+        } else if *ty == EventType::Write as u8 {
+            let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
+            for out in outs.iter() {
+                if out.get_type().eq(&Excluded) {
+                    let exclude_pattern = out.get_name().to_string();
+                    use regex::Regex;
+                    let re = Regex::new(&*exclude_pattern).unwrap();
+                    if re.is_match(fnode) {
+                        continue 'outer;
+                    }
+                }
+                if out.get_name() == fnode {
+                    continue 'outer;
+                }
+            }
+            return Err(eyre!(
+                "File {} being written was not an output to rule {}",
+                fnode,
+                rule_name
+            ));
+        }
+    }
+    'outer2: for inp in inps.iter() {
+        let fname = inp.get_name();
+        let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
+        for (fnode, ty) in io_vec.iter() {
+            if ty == &(EventType::Read as u8) && fnode == fname {
+                continue 'outer2;
+            }
+        }
+        return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
+    }
+    'outer3: for out in outs.iter() {
+        let fname = out.get_name();
+        let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
+        for (fnode, ty) in io_vec.iter() {
+            if ty == &(EventType::Write as u8) && fnode == fname {
+                continue 'outer3;
+            }
+        }
+        return Err(eyre!(
+            "File {} was not written by rule {}",
+            fname,
+            rule_name
+        ));
+    }
+    Ok(())
+}
 
+pub(crate) fn prepare_for_execution(
+    conn: &mut Connection,
+) -> Result<(IncrementalTopo, BiHashMap<i32, incremental_topo::Node>)> {
     let mut dag = IncrementalTopo::new();
     let mut unique_node_ids = HashMap::new();
     {
@@ -668,7 +883,6 @@ pub(crate) fn prepare_for_execution(
         conn.for_each_link(add_edge)?
     }
     Ok((
-        conn,
         dag,
         BiHashMap::<i32, incremental_topo::Node>::from_iter(
             unique_node_ids.iter().map(|(x, y)| (*x, y.clone())),
@@ -989,6 +1203,7 @@ fn insert_nodes(
             let name = rule_formula.get_rule_str();
             let display_str = rule_formula.get_display_str();
             let flags = rule_formula.get_flags();
+            let srcid = rule_formula.get_rule_ref().get_line();
             if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
                 crossref.add_rule_xref(*rule_desc, nodeid, dir);
                 nodeids.insert((nodeid, RowType::Rule));
@@ -1001,7 +1216,14 @@ fn insert_nodes(
                 let prevline =
                     unique_rule_check.insert(dir.to_string() + "/" + name.as_str(), line);
                 if prevline.is_none() {
-                    rules_to_insert.push(Node::new_rule(isz as i64, dir, name, display_str, flags));
+                    rules_to_insert.push(Node::new_rule(
+                        isz as i64,
+                        dir,
+                        name,
+                        display_str,
+                        flags,
+                        srcid,
+                    ));
                 } else {
                     eyre::ensure!(
                         false,
@@ -1065,6 +1287,7 @@ fn insert_nodes(
             Ok(())
         };
         let mut processed = std::collections::HashSet::new();
+        let mut processed_globs = std::collections::HashSet::new();
         for r in arts.rules_by_tup().iter() {
             for rl in r.iter() {
                 let rd = rl.get_rule_desc();
@@ -1080,6 +1303,14 @@ fn insert_nodes(
                 for p in rl.get_targets() {
                     if processed.insert(p) {
                         collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
+                    }
+                }
+                for s in rl.get_sources() {
+                    if let Some(p) = s.get_glob_path_desc() {
+                        if processed_globs.insert(p) && s.is_glob_match() {
+                            let p = PathDescriptor::new(p.into());
+                            collect_nodes_to_insert(&p, &Glob, 0, dir, crossref, &mut find_nodeid)?;
+                        }
                     }
                 }
                 for p in rl.get_excluded_targets() {
@@ -1137,11 +1368,8 @@ fn insert_nodes(
     let tx = conn.transaction()?;
     {
         //tx.create_temp_ids_table()?;
-        let mut insert_node = tx.insert_node_prepare()?;
-        let mut find_node = tx.fetch_node_prepare()?;
-        let mut update_mtime = tx.update_mtime_prepare()?;
-        let mut add_to_present = tx.add_to_present_prepare()?;
-        let mut add_to_modify = tx.add_to_modify_prepare()?;
+        let mut node_statements = NodeStatements::new(tx.deref())?;
+        let mut add_ids_statements = AddIdsStatements::new(tx.deref())?;
         for node in groups_to_insert
             .into_iter()
             .chain(paths_to_insert.into_iter())
@@ -1149,15 +1377,8 @@ fn insert_nodes(
             .chain(rules_to_insert.into_iter())
         {
             let desc = node.get_id() as usize;
-            let db_id = find_upsert_node(
-                &mut insert_node,
-                &mut find_node,
-                &mut update_mtime,
-                &mut add_to_present,
-                &mut add_to_modify,
-                &node,
-            )?
-            .get_id();
+            let db_id =
+                find_upsert_node(&mut node_statements, &mut add_ids_statements, &node)?.get_id();
             nodeids.insert((db_id, *node.get_type()));
             if RowType::Grp.eq(node.get_type()) {
                 crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id, node.get_dir());
@@ -1178,9 +1399,11 @@ fn insert_nodes(
                     add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
                 }
                 crossref.add_env_xref(env_var, env_id);
+                nodeids.insert((env_id, RowType::Env));
             } else {
                 let env_id = inst_env_stmt.insert_env_exec(env_var.as_str(), env_val.as_str())?;
                 crossref.add_env_xref(env_var, env_id);
+                nodeids.insert((env_id, RowType::Env));
                 add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
             }
         }
@@ -1197,14 +1420,80 @@ fn insert_nodes(
     Ok(nodeids)
 }
 
+pub struct NodeStatements<'a> {
+    insert_node: SqlStatement<'a>,
+    find_node: SqlStatement<'a>,
+    update_mtime: SqlStatement<'a>,
+    update_display_str: SqlStatement<'a>,
+    update_flags: SqlStatement<'a>,
+    update_srcid: SqlStatement<'a>,
+}
+
+impl NodeStatements<'_> {
+    pub fn new(conn: &Connection) -> Result<NodeStatements> {
+        let insert_node = conn.insert_node_prepare()?;
+        let find_node = conn.fetch_node_prepare()?;
+        let update_mtime = conn.update_mtime_prepare()?;
+        let update_display_str = conn.update_display_str_prepare()?;
+        let update_flags = conn.update_flags_prepare()?;
+        let update_srcid = conn.update_srcid_prepare()?;
+        Ok(NodeStatements {
+            insert_node,
+            find_node,
+            update_mtime,
+            update_display_str,
+            update_flags,
+            update_srcid,
+        })
+    }
+    fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
+        self.insert_node.insert_node_exec(n)
+    }
+    fn fetch_node(&mut self, name: &str, dirid: i64) -> Result<Node> {
+        self.find_node.fetch_node(name, dirid)
+    }
+    fn update_mtime_exec(&mut self, nodeid: i64, mtime: i64) -> Result<()> {
+        self.update_mtime.update_mtime_exec(nodeid, mtime)
+    }
+    fn update_display_str_exec(&mut self, nodeid: i64, display_str: &str) -> Result<()> {
+        self.update_display_str
+            .update_display_str(nodeid, display_str)
+    }
+    fn update_flags_exec(&mut self, nodeid: i64, flags: &str) -> Result<()> {
+        self.update_flags.update_flags_exec(nodeid, flags)
+    }
+    fn update_srcid_exec(&mut self, nodeid: i64, srcid: i64) -> Result<()> {
+        self.update_srcid.update_srcid_exec(nodeid, srcid)
+    }
+}
+
+pub(crate) struct AddIdsStatements<'a> {
+    add_to_present: SqlStatement<'a>,
+    add_to_modify: SqlStatement<'a>,
+}
+
+impl AddIdsStatements<'_> {
+    pub fn new(conn: &Connection) -> Result<AddIdsStatements> {
+        let add_to_present = conn.add_to_present_prepare()?;
+        let add_to_modify = conn.add_to_modify_prepare()?;
+        Ok(AddIdsStatements {
+            add_to_present,
+            add_to_modify,
+        })
+    }
+    fn add_to_modify(&mut self, nodeid: i64, rowtype: RowType) -> Result<()> {
+        self.add_to_modify.add_to_modify_exec(nodeid, rowtype)
+    }
+    fn add_to_present(&mut self, nodeid: i64, rowtype: RowType) -> Result<()> {
+        self.add_to_present.add_to_present_exec(nodeid, rowtype)
+    }
+}
+
 // this is pretends to be the sqlite upsert operation
 // it also adds the node to the present list, modify list and updates nodes mtime
 pub(crate) fn find_upsert_node(
-    insert_node: &mut SqlStatement,
-    find_node_id: &mut SqlStatement,
-    update_mtime: &mut SqlStatement,
-    add_to_present: &mut SqlStatement,
-    add_to_modify: &mut SqlStatement,
+    node_statements: &mut NodeStatements,
+    add_ids_statements: &mut AddIdsStatements,
     node: &Node,
 ) -> Result<Node> {
     debug!(
@@ -1212,9 +1501,10 @@ pub(crate) fn find_upsert_node(
         node.get_name(),
         node.get_dir()
     );
-    let db_node = find_node_id
+    let db_node = node_statements
         .fetch_node(node.get_name(), node.get_dir())
         .and_then(|existing_node| {
+            let mut modify = false;
             if (existing_node.get_mtime() - node.get_mtime()).abs() > 1 {
                 debug!(
                     "updating mtime for:{}, {} -> {}",
@@ -1222,23 +1512,74 @@ pub(crate) fn find_upsert_node(
                     existing_node.get_mtime(),
                     node.get_mtime()
                 );
-                update_mtime.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
-                add_to_modify
-                    .add_to_modify_exec(existing_node.get_id(), *existing_node.get_type())?;
+                node_statements.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
+                modify = true;
+                add_ids_statements
+                    .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
             }
-            add_to_present
-                .add_to_present_exec(existing_node.get_id(), *existing_node.get_type())?;
+            if existing_node.get_display_str() != node.get_display_str() {
+                debug!(
+                    "updating display_str for:{}, {} -> {}",
+                    existing_node.get_name(),
+                    existing_node.get_display_str(),
+                    node.get_display_str()
+                );
+                node_statements
+                    .update_display_str_exec(existing_node.get_id(), node.get_display_str())?;
+                if !modify {
+                    add_ids_statements
+                        .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
+                    modify = true;
+                }
+            }
+            if existing_node.get_flags() != node.get_flags() {
+                debug!(
+                    "updating flags for:{}, {} -> {}",
+                    existing_node.get_name(),
+                    existing_node.get_flags(),
+                    node.get_flags()
+                );
+                node_statements.update_flags_exec(existing_node.get_id(), node.get_flags())?;
+                if !modify {
+                    add_ids_statements
+                        .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
+                    modify = true;
+                }
+            }
+            if existing_node.get_srcid() != node.get_srcid() {
+                debug!(
+                    "updating srcid for:{}, {} -> {}",
+                    existing_node.get_name(),
+                    existing_node.get_srcid(),
+                    node.get_srcid()
+                );
+                node_statements.update_srcid_exec(existing_node.get_id(), node.get_srcid())?;
+                if !modify {
+                    add_ids_statements
+                        .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
+                    modify = true;
+                }
+            }
+            if !modify {
+                debug!(
+                    "no change for:{}, {} -> {}",
+                    existing_node.get_name(),
+                    existing_node.get_mtime(),
+                    node.get_mtime()
+                );
+            }
+            add_ids_statements.add_to_present(existing_node.get_id(), *existing_node.get_type())?;
             Ok(existing_node)
         })
         .or_else(|e| {
             if let Some(rusqlite::Error::QueryReturnedNoRows) =
                 e.root_cause().downcast_ref::<rusqlite::Error>()
             {
-                let node = insert_node
+                let node = node_statements
                     .insert_node_exec(node)
                     .map(|i| Node::copy_from(i, node))?;
-                add_to_modify.add_to_modify_exec(node.get_id(), *node.get_type())?;
-                add_to_present.add_to_present_exec(node.get_id(), *node.get_type())?; // add to present list
+                add_ids_statements.add_to_modify(node.get_id(), *node.get_type())?;
+                add_ids_statements.add_to_present(node.get_id(), *node.get_type())?; // add to present list
                 Ok::<Node, eyre::Error>(node)
             } else {
                 Err::<Node, eyre::Error>(e)

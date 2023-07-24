@@ -2,12 +2,14 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
-use eyre::Result;
+use eyre::{Report, Result};
 use log::debug;
 use pathdiff::diff_paths;
 use rusqlite::{Connection, Params, Statement};
 
-use tupparser::decode::MatchingPath;
+use tupparser::decode::{decode_group_captures, MatchingPath, RuleRef};
+use tupparser::statements::Loc;
+use tupparser::TupPathDescriptor;
 
 use crate::db::StatementType::*;
 use crate::{make_node, make_tup_node};
@@ -33,6 +35,8 @@ pub enum RowType {
     DirGen = 7,
     /// Excluded file pattern
     Excluded = 8,
+    /// Glob input type for a rule
+    Glob = 9,
 }
 
 impl PartialOrd<Self> for RowType {
@@ -166,7 +170,14 @@ impl Node {
             srcid,
         }
     }
-    pub fn new_rule(id: i64, dirid: i64, name: String, display_str: String, flags: String) -> Node {
+    pub fn new_rule(
+        id: i64,
+        dirid: i64,
+        name: String,
+        display_str: String,
+        flags: String,
+        srcid: u32,
+    ) -> Node {
         Node {
             id,
             dirid,
@@ -175,7 +186,7 @@ impl Node {
             rtype: RowType::Rule,
             display_str,
             flags,
-            srcid: -1,
+            srcid: srcid as i64,
         }
     }
     pub fn new_grp(id: i64, dirid: i64, name: String) -> Node {
@@ -218,6 +229,7 @@ impl Node {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatementType {
+    DoNothing,
     AddToMod,
     AddToDel,
     AddToPres,
@@ -242,16 +254,22 @@ pub enum StatementType {
     FindParentRule,
     //FindIo,
     UpdMTime,
+    UpdDisplayStr,
+    UpdFlags,
+    UpdSrcId,
     UpdDirId,
     UpdEnv,
     DeleteId,
     DeleteNormalRuleLinks,
     ImmediateDeps,
+    FailedRule,
     RuleDepRules,
     RestoreDeleted,
     FetchIO,
     FetchEnvsForRule,
     RemovePresents,
+    RemoveFailed,
+    AddFailedToMod,
     FetchOutputsForRule,
     FetchInputsForRule,
 }
@@ -266,6 +284,8 @@ pub(crate) trait LibSqlPrepare {
     fn add_to_delete_prepare(&self) -> Result<SqlStatement>;
     fn add_to_present_prepare(&self) -> Result<SqlStatement>;
     fn remove_presents_prepare(&self) -> Result<SqlStatement>;
+    fn remove_failed_prepare(&self) -> Result<SqlStatement>;
+    fn insert_failed_to_modified_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
@@ -275,6 +295,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_dirid_with_par_prepare(&self) -> Result<SqlStatement>;
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
+    fn do_nothing_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_env_id_prepare(&self) -> Result<SqlStatement>;
@@ -285,10 +306,14 @@ pub(crate) trait LibSqlPrepare {
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
+    fn update_display_str_prepare(&self) -> Result<SqlStatement>;
+    fn update_flags_prepare(&self) -> Result<SqlStatement>;
+    fn update_srcid_prepare(&self) -> Result<SqlStatement>;
     fn update_env_prepare(&self) -> Result<SqlStatement>;
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
+    fn mark_rule_failed_prepare(&self) -> Result<SqlStatement>;
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
     fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
     fn mark_deleted_prepare(&self) -> Result<SqlStatement>;
@@ -307,6 +332,8 @@ pub(crate) trait LibSqlExec {
     fn add_to_present_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
     fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
     fn remove_presents_exec(&mut self) -> Result<()>;
+    fn remove_failed_exec(&mut self) -> Result<()>;
+    fn add_failed_to_modified_exec(&mut self) -> Result<()>;
     /// Insert a directory node into the database
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
     /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxillary table
@@ -350,8 +377,12 @@ pub(crate) trait LibSqlExec {
     fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>>;
     /// fetch node path from its name and directory id
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
+    fn fetch_node_dir_path(&mut self, dirid: i64) -> Result<PathBuf>;
     /// update modified time for a node with the given id
     fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()>;
+    fn update_display_str(&mut self, id: i64, display_str: &str) -> Result<()>;
+    fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()>;
+    fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()>;
     /// update directory id for a node with the given id
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     /// update env value  for a env node with the given id
@@ -360,6 +391,7 @@ pub(crate) trait LibSqlExec {
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     /// deleted nodes that are outputs of a rule with the given rule id
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
+    fn mark_rule_failed(&mut self, rule_id: i64) -> Result<()>;
     /// fetch all tupfiles that depend on the given rule (usually via a group output)
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
     /// delete normal links between nodes that are inputs and outputs of a rule with the given rule id
@@ -529,6 +561,24 @@ impl LibSqlPrepare for Connection {
             tok: RemovePresents,
         })
     }
+    fn remove_failed_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE * from FailedList")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RemoveFailed,
+        })
+    }
+
+    fn insert_failed_to_modified_prepare(&self) -> Result<SqlStatement> {
+        let rtype = RowType::Rule as u8;
+        let stmt = self.prepare(&*format!(
+            "INSERT or IGNORE into ModifyList(id, type) SELECT id, {rtype} from FailedList"
+        ))?;
+        Ok(SqlStatement {
+            stmt,
+            tok: AddFailedToMod,
+        })
+    }
 
     fn insert_dir_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into Node (name, dir, type) Values (?,?,?);")?;
@@ -601,6 +651,13 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: FindNode,
+        })
+    }
+    fn do_nothing_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT 1")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: DoNothing,
         })
     }
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement> {
@@ -697,6 +754,27 @@ impl LibSqlPrepare for Connection {
             tok: UpdDirId,
         })
     }
+    fn update_display_str_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set display_str = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdDisplayStr,
+        })
+    }
+    fn update_flags_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set flags = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdFlags,
+        })
+    }
+    fn update_srcid_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set srcid = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdSrcId,
+        })
+    }
     fn update_env_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("Update Node Set display_str = ? where id=?")?;
         Ok(SqlStatement { stmt, tok: UpdEnv })
@@ -726,6 +804,14 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: ImmediateDeps,
+        })
+    }
+
+    fn mark_rule_failed_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(" INSERT into FailedList (id) Values(?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FailedRule,
         })
     }
 
@@ -787,7 +873,7 @@ SELECT DISTINCT x FROM dependants));",
         let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type,\
          (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
          where  Node.id in \
-        (SELECT to_id from NormalLink where from_id  = ? and to_type={typ}"))?;
+        (SELECT to_id from NormalLink where from_id  = ? and to_type={typ})"))?;
         Ok(SqlStatement {
             stmt,
             tok: FetchOutputsForRule,
@@ -795,11 +881,12 @@ SELECT DISTINCT x FROM dependants));",
     }
 
     fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement> {
-        let typ = RowType::File as u8;
+        let file_type = RowType::File as u8;
+        let gen_file_type = RowType::GenF as u8;
         let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type, \
-        (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
-         where Node.type = {typ} and Node.id in \
-        (SELECT from_id from NormalLink where to_id  = ?"))?;
+        (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id) \
+          where (Node.type = {file_type} or Node.type = {gen_file_type}) and Node.id in \
+        (SELECT from_id from NormalLink where to_id  = ?)"))?;
         Ok(SqlStatement {
             stmt,
             tok: FetchInputsForRule,
@@ -842,6 +929,21 @@ impl LibSqlExec for SqlStatement<'_> {
         eyre::ensure!(
             self.tok == RemovePresents,
             "wrong token for removing presents"
+        );
+        self.stmt.execute([])?;
+        Ok(())
+    }
+
+    fn remove_failed_exec(&mut self) -> Result<()> {
+        eyre::ensure!(self.tok == RemoveFailed, "wrong token for removing failed");
+        self.stmt.execute([])?;
+        Ok(())
+    }
+
+    fn add_failed_to_modified_exec(&mut self) -> Result<()> {
+        eyre::ensure!(
+            self.tok == AddFailedToMod,
+            "wrong token for adding failed to modified"
         );
         self.stmt.execute([])?;
         Ok(())
@@ -950,14 +1052,14 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
         eyre::ensure!(self.tok == FindNodeId, "wrong token for fetch node");
-        log::debug!("query:{:?}, {:?}", node_name, dir);
+        debug!("query:{:?}, {:?}", node_name, dir);
         let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
         Ok(nodeid)
     }
 
     fn fetch_env_id(&mut self, env_name: &str) -> Result<(i64, String)> {
         eyre::ensure!(self.tok == FindEnvId, "wrong token for fetch env");
-        log::debug!("query env:{:?}", env_name);
+        debug!("query env:{:?}", env_name);
         let (nodeid, val) = self
             .stmt
             .query_row((env_name,), |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -1024,12 +1126,37 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(Path::new(path_str.as_str()).join(name))
     }
 
+    fn fetch_node_dir_path(&mut self, dirid: i64) -> Result<PathBuf> {
+        eyre::ensure!(self.tok == FindNodePath, "wrong token for fetch node path");
+        let path_str: String = self.stmt.query_row([dirid], |r| r.get(0))?;
+        Ok(PathBuf::from(path_str.as_str()))
+    }
+
     fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()> {
         eyre::ensure!(self.tok == UpdMTime, "wrong token for update mtime");
-        self.stmt.execute([id, mtime_ns])?;
+        self.stmt.execute([mtime_ns, id])?;
         Ok(())
     }
 
+    fn update_display_str(&mut self, id: i64, display_str: &str) -> Result<()> {
+        eyre::ensure!(
+            self.tok == UpdDisplayStr,
+            "wrong token for update display string"
+        );
+        self.stmt.execute((display_str, id))?;
+        Ok(())
+    }
+
+    fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()> {
+        eyre::ensure!(self.tok == UpdFlags, "wrong token for update flags");
+        self.stmt.execute((flags, id))?;
+        Ok(())
+    }
+    fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()> {
+        eyre::ensure!(self.tok == UpdSrcId, "wrong token for srcid update");
+        self.stmt.execute([srcid, id])?;
+        Ok(())
+    }
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()> {
         eyre::ensure!(self.tok == UpdDirId, "wrong token for dirid update");
         self.stmt.execute([dirid, id])?;
@@ -1051,6 +1178,14 @@ impl LibSqlExec for SqlStatement<'_> {
         eyre::ensure!(
             self.tok == ImmediateDeps,
             "wrong token for mark immediate rule as deleted"
+        );
+        self.stmt.execute([rule_id])?;
+        Ok(())
+    }
+    fn mark_rule_failed(&mut self, rule_id: i64) -> Result<()> {
+        eyre::ensure!(
+            self.tok == FailedRule,
+            "wrong token for mark immediate rule as failed"
         );
         self.stmt.execute([rule_id])?;
         Ok(())
@@ -1084,11 +1219,11 @@ impl LibSqlExec for SqlStatement<'_> {
             [name, dp.as_str()],
             |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error> {
                 let id: i64 = r.get(0)?;
-                let pid: i64 = r.get(1)?;
-                Ok((id, pid))
+                let dirid: i64 = r.get(1)?;
+                Ok((id, dirid))
             },
         )?;
-        Ok((id, pid))
+        Ok((id, dirid))
     }
 
     fn fetch_io(&mut self, proc_id: i32) -> Result<Vec<(String, u8)>> {
@@ -1171,7 +1306,65 @@ fn db_path_str<P: AsRef<Path>>(p: P) -> String {
         .to_string()
 }
 
-impl SqlStatement<'_> {}
+struct ConnWrapper<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ConnWrapper<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl<'a> tupparser::decode::GroupInputs for ConnWrapper<'a> {
+    fn get_group_paths(&self, group_name: &str, rule_id: i64, rule_dir: i64) -> Option<String>
+    where
+        Self: Sized,
+    {
+        let grptype = RowType::Grp as u8;
+        let ftype = RowType::File as u8;
+        let gftype = RowType::GenF as u8;
+        // first fetch all the input groups to the given rule
+        let group_name = if group_name.starts_with("<") {
+            group_name.to_string()
+        } else {
+            format!("<{}>", group_name)
+        };
+        let mut dir_path = self.conn.fetch_node_path_prepare().expect(&*format!(
+            "failed to prepare fetch node path statement for rule:{} in dir :{}",
+            rule_id, rule_dir
+        ));
+        let rule_dir = dir_path.fetch_node_dir_path(rule_dir).expect(&*format!(
+            "failed to fetch dir path for rule:{} in dir :{}",
+            rule_id, rule_dir
+        ));
+
+        let mut fetch_input_groups_of_rule = self.conn.prepare(&*format!("SELECT id, name from Node where type = {grptype} and id in (SELECT from_id from NormalLink where to_id = ?)")).unwrap();
+        let mut rows = fetch_input_groups_of_rule.query([rule_id]).unwrap();
+        let mut find_group_id = |group_name: &str| {
+            while let Some(row) = rows.next().unwrap() {
+                let id: i64 = row.get(0).unwrap();
+                let name: String = row.get(1).unwrap();
+                if name.as_str().eq(group_name) {
+                    return Some(id);
+                }
+            }
+            return None;
+        };
+        find_group_id(group_name.as_str()).and_then(|grp_id| {
+            let mut stmt = self.conn.prepare(&*format!("SELECT (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id) where (Node.type = {ftype} or Node.type = {gftype}) and Node.id in (SELECT from_id from NormalLink  where to_id = ?)")).expect("unable to prepare stmt to fetch group input paths");
+            let mut rows = stmt.query([grp_id]).expect("Unable to query for group input paths");
+            let mut path = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                let p: String = row.get(0).unwrap();
+                path.push_str(diff_paths(p.as_str(), rule_dir.as_path()).unwrap_or(PathBuf::from(p)).to_string_lossy().to_string().as_str());
+                path.push_str(" ");
+            }
+            path.pop();
+            Some(path)
+        })
+    }
+}
 
 impl ForEachClauses for Connection {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
@@ -1357,6 +1550,16 @@ impl ForEachClauses for Connection {
         Ok(())
     }
 
+    fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>> {
+        let mut inputs = Vec::new();
+
+        let rows = stmt.query_map([rule_id], |r| r.get(0))?;
+        for row in rows {
+            inputs.push(row?);
+        }
+        Ok(inputs)
+    }
+
     fn for_each_link<F>(&mut self, f: F) -> Result<()>
     where
         F: FnMut(i32, i32) -> Result<()>,
@@ -1372,27 +1575,43 @@ impl ForEachClauses for Connection {
         Ok(())
     }
 
-    fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>> {
-        let mut inputs = Vec::new();
-
-        let _ = stmt.query_map([rule_id], |r| -> rusqlite::Result<()> {
-            let id = r.get(0)?;
-            inputs.push(id);
-            Ok(())
-        })?;
-        Ok(inputs)
-    }
-
-    fn rules_to_run_no_target(&self) -> Result<Vec<Node>> {
+    fn rules_to_run_no_target(&self) -> Result<Vec<Node>, Report> {
         let rtype = RowType::Rule as u8;
-        let stmt = &*format!("SELECT id from ModifyList where type = {rtype}");
+        let stmt = &*format!("SELECT Node.id, Node.dir, Node.name, Node.display_str, Node.flags, Node.srcid  from Node inner join ModifyList on Node.id = ModifyList.id and Node.type = {rtype}");
         let mut stmt = self.prepare(stmt)?;
         let mut rules = Vec::new();
-        let _ = stmt.query_map([], |r| -> rusqlite::Result<()> {
-            let n = crate::make_rule_node(r)?;
-            rules.push(n);
-            Ok(())
-        })?;
+        let conn_wrapper = ConnWrapper::new(self);
+        let mut rule_nodes = stmt.query([])?;
+        while let Some(rule_node) = rule_nodes.next()? {
+            let mut node = crate::make_rule_node(rule_node);
+            if let Ok(ref mut node) = node {
+                let rule_id = node.id;
+                let rule_ref =
+                    RuleRef::new(&TupPathDescriptor::from(0), &Loc::new(node.srcid as _, 0));
+                let rule_string = &node.name;
+                let new_name = decode_group_captures(
+                    &conn_wrapper,
+                    &rule_ref,
+                    rule_id,
+                    node.dirid,
+                    rule_string,
+                )
+                .map_err(|e| {
+                    eyre::Error::msg(format!(
+                        "Error decoding group captures for rule:{}\n error:{}",
+                        rule_string, e
+                    ))
+                })?;
+                rules.push(Node::new_rule(
+                    node.id,
+                    node.dirid,
+                    new_name,
+                    node.display_str.clone(),
+                    node.flags.clone(),
+                    node.srcid as _,
+                ));
+            }
+        }
         Ok(rules)
     }
 
@@ -1449,9 +1668,8 @@ impl MiscStatements for Connection {
         Ok(())
     }
 
-    // if a directory is in the modify list, add all its children to the modify list
+    // mark rules as Modified if any of its outputs are in the deletelist
     fn enrich_modified_list_with_outside_mods(&self) -> Result<()> {
-        // mark rules as Modified if any of its outputs are in the deletelist
         let rtype = RowType::Rule as u8;
         let mut stmt = self.prepare(
             &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
@@ -1462,25 +1680,28 @@ impl MiscStatements for Connection {
     }
     fn enrich_modified_list(&self) -> Result<()> {
         // add parent dirs to modify list if children of that directory are already in it
-        let ftype = RowType::File as u8;
-        let gentype = RowType::GenF as u8;
-        let dtype = RowType::Dir as u8;
         let rtype = RowType::Rule as u8;
-        let gdtype = RowType::DirGen as u8;
         let grptype = RowType::Grp as u8;
         {
-            // add parent dirs to modify list if any child of that directory is in the delete list
-            let mut stmt = self.prepare(&*format!(
-                "Insert or IGNORE into ModifyList  SELECT dir, {dtype} from Node where id in \
-            (SELECT id from ModifyList where type = {ftype}  UNION \
-            SELECT id from DeleteList where type = {ftype} )"
-            ))?;
-            stmt.execute([])?;
+            // add parent dirs/glob to modify list if any child of that directory with matched glob pattern is in the delete list/modify list
 
+            let ftype = RowType::File as u8;
+            let gentype = RowType::GenF as u8;
+            let globtype = RowType::Glob as u8;
+            //stmt.execute([])?;
+
+            // mark glob patterns as modified if any of its inputs are in the deletelist or modified list
+            // note that glob patterns are mapped to Tupfiles in  NormalLink table
+            // which will then trigger a loading of these tupfiles
             let mut stmt = self.prepare(&*format!(
-                "Insert or IGNORE into ModifyList  SELECT dir, {gdtype} from Node where id in \
-            (SELECT id from ModifyList where type = {gentype}  UNION \
-            SELECT id from DeleteList where type = {gentype} )"
+                "INSERT or IGNORE into ModifyList  SELECT globPatterns.id, {globtype}
+FROM Node AS n
+JOIN Node AS globPatterns
+    ON n.dir = globPatterns.dir
+WHERE (n.type = {ftype} or n.type = {gentype})
+AND globPatterns.type = {globtype}
+AND n.name GLOB globPatterns.name
+AND n.id in (SELECT id from DeleteList UNION SELECT id from ModifyList)"
             ))?;
             stmt.execute([])?;
 
@@ -1491,11 +1712,32 @@ impl MiscStatements for Connection {
             )?;
             stmt.execute([])?;
 
-            // mark rules as Modified if any of its inputs are in the deletelist
+            // mark rules as Modified if any of its inputs are in the deletelist or ModifyList
             let mut stmt = self.prepare(
                 &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
             (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
             )?;
+            stmt.execute([])?;
+            // recursively mark all rules as modified if any of the parent rules are marked as modified
+            // this is the closure operation.
+            let mut stmt = self
+                .prepare(&*format!(
+                    "WITH RECURSIVE NodeChain(id, type) AS (
+  -- Step 1: Get the initial set of nodes (selected list of node ids) along with their types
+  SELECT id, type
+  FROM Node
+  WHERE id IN (SELECT id from ModifyList where type = {rtype})
+  UNION ALL
+  -- Step 2: Recursively select connected nodes along with their types
+  SELECT nl.to_id, nl.to_type
+  FROM NodeChain nc
+  JOIN NormalLink nl ON nc.id = nl.from_id
+)
+INSERT or IGNORE INTO ModifyList(id, type)
+SELECT DISTINCT id, type
+FROM NodeChain;"
+                ))
+                .unwrap();
             stmt.execute([])?;
         }
 

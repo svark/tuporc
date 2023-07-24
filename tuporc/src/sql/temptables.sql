@@ -15,4 +15,8 @@ Create Table IF NOT EXISTS DeleteList
     type INTEGER
 );
 
+Create Table IF NOT EXISTS FailedList
+(
+    id INTEGER PRIMARY KEY not NULL
+);
 

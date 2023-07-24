@@ -54,6 +54,7 @@ VALUES ('File', 0),
        ('TupF', 5),
        ('Grp', 6),
        ('DirGen', 7),
-       ('Excl', 8)
+       ('Excl', 8),
+       ('Glob', 9)
 
 
