@@ -42,8 +42,8 @@ use db::RowType::Dir;
 
 use crate::db::RowType::TupF;
 use crate::db::{
-    create_dyn_io_temp_tables, init_db, is_initialized, ForEachClauses, LibSqlExec, LibSqlPrepare,
-    MiscStatements, SqlStatement,
+    init_db, is_initialized, ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements,
+    SqlStatement,
 };
 use crate::parse::{exec_rules_to_run, find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
@@ -164,7 +164,7 @@ fn main() -> Result<()> {
                 parse_tupfiles_in_db(tupfiles, root.as_path())?;
                 let (dag, node_bimap) = parse::prepare_for_execution(&mut conn)?;
 
-                create_dyn_io_temp_tables(&conn)?;
+                //create_dyn_io_temp_tables(&conn)?;
                 // start tracking file io by subprocesses.
                 let rule_nodes = conn.rules_to_run_no_target()?;
                 if rule_nodes.is_empty() {

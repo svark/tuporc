@@ -1,0 +1,37 @@
+use tracefile::trace_read_recursive;
+use std::process::{Command, Stdio};
+use std::fs::Metadata;
+
+fn main() {
+    // Create a child process that runs "sh" command and executes a script named "script.sh" that spawns more children
+    let mut child = Command::new("sh")
+        .arg("script.sh")
+        .spawn()
+        .expect("Failed to spawn child process");
+
+    // Use trace_read_recursive to trace all the files that the child process and its descendants (including any spawned children) read or write to
+    trace_read_recursive(child.id(), |path, metadata| {
+        // Print the path and metadata of the file
+        println!("Path: {}", path.display());
+        println!("Metadata: {:?}", metadata);
+    }).expect("Failed to trace the child process");
+}
+--------------------
+use tracefile::trace_write_recursive;
+use std::process::{Command, Stdio};
+use std::fs::Metadata;
+
+fn main() {
+    // Create a child process that runs "sh" command and executes a script named "script.sh" that spawns more children
+    let mut child = Command::new("sh")
+        .arg("script.sh")
+        .spawn()
+        .expect("Failed to spawn child process");
+
+    // Use trace_write_recursive to trace all the files that the child process and its descendants (including any spawned children) write to
+    trace_write_recursive(child.id(), |path, metadata| {
+        // Print the path and metadata of the file
+        println!("Path: {}", path.display());
+        println!("Metadata: {:?}", metadata);
+    }).expect("Failed to trace the child process");
+}

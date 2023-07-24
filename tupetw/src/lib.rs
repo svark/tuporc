@@ -147,14 +147,13 @@ impl DynDepTracker {
                         if let Ok(parent_id) = parser.try_parse::<u32>("ParentId") {
                             if let Ok(processid) = parser.try_parse::<u32>("ProcessId") {
                                 let ppid = gen_proc(parent_id);
-                                if active_processtreeids.contains(&processid) {
+                                if active_processtreeids.insert(processid) {
                                     println!("Child process id: {}", processid);
-                                    active_processtreeids.insert(processid);
 
                                     let cur_id: i64 = gen_proc(processid);
                                     numchildren_and_self.insert(
                                         cur_id,
-                                        numchildren_and_self.get(&cur_id).unwrap_or(&1) + 1,
+                                        numchildren_and_self.get(&cur_id).unwrap_or(&0) + 1,
                                     );
                                     tx.send((processid, op)).unwrap();
                                     let mut parent_id: i64 = ppid;
@@ -166,7 +165,7 @@ impl DynDepTracker {
                                     parents.insert(cur_id, parent_id);
                                     numchildren_and_self.insert(
                                         parent_id,
-                                        numchildren_and_self.get(&parent_id).unwrap_or(&1) + 1,
+                                        numchildren_and_self.get(&parent_id).unwrap_or(&0) + 1,
                                     );
                                     txpar.send((cur_id, parent_id)).unwrap();
                                     ctx_process

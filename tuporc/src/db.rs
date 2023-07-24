@@ -808,7 +808,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn mark_rule_failed_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(" INSERT into FailedList (id) Values(?)")?;
+        let stmt = self.prepare(" INSERT or IGNORE into FailedList (id) Values(?)")?;
         Ok(SqlStatement {
             stmt,
             tok: FailedRule,

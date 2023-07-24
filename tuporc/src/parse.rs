@@ -3,6 +3,7 @@ use std::ops::Deref;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
+use std::thread::yield_now;
 
 use bimap::{BiHashMap, BiMap};
 use crossbeam::channel::Receiver;
@@ -15,6 +16,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 
+use tupetw::EventType::ProcessDeletion;
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::decode::{
     GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
@@ -28,7 +30,8 @@ use tupparser::{
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
-    create_path_buf_temptable, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
+    create_dyn_io_temp_tables, create_path_buf_temptable, ForEachClauses, LibSqlExec,
+    MiscStatements, SqlStatement,
 };
 use crate::{get_dir_id, LibSqlPrepare, Node, RowType, MAX_THRS_DIRS};
 
@@ -661,6 +664,7 @@ fn wait_for_children(
             }
         }
         children = tryagain;
+        yield_now();
         if !children.is_empty() {
             std::thread::sleep(std::time::Duration::from_nanos(100));
         }
@@ -678,11 +682,14 @@ fn listen_to_processes(
     child_id_receiver: &Receiver<(u32, (i64, String))>,
 ) -> Result<(), Report> {
     let mut io_conn = Connection::open_in_memory().expect("Failed to open in memory db");
+    create_dyn_io_temp_tables(&mut io_conn)?;
     let mut end_child_ids = false;
     let mut end_trace = false;
     let mut input_getter = conn.fetch_inputs_for_rule_prepare()?;
     let mut output_getter = conn.fetch_outputs_for_rule_prepare()?;
     let mut marke_failed_stmt = conn.mark_rule_failed_prepare()?;
+    let mut deleted_children = BTreeSet::new();
+    let mut to_verify = Vec::new();
     loop {
         let mut sel = crossbeam::channel::Select::new();
         let index_child_ids = if end_child_ids {
@@ -709,29 +716,7 @@ fn listen_to_processes(
                             tracker.stop();
                         })
                     {
-                        let mut fetch_io_stmt = io_conn.fetch_io_prepare()?;
-                        //dir_id_by_path.insert(p, id);
-                        if let Err(e) = verify_rule_io(
-                            child_id,
-                            rule_id as _,
-                            rule_name.as_str(),
-                            &mut input_getter,
-                            &mut output_getter,
-                            &mut fetch_io_stmt,
-                        ) {
-                            eprintln!("Error verifying rule io: {}", e.to_string());
-                            marke_failed_stmt
-                                .mark_rule_failed(rule_id as _)
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "Could not write failed rule {} with id :{} to db, \n {}",
-                                        rule_name,
-                                        rule_id,
-                                        e.to_string()
-                                    )
-                                });
-                            *poisoned.write() = 2;
-                        }
+                        to_verify.push((child_id, rule_id, rule_name));
                     }
                 }
                 i if i == index_trace => {
@@ -741,11 +726,14 @@ fn listen_to_processes(
                     }) {
                         //dir_children_set.insert(p);
                         let file_path = evt_header.get_file_path();
+                        let process_id = evt_header.get_process_id();
+                        let process_gen = evt_header.get_process_gen();
+                        let event_type = evt_header.get_event_type();
+                        let child_cnt = evt_header.get_child_cnt() as i32;
+                        if event_type == ProcessDeletion as _ && child_cnt == 0 {
+                            deleted_children.insert(process_id);
+                        }
                         if let Some(rel_path) = pathdiff::diff_paths(Path::new(file_path), root) {
-                            let process_id = evt_header.get_process_id();
-                            let process_gen = evt_header.get_process_gen();
-                            let event_type = evt_header.get_event_type();
-                            let child_cnt = evt_header.get_child_cnt() as i32;
                             io_conn
                                 .insert_trace(
                                     rel_path.as_path(),
@@ -767,12 +755,49 @@ fn listen_to_processes(
                 break;
             }
         }
+        if !to_verify.is_empty() {
+            let mut fetch_io_stmt = io_conn
+                .fetch_io_prepare()
+                .expect("Failed to prepare fetch io statement");
+
+            let mut reverify = Vec::new();
+            for (child_id, rule_id, rule_name) in to_verify.drain(..) {
+                if !deleted_children.contains(&child_id) {
+                    reverify.push((child_id, rule_id, rule_name));
+                    continue;
+                }
+                //dir_id_by_path.insert(p, id);
+                if let Err(e) = verify_rule_io(
+                    child_id,
+                    rule_id as _,
+                    rule_name.as_str(),
+                    &mut input_getter,
+                    &mut output_getter,
+                    &mut fetch_io_stmt,
+                ) {
+                    eprintln!("Error verifying rule io: {}", e.to_string());
+                    marke_failed_stmt
+                        .mark_rule_failed(rule_id as _)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Could not write failed rule {} with id :{} to db, \n {}",
+                                rule_name,
+                                rule_id,
+                                e.to_string()
+                            )
+                        });
+                    *poisoned.write() = 2;
+                }
+            }
+            to_verify = reverify;
+        }
         if !keep_going && *poisoned.read() != 0 {
             break;
         }
         if end_child_ids || end_trace {
             break;
         }
+        yield_now();
     }
     Ok(())
 }
