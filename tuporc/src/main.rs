@@ -97,13 +97,13 @@ fn make_tup_node(row: &Row) -> rusqlite::Result<Node> {
 
 fn make_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;
-    let pid: i64 = row.get(1)?;
+    let dirid: i64 = row.get(1)?;
     let rtype: u8 = row.get(2)?;
     let name: String = row.get(3)?;
     let mtime: i64 = row.get(4)?;
     let rtype = RowType::try_from(rtype)
         .unwrap_or_else(|_| panic!("Invalid row type {} for node {}", rtype, name));
-    Ok(Node::new(id, pid, mtime, name, rtype))
+    Ok(Node::new(id, dirid, mtime, name, rtype))
 }
 
 fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {

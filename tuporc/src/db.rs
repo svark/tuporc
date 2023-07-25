@@ -871,7 +871,7 @@ SELECT DISTINCT x FROM dependants));",
     fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement> {
         let typ = RowType::GenF as u8;
         let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type,\
-         (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
+         (DirPathBuf.name || '/' || Node.name) name, Node.mtime_ns mtime_ns from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id)\
          where  Node.id in \
         (SELECT to_id from NormalLink where from_id  = ? and to_type={typ})"))?;
         Ok(SqlStatement {
@@ -884,7 +884,7 @@ SELECT DISTINCT x FROM dependants));",
         let file_type = RowType::File as u8;
         let gen_file_type = RowType::GenF as u8;
         let stmt = self.prepare(&format!("SELECT Node.id id, Node.dir dir, Node.type type, \
-        (DirPathBuf.name || '/' || Node.name) name from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id) \
+        (DirPathBuf.name || '/' || Node.name) name, Node.mtime_ns mtime_ns from NODE inner join DirPathBuf on (Node.dir = DirPathBuf.id) \
           where (Node.type = {file_type} or Node.type = {gen_file_type}) and Node.id in \
         (SELECT from_id from NormalLink where to_id  = ?)"))?;
         Ok(SqlStatement {

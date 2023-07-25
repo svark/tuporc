@@ -31,11 +31,11 @@ impl From<trace::TraceError> for TraceError {
 
 #[derive(Clone, Debug)]
 pub enum EventType {
-    Open,
-    Read,
-    Write,
-    ProcessCreation,
-    ProcessDeletion,
+    Open = 0,
+    Read = 1,
+    Write = 2,
+    ProcessCreation = 3,
+    ProcessDeletion = 4,
 }
 
 #[derive(Clone, Debug)]
@@ -69,8 +69,8 @@ impl EventHeader {
     pub fn get_process_gen(&self) -> u32 {
         ((self.process_id << 0x20) >> 0x20) as u32
     }
-    pub fn get_parent_process_id(&self) -> i64 {
-        self.parent_process_id
+    pub fn get_parent_process_id(&self) -> u32 {
+        (self.parent_process_id >> 0x20) as _
     }
     pub fn get_event_type(&self) -> i8 {
         let evt = self.event_type.clone();
@@ -121,11 +121,11 @@ impl DynDepTracker {
         log::info!("Tracing process id: {}", root_process_id);
         //let mut immediate_parent = std::collections::HashMap::new();
         let ctx_process = tracer.clone();
+        let mut proc_generation = std::collections::HashMap::new();
+        let mut parents = std::collections::HashMap::new();
+        let mut numchildren_and_self = std::collections::HashMap::new();
         let provider_process = provider_builder
             .add_callback(move |event, schema_locator| {
-                let mut proc_generation = std::collections::HashMap::new();
-                let mut parents = std::collections::HashMap::new();
-                let mut numchildren_and_self = std::collections::HashMap::new();
                 let op = event.opcode();
                 let generation = |id| {
                     if let Some(gen) = proc_generation.get(&id) {
@@ -141,42 +141,43 @@ impl DynDepTracker {
                 };
                 if op == PROC_CREATION_OPCODE {
                     // process creation
-                    //println!("Event id: {}, op:{}, procid:{}", id, event.opcode(), event.process_id());
                     if let Ok(sch) = schema_locator.event_schema(event) {
                         let parser = Parser::create(event, &sch);
                         if let Ok(parent_id) = parser.try_parse::<u32>("ParentId") {
                             if let Ok(processid) = parser.try_parse::<u32>("ProcessId") {
                                 let ppid = gen_proc(parent_id);
-                                if active_processtreeids.insert(processid) {
-                                    println!("Child process id: {}", processid);
+                                if parent_id == root_process_id || parents.contains_key(&ppid) {
+                                    if active_processtreeids.insert(processid) {
+                                        println!("Child process id: {}", processid);
 
-                                    let cur_id: i64 = gen_proc(processid);
-                                    numchildren_and_self.insert(
-                                        cur_id,
-                                        numchildren_and_self.get(&cur_id).unwrap_or(&0) + 1,
-                                    );
-                                    tx.send((processid, op)).unwrap();
-                                    let mut parent_id: i64 = ppid;
-                                    //immediate_parent.insert(cur_id, parent_id);
-                                    if let Some(&p) = parents.get(&ppid) {
-                                        // only keep the parent which is the closest to the root or root itself
-                                        parent_id = p;
-                                    }
-                                    parents.insert(cur_id, parent_id);
-                                    numchildren_and_self.insert(
-                                        parent_id,
-                                        numchildren_and_self.get(&parent_id).unwrap_or(&0) + 1,
-                                    );
-                                    txpar.send((cur_id, parent_id)).unwrap();
-                                    ctx_process
-                                        .send(EventHeader::new(
+                                        let cur_id: i64 = gen_proc(processid);
+                                        numchildren_and_self.insert(
                                             cur_id,
+                                            numchildren_and_self.get(&cur_id).unwrap_or(&0) + 1,
+                                        );
+                                        tx.send((processid, op)).unwrap();
+                                        // only keep the parent which is the closest to the root or root itself
+                                        let parent_id = if let Some(&p) = parents.get(&ppid) {
+                                            p
+                                        } else {
+                                            cur_id
+                                        };
+                                        parents.insert(cur_id, parent_id);
+                                        numchildren_and_self.insert(
                                             parent_id,
-                                            EventType::ProcessCreation,
-                                            "".to_string(),
-                                            0,
-                                        ))
-                                        .unwrap();
+                                            numchildren_and_self.get(&parent_id).unwrap_or(&0) + 1,
+                                        );
+                                        txpar.send((cur_id, parent_id)).unwrap();
+                                        ctx_process
+                                            .send(EventHeader::new(
+                                                cur_id,
+                                                parent_id,
+                                                EventType::ProcessCreation,
+                                                "".to_string(),
+                                                0,
+                                            ))
+                                            .unwrap();
+                                    }
                                 }
                             }
                         }
@@ -187,6 +188,7 @@ impl DynDepTracker {
                         let parser = Parser::create(event, &sch);
                         if let Ok(processid) = parser.try_parse::<u32>("ProcessId") {
                             if active_processtreeids.remove(&processid) {
+                                println!("Process id: {} deleted", processid);
                                 let pid = gen_proc(processid);
                                 let g = proc_generation.entry(processid).or_insert(0);
                                 tx.send((processid, op)).unwrap();
@@ -209,8 +211,9 @@ impl DynDepTracker {
                                             child_count,
                                         ))
                                         .unwrap();
+                                } else {
+                                    println!("Process id: {} deleted but has no parent", processid);
                                 }
-                                println!("Process id: {} deleted", processid);
                             }
                         }
                     }
@@ -220,11 +223,11 @@ impl DynDepTracker {
 
         let provider_builder = Provider::kernel(kernel_provider_file_io);
         let ctx_io = tracer.clone();
+        let mut parent_ids = std::collections::HashMap::new();
+        let mut proc_generations = std::collections::HashMap::new();
+        let mut fileobject_to_file_path = std::collections::HashMap::new();
         let provider_disc_io = provider_builder
             .add_callback(move |event, schema_locator| {
-                let mut parent_ids = std::collections::HashMap::new();
-                let mut proc_generations = std::collections::HashMap::new();
-                let mut fileobject_to_file_path = std::collections::HashMap::new();
                 if let Some((id, op)) = rx.try_recv().ok() {
                     if op == PROC_CREATION_OPCODE {
                         processtreeids_disc_io.insert(id);
@@ -261,7 +264,6 @@ impl DynDepTracker {
                     if let Ok(sch) = schema_locator.event_schema(event) {
                         let parser = Parser::create(event, &sch);
                         let opname = sch.opcode_name();
-                        debug!("Opcode: {} code:{}", opname, event.opcode());
                         if event.opcode() == 64 {
                             if let Ok(open_path) = parser.try_parse::<String>("OpenPath") {
                                 let open_path_buf = if open_path
@@ -273,15 +275,13 @@ impl DynDepTracker {
                                 };
                                 let open_path =
                                     canonicalize(open_path_buf).unwrap_or(PathBuf::from(open_path));
-                                print!("Open path: {:?}: ", &open_path);
-                                print!(
-                                    "CreateOptions:{}",
-                                    parser.try_parse::<u32>("CreateOptions").unwrap()
-                                );
-                                let fo = parser.try_parse::<u64>("FileObject").unwrap_or(0);
-                                println!(" fileobj:{}", fo);
-                                let pid = gen_proc(event.process_id());
-                                if event.process_id() != root_process_id {
+                                // print!("Open path: {:?}: ", &open_path);
+                                if open_path.is_file() {
+                                    //debug!("Opcode: {} code:{}", opname, event.opcode());
+                                    //print!("CreateOptions:{}", parser.try_parse::<u32>("CreateOptions").unwrap());
+                                    let fo = parser.try_parse::<u64>("FileObject").unwrap_or(0);
+                                    //println!(" fileobj:{}", fo);
+                                    let pid = gen_proc(event.process_id());
                                     ctx_io
                                         .send(EventHeader {
                                             process_id: pid,
@@ -295,13 +295,14 @@ impl DynDepTracker {
                                 }
                             }
                         } else if event.opcode() == 65 {
+                            /*debug!("Opcode: {} code:{}", opname, event.opcode());
                             if let Ok(ofile) = parser.try_parse::<String>("FileKey") {
-                                debug!("filekey 65: {}: ", ofile);
-                                //println!("CreateOptions:{}", parser.try_parse::<u32>("CreateOptions").unwrap());
-                            }
+                                println!("CreateOptions:{}", parser.try_parse::<u32>("CreateOptions").unwrap());
+                            } */
                         } else if event.opcode() == 68 {
                             // for write
                             if let Ok(open_path_fo) = parser.try_parse::<u64>("FileObject") {
+                                debug!("Write Opcode: {} code:{}", opname, event.opcode());
                                 debug!("Open path file object: {}: ", open_path_fo);
 
                                 let pid = gen_proc(event.process_id());
@@ -309,7 +310,7 @@ impl DynDepTracker {
                                     .get(&open_path_fo)
                                     .unwrap_or(&PathBuf::new())
                                     .clone();
-                                if event.process_id() != root_process_id {
+                                if file_path.is_file() {
                                     ctx_io
                                         .send(EventHeader {
                                             process_id: pid,

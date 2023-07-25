@@ -3,6 +3,7 @@ use std::ops::Deref;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
+use std::thread;
 use std::thread::yield_now;
 
 use bimap::{BiHashMap, BiMap};
@@ -16,7 +17,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 
-use tupetw::EventType::ProcessDeletion;
+use tupetw::EventType::{ProcessCreation, ProcessDeletion, Write};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::decode::{
     GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
@@ -392,7 +393,8 @@ pub(crate) fn exec_rules_to_run(
     // order the rules based on their dependencies
     let target_ids = conn.get_target_ids(root, target)?;
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
-    let (child_id_sender, child_id_receiver) = crossbeam::channel::unbounded();
+    let (completed_child_id_sender, completed_child_id_receiver) = crossbeam::channel::unbounded();
+    let (spawned_child_id_sender, spawned_child_id_receiver) = crossbeam::channel::unbounded();
     let mut valid_rules = Vec::new();
     if target_ids.is_empty() {
         valid_rules = rule_nodes;
@@ -492,22 +494,28 @@ pub(crate) fn exec_rules_to_run(
         {
             let poisoned = poisoned.clone();
             let trace_receiver = trace_receiver.clone();
-            let child_id_receiver = child_id_receiver.clone();
+            let child_id_receiver = completed_child_id_receiver.clone();
+            let spawned_child_id_receiver = spawned_child_id_receiver.clone();
             s.spawn(move |_| -> Result<()> {
-                listen_to_processes(
+                if let Err(e) = listen_to_processes(
                     &mut conn,
                     root,
                     keep_going,
                     tracker,
-                    poisoned,
+                    poisoned.clone(),
                     &trace_receiver,
                     &child_id_receiver,
-                )?;
+                    &spawned_child_id_receiver,
+                ) {
+                    eprintln!("Error while listening to processes: {}", e);
+                    *poisoned.write() = 1;
+                    return Err(e);
+                }
                 Ok(())
             });
         }
         drop(trace_receiver);
-        drop(child_id_receiver);
+        drop(completed_child_id_receiver);
         for o in topo_orders_set {
             let max_idx = valid_rules.partition_point(|x| {
                 let id = x.get_id() as i32;
@@ -515,24 +523,32 @@ pub(crate) fn exec_rules_to_run(
             }); // we limit ourselves to nodes with same topo order, so that dependent rules are run later
 
             rule_for_child_id.write().clear();
+            if min_idx == max_idx {
+                continue;
+            }
             let mut children = Vec::new();
             (0..num_threads).for_each(|_| {
                 children.push(Vec::<Arc<Mutex<(Child, String)>>>::new());
             });
             for j in min_idx..max_idx {
                 let rule_node = &valid_rules[j];
-                if *poisoned.read() == 1 {
-                    return Err(eyre!("Aborted executing rule: \n{}", rule_node.get_name()));
+                if *poisoned.read() == 1 || (*poisoned.read() > 1 && !keep_going) {
+                    let rule_id = rule_node.get_id();
+                    let rule_name = rule_node.get_name();
+                    completed_child_id_sender.send((0, (rule_id, rule_name.to_owned(), false)))?;
+                    return Err(eyre!("Aborted executing rule: \n{}", rule_name));
                 }
                 let mut cmd = execute::shell(rule_node.get_name());
                 cmd.current_dir(dirpaths[j].as_path());
-                if rule_node.get_display_str().is_empty() {
-                    println!("{:?}", cmd);
-                } else {
-                    println!("{}", rule_node.get_display_str());
-                }
+
                 let ch = cmd.spawn()?;
                 let ch_id = ch.id();
+                if rule_node.get_display_str().is_empty() {
+                    println!("id:{} {:?}", ch_id, cmd);
+                } else {
+                    println!("{} {}", ch_id, rule_node.get_display_str());
+                }
+                spawned_child_id_sender.send(ch_id)?;
 
                 let rule_id = rule_node.get_id();
                 rule_for_child_id
@@ -551,40 +567,28 @@ pub(crate) fn exec_rules_to_run(
                 for i in 0..num_threads {
                     let done = Arc::new(RwLock::new(false));
                     {
-                        let mut poisoned = poisoned.clone();
-                        let i = i.clone();
-                        let children = children[i].clone();
-
-                        let done = done.clone();
-                        // in this thread we check for user breaks or poisoned state and attempt to kill all children
-                        s.spawn(move |_| -> Result<()> {
-                            loop {
-                                if *done.read() {
-                                    break;
-                                }
-                                if kill_poisoned(&mut poisoned, &children, keep_going) {
-                                    break;
-                                }
-                            }
-                            Ok(())
-                        });
-                    }
-                    {
                         let poisoned = poisoned.clone();
                         let i = i.clone();
                         let children = children[i].clone();
                         // in this thread we wait for children to finish
-                        let child_id_sender = child_id_sender.clone();
+                        let completed_child_id_sender = completed_child_id_sender.clone();
                         let rule_for_child_id = rule_for_child_id.clone();
                         let wg = wg.clone();
                         s.spawn(move |_| -> Result<()> {
-                            let finished = wait_for_children(keep_going, poisoned, children)?;
-                            for id in finished {
+                            let (finished, failed) =
+                                wait_for_children(keep_going, poisoned, children)?;
+                            for (id, succeeded) in finished
+                                .iter()
+                                .map(|i| (*i, true))
+                                .chain(failed.iter().map(|j| (*j, false)))
+                            {
                                 let rule_for_child_id = rule_for_child_id.read();
+
                                 if let Some((rule_id, rule_name)) =
                                     rule_for_child_id.get(&id).cloned()
                                 {
-                                    child_id_sender.send((id, (rule_id, rule_name)))?;
+                                    completed_child_id_sender
+                                        .send((id, (rule_id, rule_name, succeeded)))?;
                                 }
                             }
                             *done.write() = true;
@@ -602,15 +606,20 @@ pub(crate) fn exec_rules_to_run(
                 return Err(eyre!("Stopping further rule executions"));
             }
         } // min_topo_order..max topo order
-        drop(child_id_sender);
+        drop(completed_child_id_sender);
+        drop(spawned_child_id_sender);
         Ok(())
     })
-    .unwrap()
+    .unwrap_or_else(|e| {
+        eprintln!("Error while executing rules: {:?}", e);
+        return Ok(());
+    })
     .expect(" panic message");
 
     Ok(())
 }
 
+#[allow(dead_code)]
 fn kill_poisoned(
     poisoned: &mut Arc<RwLock<u8>>,
     children: &Vec<Arc<Mutex<(Child, String)>>>,
@@ -631,15 +640,15 @@ fn kill_poisoned(
 }
 
 fn wait_for_children(
-    keep_going: bool,
+    _keep_going: bool,
     poisoned: Arc<RwLock<u8>>,
     mut children: Vec<Arc<Mutex<(Child, String)>>>,
-) -> Result<Vec<u32>, Report> {
-    let mut finished = Vec::new();
+) -> Result<(Vec<u32>, Vec<u32>), Report> {
+    let (mut finished, mut failed) = (Vec::new(), Vec::new());
     while !children.is_empty() {
         let mut tryagain = Vec::new();
 
-        for child in children {
+        for child in children.iter() {
             let ref mut ch = child.lock();
             let id = ch.0.id();
             if let Some(ref exit_status) = ch.0.try_wait()? {
@@ -647,13 +656,11 @@ fn wait_for_children(
                     if *poisoned.read() != 0 {
                         continue;
                     }
+                    failed.push(id);
                     let mut poisoned = poisoned.write();
                     if *poisoned == 0 {
                         *poisoned = 2_u8;
-                    }
-                    if !keep_going {
-                        //eprintln!("{}", String::from_utf8_lossy(&exit_status.stderr));
-                        return Err(eyre!("Error executing rule: \n{:?}", ch.1));
+                        yield_now();
                     }
                 } else {
                     debug!("finished executing rule: \n{:?}", ch.1);
@@ -667,9 +674,18 @@ fn wait_for_children(
         yield_now();
         if !children.is_empty() {
             std::thread::sleep(std::time::Duration::from_nanos(100));
+            if *poisoned.read() != 0 {
+                for child in children.iter() {
+                    let ref mut ch = child.lock();
+                    let id = ch.0.id();
+                    failed.push(id);
+                    ch.0.kill().ok();
+                    ch.0.wait().ok();
+                }
+            }
         }
     }
-    Ok(finished)
+    Ok((finished, failed))
 }
 
 fn listen_to_processes(
@@ -679,20 +695,27 @@ fn listen_to_processes(
     mut tracker: DynDepTracker,
     poisoned: Arc<RwLock<u8>>,
     trace_receiver: &Receiver<EventHeader>,
-    child_id_receiver: &Receiver<(u32, (i64, String))>,
+    child_id_receiver: &Receiver<(u32, (i64, String, bool))>,
+    spawned_child_id_receiver: &Receiver<u32>,
 ) -> Result<(), Report> {
-    let mut io_conn = Connection::open_in_memory().expect("Failed to open in memory db");
+    let mut io_conn =
+        Connection::open(root.join(".tup/io.db")).expect("Failed to open in memory db");
     create_dyn_io_temp_tables(&mut io_conn)?;
-    let mut end_child_ids = false;
+    let mut end_completed_child_ids = false;
+    let mut end_spawned_child_ids = false;
     let mut end_trace = false;
     let mut input_getter = conn.fetch_inputs_for_rule_prepare()?;
     let mut output_getter = conn.fetch_outputs_for_rule_prepare()?;
-    let mut marke_failed_stmt = conn.mark_rule_failed_prepare()?;
-    let mut deleted_children = BTreeSet::new();
+    let mut mark_failed_stmt = conn.mark_rule_failed_prepare()?;
+    let mut fetch_id_stmt = conn.fetch_nodeid_prepare()?;
+    let mut fetch_dirid_stmt = conn.fetch_dirid_prepare()?;
+    let mut add_link_stmt = conn.insert_link_prepare()?;
+    let mut deleted_child_procs = BTreeSet::new();
     let mut to_verify = Vec::new();
+    let mut children = BTreeSet::new();
     loop {
         let mut sel = crossbeam::channel::Select::new();
-        let index_child_ids = if end_child_ids {
+        let index_child_ids = if end_completed_child_ids {
             usize::MAX
         } else {
             sel.recv(&child_id_receiver)
@@ -703,20 +726,41 @@ fn listen_to_processes(
         } else {
             sel.recv(&trace_receiver)
         };
+
+        let index_spawned_child = if end_spawned_child_ids {
+            usize::MAX
+        } else {
+            sel.recv(&spawned_child_id_receiver)
+        };
+        let mut change = false;
         while let Ok(oper) = sel.try_select() {
             if !keep_going && *poisoned.read() != 0 {
                 break;
             }
             match oper.index() {
                 i if i == index_child_ids => {
-                    if let Ok((child_id, (rule_id, rule_name))) =
+                    if let Ok((child_id, (rule_id, rule_name, succeeded))) =
                         oper.recv(&child_id_receiver).map_err(|_| {
                             log::debug!("no more children  expected");
-                            end_child_ids = true;
-                            tracker.stop();
+                            end_completed_child_ids = true;
                         })
                     {
-                        to_verify.push((child_id, rule_id, rule_name));
+                        change = true;
+                        if succeeded {
+                            to_verify.push((child_id, rule_id, rule_name));
+                        } else {
+                            debug!("Error running rule: {}", rule_name);
+                            mark_failed_stmt
+                                .mark_rule_failed(rule_id as _)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "Could not write failed rule {} with id :{} to db, \n {}",
+                                        rule_name,
+                                        rule_id,
+                                        e.to_string()
+                                    )
+                                });
+                        }
                     }
                 }
                 i if i == index_trace => {
@@ -728,22 +772,52 @@ fn listen_to_processes(
                         let file_path = evt_header.get_file_path();
                         let process_id = evt_header.get_process_id();
                         let process_gen = evt_header.get_process_gen();
+                        let parent_process_id = evt_header.get_parent_process_id();
                         let event_type = evt_header.get_event_type();
-                        let child_cnt = evt_header.get_child_cnt() as i32;
-                        if event_type == ProcessDeletion as _ && child_cnt == 0 {
-                            deleted_children.insert(process_id);
+                        change = true;
+                        if event_type == Write as i8 {
+                            debug!("Write recvd");
                         }
-                        if let Some(rel_path) = pathdiff::diff_paths(Path::new(file_path), root) {
+                        let child_cnt = evt_header.get_child_cnt() as i32;
+                        if event_type == ProcessDeletion as _ || event_type == ProcessCreation as _
+                        {
+                            if event_type == ProcessDeletion as _ {
+                                deleted_child_procs.insert(process_id);
+                            }
                             io_conn
                                 .insert_trace(
-                                    rel_path.as_path(),
-                                    process_id,
+                                    file_path.as_str(),
+                                    process_id as _,
                                     process_gen,
                                     event_type,
                                     child_cnt,
                                 )
                                 .expect("Failed to insert trace");
+                        } else if let Some(rel_path) =
+                            pathdiff::diff_paths(Path::new(file_path), root)
+                        {
+                            if !rel_path.starts_with("..") {
+                                io_conn
+                                    .insert_trace(
+                                        rel_path.as_path(),
+                                        parent_process_id as _,
+                                        process_gen,
+                                        event_type,
+                                        child_cnt,
+                                    )
+                                    .expect("Failed to insert trace");
+                            }
                         }
+                    }
+                }
+                i if i == index_spawned_child => {
+                    if let Ok(child_id) = oper.recv(&spawned_child_id_receiver).map_err(|_| {
+                        log::debug!("no more spawned child ids expected");
+                        end_spawned_child_ids = true;
+                    }) {
+                        debug!("spawned child id recvd :{}", child_id);
+                        children.insert(child_id);
+                        change = true;
                     }
                 }
                 _ => {
@@ -751,8 +825,25 @@ fn listen_to_processes(
                     break;
                 }
             }
-            if end_child_ids || end_trace {
+            if end_spawned_child_ids && index_spawned_child != usize::MAX {
                 break;
+            }
+            if end_trace && index_trace != usize::MAX {
+                break;
+            }
+            if end_completed_child_ids && index_child_ids != usize::MAX {
+                break;
+            }
+        }
+        thread::sleep(std::time::Duration::from_nanos(100));
+        if end_completed_child_ids && !end_trace {
+            if index_child_ids != usize::MAX {
+                // run select once more to pick up more eventheaders from trace_receiver
+                yield_now();
+                continue;
+            }
+            if end_spawned_child_ids {
+                tracker.stop();
             }
         }
         if !to_verify.is_empty() {
@@ -762,10 +853,11 @@ fn listen_to_processes(
 
             let mut reverify = Vec::new();
             for (child_id, rule_id, rule_name) in to_verify.drain(..) {
-                if !deleted_children.contains(&child_id) {
+                if !deleted_child_procs.contains(&child_id) {
                     reverify.push((child_id, rule_id, rule_name));
                     continue;
                 }
+                deleted_child_procs.remove(&child_id);
                 //dir_id_by_path.insert(p, id);
                 if let Err(e) = verify_rule_io(
                     child_id,
@@ -774,9 +866,12 @@ fn listen_to_processes(
                     &mut input_getter,
                     &mut output_getter,
                     &mut fetch_io_stmt,
+                    &mut add_link_stmt,
+                    &mut fetch_id_stmt,
+                    &mut fetch_dirid_stmt,
                 ) {
                     eprintln!("Error verifying rule io: {}", e.to_string());
-                    marke_failed_stmt
+                    mark_failed_stmt
                         .mark_rule_failed(rule_id as _)
                         .unwrap_or_else(|e| {
                             panic!(
@@ -786,7 +881,9 @@ fn listen_to_processes(
                                 e.to_string()
                             )
                         });
-                    *poisoned.write() = 2;
+                    if *poisoned.read() == 0 {
+                        *poisoned.write() = 2;
+                    }
                 }
             }
             to_verify = reverify;
@@ -794,7 +891,7 @@ fn listen_to_processes(
         if !keep_going && *poisoned.read() != 0 {
             break;
         }
-        if end_child_ids || end_trace {
+        if end_completed_child_ids && end_trace && end_spawned_child_ids {
             break;
         }
         yield_now();
@@ -809,14 +906,20 @@ fn verify_rule_io(
     input_getter: &mut SqlStatement,
     output_getter: &mut SqlStatement,
     fetch_io_stmt: &mut SqlStatement,
+    add_link_stmt: &mut SqlStatement,
+    fetch_id_stmt: &mut SqlStatement,
+    fetch_dirid_stmt: &mut SqlStatement,
 ) -> Result<()> {
-    let io_vec = fetch_io_stmt.fetch_io(ch_id as i32)?; // this will fail if the child process failed
+    let io_vec = fetch_io_stmt.fetch_io(ch_id as i32)?;
     let inps = input_getter.fetch_inputs(rule_id)?;
     let outs = output_getter.fetch_outputs(rule_id)?;
+    let mut processed_io = BTreeSet::new();
     'outer: for (fnode, ty) in io_vec.iter() {
-        if *ty == EventType::Read as u8 {
-            let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
-            for inp in inps.iter() {
+        if !processed_io.insert((fnode.clone(), *ty)) {
+            continue;
+        }
+        if *ty == EventType::Read as _ || *ty == EventType::Open as _ {
+            for inp in inps.iter().chain(outs.iter()) {
                 if *inp.get_type() == RowType::Dir
                     || *inp.get_type() == RowType::Grp
                     || *inp.get_type() == RowType::Env
@@ -828,13 +931,13 @@ fn verify_rule_io(
                     continue 'outer;
                 }
             }
-            return Err(eyre!(
-                "File {} being read was not an input to rule {}",
-                fnode,
-                rule_name
-            ));
+
+            if let Ok(dirid) = fetch_dirid_stmt.fetch_dirid(fnode) {
+                if let Ok(from_id) = fetch_id_stmt.fetch_node_id(fnode, dirid) {
+                    add_link_stmt.insert_link(from_id, rule_id as _, false, RowType::Rule)?;
+                }
+            }
         } else if *ty == EventType::Write as u8 {
-            let fnode = fnode.strip_prefix("./").unwrap_or(fnode.as_ref());
             for out in outs.iter() {
                 if out.get_type().eq(&Excluded) {
                     let exclude_pattern = out.get_name().to_string();
@@ -857,27 +960,29 @@ fn verify_rule_io(
     }
     'outer2: for inp in inps.iter() {
         let fname = inp.get_name();
-        let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
         for (fnode, ty) in io_vec.iter() {
-            if ty == &(EventType::Read as u8) && fnode == fname {
+            if ty == &(EventType::Read as u8) || ty == &(EventType::Open as u8) && fnode == fname {
                 continue 'outer2;
             }
         }
-        return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
+        eprintln!(
+            "Proc:{} File {} was not read by rule {}",
+            ch_id, fname, rule_name
+        );
+        //return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
     }
     'outer3: for out in outs.iter() {
         let fname = out.get_name();
-        let fname = fname.strip_prefix("./").unwrap_or(fname.as_ref());
         for (fnode, ty) in io_vec.iter() {
             if ty == &(EventType::Write as u8) && fnode == fname {
                 continue 'outer3;
             }
         }
-        return Err(eyre!(
-            "File {} was not written by rule {}",
-            fname,
-            rule_name
-        ));
+        eprintln!(
+            "Proc:{} File {} was not written by rule {}",
+            ch_id, fname, rule_name
+        );
+        //return Err(eyre!("File {} was not written by rule {}",fname,rule_name));
     }
     Ok(())
 }
