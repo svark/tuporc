@@ -3,7 +3,7 @@ extern crate clap;
 extern crate crossbeam;
 extern crate ctrlc;
 extern crate env_logger;
-extern crate execute;
+extern crate execute as ex;
 extern crate eyre;
 extern crate incremental_topo;
 extern crate num_cpus;
@@ -41,13 +41,11 @@ use db::{Node, RowType};
 use db::RowType::Dir;
 
 use crate::db::RowType::TupF;
-use crate::db::{
-    init_db, is_initialized, ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements,
-    SqlStatement,
-};
-use crate::parse::{exec_rules_to_run, find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
+use crate::db::{init_db, is_initialized, LibSqlExec, LibSqlPrepare, MiscStatements, SqlStatement};
+use crate::parse::{find_upsert_node, gather_tupfiles, parse_tupfiles_in_db};
 
 mod db;
+mod execute;
 mod parse;
 
 const MAX_THRS_NODES: u8 = 4;
@@ -153,33 +151,19 @@ fn main() -> Result<()> {
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 let tupfiles = scan_and_get_tupfiles(&root, &mut connection)?;
-                parse_tupfiles_in_db(tupfiles, root.as_path())?;
+                parse_tupfiles_in_db(connection, tupfiles, root.as_path())?;
             }
             Action::Upd { target, keep_going } => {
                 println!("Updating db {}", target.join(" "));
                 let root = current_dir()?;
-                let mut conn = Connection::open(".tup/db")
-                    .expect("Connection to tup database in .tup/db could not be established");
-                let tupfiles = scan_and_get_tupfiles(&root, &mut conn)?;
-                parse_tupfiles_in_db(tupfiles, root.as_path())?;
-                let (dag, node_bimap) = parse::prepare_for_execution(&mut conn)?;
-
-                //create_dyn_io_temp_tables(&conn)?;
-                // start tracking file io by subprocesses.
-                let rule_nodes = conn.rules_to_run_no_target()?;
-                if rule_nodes.is_empty() {
-                    println!("Nothing to do");
-                    return Ok(());
+                {
+                    let mut conn = Connection::open(".tup/db")
+                        .expect("Connection to tup database in .tup/db could not be established");
+                    let tupfiles = scan_and_get_tupfiles(&root, &mut conn)?;
+                    parse_tupfiles_in_db(conn, tupfiles, root.as_path())?;
                 }
-                let _ = exec_rules_to_run(
-                    conn,
-                    rule_nodes,
-                    &node_bimap,
-                    &dag,
-                    root.as_path(),
-                    &target,
-                    keep_going,
-                )?;
+
+                execute::execute_targets(&target, keep_going, root)?;
                 // receive events from subprocesses.
                 //conn.remove_modified_list()?;
 
