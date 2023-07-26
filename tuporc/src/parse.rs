@@ -619,9 +619,8 @@ pub(crate) fn exec_rules_to_run(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn kill_poisoned(
-    poisoned: &mut Arc<RwLock<u8>>,
+    poisoned: &Arc<RwLock<u8>>,
     children: &Vec<Arc<Mutex<(Child, String)>>>,
     keep_going: bool,
 ) -> bool {
@@ -673,15 +672,9 @@ fn wait_for_children(
         children = tryagain;
         yield_now();
         if !children.is_empty() {
-            std::thread::sleep(std::time::Duration::from_nanos(100));
-            if *poisoned.read() != 0 {
-                for child in children.iter() {
-                    let ref mut ch = child.lock();
-                    let id = ch.0.id();
-                    failed.push(id);
-                    ch.0.kill().ok();
-                    ch.0.wait().ok();
-                }
+            thread::sleep(std::time::Duration::from_nanos(100));
+            if kill_poisoned(&poisoned, &children, _keep_going) {
+                break;
             }
         }
     }
@@ -732,7 +725,6 @@ fn listen_to_processes(
         } else {
             sel.recv(&spawned_child_id_receiver)
         };
-        let mut change = false;
         while let Ok(oper) = sel.try_select() {
             if !keep_going && *poisoned.read() != 0 {
                 break;
@@ -741,11 +733,15 @@ fn listen_to_processes(
                 i if i == index_child_ids => {
                     if let Ok((child_id, (rule_id, rule_name, succeeded))) =
                         oper.recv(&child_id_receiver).map_err(|_| {
-                            log::debug!("no more children  expected");
+                            debug!("no more children  expected");
                             end_completed_child_ids = true;
                         })
                     {
-                        change = true;
+                        log::info!(
+                            "Child id {} finished executing rule: {}",
+                            child_id,
+                            rule_name
+                        );
                         if succeeded {
                             to_verify.push((child_id, rule_id, rule_name));
                         } else {
@@ -774,9 +770,16 @@ fn listen_to_processes(
                         let process_gen = evt_header.get_process_gen();
                         let parent_process_id = evt_header.get_parent_process_id();
                         let event_type = evt_header.get_event_type();
-                        change = true;
                         if event_type == Write as i8 {
-                            debug!("Write recvd");
+                            debug!("Write recvd for {} by process id:{}", file_path, process_id);
+                        }
+                        if event_type == EventType::Read as i8
+                            || event_type == EventType::Open as i8
+                        {
+                            debug!(
+                                "Open/Read recvd for {} by process id:{}",
+                                file_path, process_id
+                            );
                         }
                         let child_cnt = evt_header.get_child_cnt() as i32;
                         if event_type == ProcessDeletion as _ || event_type == ProcessCreation as _
@@ -817,7 +820,6 @@ fn listen_to_processes(
                     }) {
                         debug!("spawned child id recvd :{}", child_id);
                         children.insert(child_id);
-                        change = true;
                     }
                 }
                 _ => {
