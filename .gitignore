@@ -4,7 +4,7 @@ target/*
 .projectile
 Tupfile.ini
 .fdignore
-.tup/db
+.tup/*
 .vs/*
 Cargo.lock
 tuporc/.vscode/*
@@ -12,9 +12,4 @@ tuporc/.vscode/*
 .fleet/settings.json
 tuplua/
 out.txt
-ptrace_nix.txt
-ptrace_nix1.txt
-ptrace_nix2.txt
-ptrace_nix3.txt
-ptrace_nix4_audit.txt
-ptrace_nix5_traceread_recursive.txt
+ptrace*.txt

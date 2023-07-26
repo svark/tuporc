@@ -29,7 +29,7 @@ impl From<trace::TraceError> for TraceError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventType {
     Open = 0,
     Read = 1,
@@ -72,9 +72,9 @@ impl EventHeader {
     pub fn get_parent_process_id(&self) -> u32 {
         (self.parent_process_id >> 0x20) as _
     }
-    pub fn get_event_type(&self) -> i8 {
+    pub fn get_event_type(&self) -> EventType {
         let evt = self.event_type.clone();
-        evt as i8
+        evt
     }
     pub fn get_file_path(&self) -> &String {
         &self.file_path

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 use std::path::Path;
 use std::process::{Child, Stdio};
+use std::slice::Iter;
 use std::sync::Arc;
 use std::thread;
 use std::thread::yield_now;
@@ -17,7 +18,6 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 
-use tupetw::EventType::{ProcessCreation, ProcessDeletion, Write};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::decode::{
     GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
@@ -681,6 +681,146 @@ fn wait_for_children(
     Ok((finished, failed))
 }
 
+struct ProcessIOChecker<'a> {
+    input_getter: SqlStatement<'a>,
+    output_getter: SqlStatement<'a>,
+    fetch_id_stmt: SqlStatement<'a>,
+    fetch_dirid_stmt: SqlStatement<'a>,
+    add_link_stmt: SqlStatement<'a>,
+    rule_failed_stmt: SqlStatement<'a>,
+}
+
+struct IoConn<'b> {
+    fetch_io_statement: SqlStatement<'b>,
+    insert_trace_statement: SqlStatement<'b>,
+}
+
+struct RulesToVerify {
+    to_verify: Vec<(u32, i64, String)>,
+}
+
+impl RulesToVerify {
+    fn is_empty(&self) -> bool {
+        self.to_verify.is_empty()
+    }
+
+    fn iter(&self) -> Iter<'_, (u32, i64, String)> {
+        self.to_verify.iter()
+    }
+
+    fn reverify(&mut self, to_verify: Vec<(u32, i64, String)>) {
+        self.to_verify = to_verify;
+    }
+
+    fn add(&mut self, child_id: u32, rule_id: i64, rule_name: String) {
+        self.to_verify.push((child_id, rule_id, rule_name));
+    }
+}
+
+impl<'a> ProcessIOChecker<'a> {
+    fn new(conn: &'a mut Connection) -> Result<Self> {
+        let s = Self {
+            input_getter: conn.fetch_inputs_for_rule_prepare()?,
+            output_getter: conn.fetch_outputs_for_rule_prepare()?,
+            fetch_id_stmt: conn.fetch_nodeid_prepare()?,
+            fetch_dirid_stmt: conn.fetch_dirid_prepare()?,
+            add_link_stmt: conn.insert_link_prepare()?,
+            rule_failed_stmt: conn.mark_rule_failed_prepare()?,
+        };
+        return Ok(s);
+    }
+
+    fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
+        let fetch_inputs = self.input_getter.fetch_inputs(rule_id)?;
+        Ok(fetch_inputs)
+    }
+    fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
+        let fetch_outputs = self.output_getter.fetch_outputs(rule_id)?;
+        Ok(fetch_outputs)
+    }
+
+    fn fetch_dirid<P: AsRef<Path>>(&mut self, node_path: P) -> Result<i64> {
+        let dirid = self.fetch_dirid_stmt.fetch_dirid(node_path)?;
+        Ok(dirid)
+    }
+    fn fetch_node_id(&mut self, node_name: &str, dirid: i64) -> Result<i64> {
+        let nodeid = self.fetch_id_stmt.fetch_node_id(node_name, dirid)?;
+        Ok(nodeid)
+    }
+
+    fn mark_failed(&mut self, rule_id: i64) -> Result<()> {
+        self.rule_failed_stmt.mark_rule_failed(rule_id)?;
+        Ok(())
+    }
+
+    fn insert_link(&mut self, from_id: i64, rule_id: i64) -> Result<()> {
+        self.add_link_stmt
+            .insert_link(from_id, rule_id, false, RowType::Rule)?;
+        Ok(())
+    }
+}
+
+impl<'b> IoConn<'b> {
+    fn new(conn: &'b mut Connection) -> Result<Self> {
+        let s = Self {
+            fetch_io_statement: conn.fetch_io_prepare()?,
+            insert_trace_statement: conn.insert_trace_prepare()?,
+        };
+        return Ok(s);
+    }
+
+    fn fetch_io(&mut self, child_id: u32) -> Result<Vec<(String, u8)>> {
+        let fetch_io = self.fetch_io_statement.fetch_io(child_id as _)?;
+        Ok(fetch_io)
+    }
+
+    fn insert_trace(&mut self, root: &Path, evt_header: &EventHeader) -> Result<()> {
+        let file_path = evt_header.get_file_path();
+        let process_id = evt_header.get_process_id();
+        let process_gen = evt_header.get_process_gen();
+        let parent_process_id = evt_header.get_parent_process_id();
+        let event_type = evt_header.get_event_type();
+        let child_cnt = evt_header.get_child_cnt() as i32;
+        match event_type {
+            EventType::ProcessCreation | EventType::ProcessDeletion => {
+                self.insert_trace_statement.insert_trace(
+                    file_path.as_str(),
+                    process_id as _,
+                    process_gen,
+                    event_type as u8,
+                    child_cnt,
+                )?
+            }
+
+            EventType::Open | EventType::Read | EventType::Write => {
+                // only add paths relative to root
+                if let Some(rel_path) = pathdiff::diff_paths(Path::new(file_path.as_str()), root) {
+                    if !rel_path.starts_with("..") {
+                        if event_type == EventType::Write {
+                            debug!("Write recvd for {} by process id:{}", file_path, process_id);
+                        }
+                        if event_type == EventType::Read || event_type == EventType::Open {
+                            debug!(
+                                "Open/Read recvd for {} by process id:{}",
+                                file_path, process_id
+                            );
+                        }
+
+                        self.insert_trace_statement.insert_trace(
+                            rel_path.as_path(),
+                            parent_process_id as _,
+                            process_gen as _,
+                            event_type as u8,
+                            child_cnt,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn listen_to_processes(
     conn: &mut Connection,
     root: &Path,
@@ -697,14 +837,13 @@ fn listen_to_processes(
     let mut end_completed_child_ids = false;
     let mut end_spawned_child_ids = false;
     let mut end_trace = false;
-    let mut input_getter = conn.fetch_inputs_for_rule_prepare()?;
-    let mut output_getter = conn.fetch_outputs_for_rule_prepare()?;
-    let mut mark_failed_stmt = conn.mark_rule_failed_prepare()?;
-    let mut fetch_id_stmt = conn.fetch_nodeid_prepare()?;
-    let mut fetch_dirid_stmt = conn.fetch_dirid_prepare()?;
-    let mut add_link_stmt = conn.insert_link_prepare()?;
+    let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = BTreeSet::new();
-    let mut to_verify = Vec::new();
+
+    let mut to_verify = RulesToVerify {
+        to_verify: Vec::new(),
+    };
+    let mut io_conn = IoConn::new(&mut io_conn)?;
     let mut children = BTreeSet::new();
     loop {
         let mut sel = crossbeam::channel::Select::new();
@@ -737,85 +876,27 @@ fn listen_to_processes(
                             end_completed_child_ids = true;
                         })
                     {
-                        log::info!(
-                            "Child id {} finished executing rule: {}",
+                        handle_childids(
+                            &mut process_checker,
                             child_id,
-                            rule_name
+                            rule_id,
+                            rule_name,
+                            succeeded,
+                            &mut to_verify,
                         );
-                        if succeeded {
-                            to_verify.push((child_id, rule_id, rule_name));
-                        } else {
-                            debug!("Error running rule: {}", rule_name);
-                            mark_failed_stmt
-                                .mark_rule_failed(rule_id as _)
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "Could not write failed rule {} with id :{} to db, \n {}",
-                                        rule_name,
-                                        rule_id,
-                                        e.to_string()
-                                    )
-                                });
-                        }
                     }
                 }
                 i if i == index_trace => {
                     if let Ok(evt_header) = oper.recv(&trace_receiver).map_err(|_| {
-                        log::debug!("no more trace events expected");
+                        debug!("no more trace events expected");
                         end_trace = true;
                     }) {
-                        //dir_children_set.insert(p);
-                        let file_path = evt_header.get_file_path();
-                        let process_id = evt_header.get_process_id();
-                        let process_gen = evt_header.get_process_gen();
-                        let parent_process_id = evt_header.get_parent_process_id();
-                        let event_type = evt_header.get_event_type();
-                        if event_type == Write as i8 {
-                            debug!("Write recvd for {} by process id:{}", file_path, process_id);
-                        }
-                        if event_type == EventType::Read as i8
-                            || event_type == EventType::Open as i8
-                        {
-                            debug!(
-                                "Open/Read recvd for {} by process id:{}",
-                                file_path, process_id
-                            );
-                        }
-                        let child_cnt = evt_header.get_child_cnt() as i32;
-                        if event_type == ProcessDeletion as _ || event_type == ProcessCreation as _
-                        {
-                            if event_type == ProcessDeletion as _ {
-                                deleted_child_procs.insert(process_id);
-                            }
-                            io_conn
-                                .insert_trace(
-                                    file_path.as_str(),
-                                    process_id as _,
-                                    process_gen,
-                                    event_type,
-                                    child_cnt,
-                                )
-                                .expect("Failed to insert trace");
-                        } else if let Some(rel_path) =
-                            pathdiff::diff_paths(Path::new(file_path), root)
-                        {
-                            if !rel_path.starts_with("..") {
-                                io_conn
-                                    .insert_trace(
-                                        rel_path.as_path(),
-                                        parent_process_id as _,
-                                        process_gen,
-                                        event_type,
-                                        child_cnt,
-                                    )
-                                    .expect("Failed to insert trace");
-                            }
-                        }
+                        handle_trace(root, &mut io_conn, &mut deleted_child_procs, evt_header);
                     }
                 }
                 i if i == index_spawned_child => {
                     if let Ok(child_id) = oper.recv(&spawned_child_id_receiver).map_err(|_| {
-                        log::debug!("no more spawned child ids expected");
+                        debug!("no more spawned child ids expected");
                         end_spawned_child_ids = true;
                     }) {
                         debug!("spawned child id recvd :{}", child_id);
@@ -849,32 +930,23 @@ fn listen_to_processes(
             }
         }
         if !to_verify.is_empty() {
-            let mut fetch_io_stmt = io_conn
-                .fetch_io_prepare()
-                .expect("Failed to prepare fetch io statement");
-
             let mut reverify = Vec::new();
-            for (child_id, rule_id, rule_name) in to_verify.drain(..) {
+            for (child_id, rule_id, rule_name) in to_verify.iter() {
                 if !deleted_child_procs.contains(&child_id) {
-                    reverify.push((child_id, rule_id, rule_name));
+                    reverify.push((*child_id, *rule_id, rule_name.clone()));
                     continue;
                 }
                 deleted_child_procs.remove(&child_id);
-                //dir_id_by_path.insert(p, id);
                 if let Err(e) = verify_rule_io(
-                    child_id,
-                    rule_id as _,
+                    *child_id,
+                    *rule_id as _,
                     rule_name.as_str(),
-                    &mut input_getter,
-                    &mut output_getter,
-                    &mut fetch_io_stmt,
-                    &mut add_link_stmt,
-                    &mut fetch_id_stmt,
-                    &mut fetch_dirid_stmt,
+                    &mut io_conn,
+                    &mut process_checker,
                 ) {
-                    eprintln!("Error verifying rule io: {}", e.to_string());
-                    mark_failed_stmt
-                        .mark_rule_failed(rule_id as _)
+                    eprintln!("Error verifying rule io {}\n{}", rule_name, e.to_string());
+                    process_checker
+                        .mark_failed(*rule_id as _)
                         .unwrap_or_else(|e| {
                             panic!(
                                 "Could not write failed rule {} with id :{} to db, \n {}",
@@ -888,7 +960,7 @@ fn listen_to_processes(
                     }
                 }
             }
-            to_verify = reverify;
+            to_verify.reverify(reverify);
         }
         if !keep_going && *poisoned.read() != 0 {
             break;
@@ -901,20 +973,64 @@ fn listen_to_processes(
     Ok(())
 }
 
+fn handle_trace(
+    root: &Path,
+    //io_conn: &mut Connection,
+    io_conn: &mut IoConn,
+    deleted_child_procs: &mut BTreeSet<u32>,
+    evt_header: EventHeader,
+) {
+    //dir_children_set.insert(p);
+    let process_id = evt_header.get_process_id();
+    let event_type = evt_header.get_event_type();
+    if event_type == EventType::ProcessDeletion as _ {
+        deleted_child_procs.insert(process_id);
+    }
+    io_conn
+        .insert_trace(root, &evt_header)
+        .expect("Failed to insert trace");
+}
+
+fn handle_childids(
+    process_checker: &mut ProcessIOChecker,
+    child_id: u32,
+    rule_id: i64,
+    rule_name: String,
+    succeeded: bool,
+    rules_to_verify: &mut RulesToVerify,
+) {
+    log::info!(
+        "Child id {} finished executing rule: {}",
+        child_id,
+        rule_name
+    );
+    if succeeded {
+        rules_to_verify.add(child_id, rule_id, rule_name);
+    } else {
+        debug!("Error running rule: {}", rule_name);
+        process_checker
+            .mark_failed(rule_id as _)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Could not write failed rule {} with id :{} to db, \n {}",
+                    rule_name,
+                    rule_id,
+                    e.to_string()
+                )
+            });
+    }
+}
+
 fn verify_rule_io(
     ch_id: u32,
     rule_id: i32,
     rule_name: &str,
-    input_getter: &mut SqlStatement,
-    output_getter: &mut SqlStatement,
-    fetch_io_stmt: &mut SqlStatement,
-    add_link_stmt: &mut SqlStatement,
-    fetch_id_stmt: &mut SqlStatement,
-    fetch_dirid_stmt: &mut SqlStatement,
+    io_conn: &mut IoConn,
+    process_checker: &mut ProcessIOChecker,
 ) -> Result<()> {
-    let io_vec = fetch_io_stmt.fetch_io(ch_id as i32)?;
-    let inps = input_getter.fetch_inputs(rule_id)?;
-    let outs = output_getter.fetch_outputs(rule_id)?;
+    let io_vec = io_conn.fetch_io(ch_id)?;
+    let inps = process_checker.fetch_inputs(rule_id as _)?;
+    let outs = process_checker.fetch_outputs(rule_id as _)?;
     let mut processed_io = BTreeSet::new();
     'outer: for (fnode, ty) in io_vec.iter() {
         if !processed_io.insert((fnode.clone(), *ty)) {
@@ -934,9 +1050,14 @@ fn verify_rule_io(
                 }
             }
 
-            if let Ok(dirid) = fetch_dirid_stmt.fetch_dirid(fnode) {
-                if let Ok(from_id) = fetch_id_stmt.fetch_node_id(fnode, dirid) {
-                    add_link_stmt.insert_link(from_id, rule_id as _, false, RowType::Rule)?;
+            if let Ok(dirid) = process_checker.fetch_dirid(fnode) {
+                let p = Path::new(fnode);
+                if let Some(name) = p.file_name() {
+                    if let Ok(from_id) =
+                        process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
+                    {
+                        process_checker.insert_link(from_id, rule_id as _)?;
+                    }
                 }
             }
         } else if *ty == EventType::Write as u8 {

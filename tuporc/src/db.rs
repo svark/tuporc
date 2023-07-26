@@ -272,6 +272,7 @@ pub enum StatementType {
     AddFailedToMod,
     FetchOutputsForRule,
     FetchInputsForRule,
+    InsertTrace,
 }
 
 pub struct SqlStatement<'conn> {
@@ -321,6 +322,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_envs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement>;
+    fn insert_trace_prepare(&self) -> Result<SqlStatement>;
 }
 
 pub(crate) trait LibSqlExec {
@@ -406,6 +408,14 @@ pub(crate) trait LibSqlExec {
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
     /// fetch all outputs of the given rule
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
+    fn insert_trace<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        pid: i32,
+        gen: u32,
+        typ: u8,
+        childcnt: i32,
+    ) -> Result<()>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -414,14 +424,6 @@ pub(crate) trait MiscStatements {
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
     fn prune_present_list(&self) -> Result<()>;
     fn prune_modified_list(&self) -> Result<()>;
-    fn insert_trace<P: AsRef<Path>>(
-        &mut self,
-        filepath: P,
-        pid: u32,
-        gen: u32,
-        typ: i8,
-        childcnt: i32,
-    ) -> Result<i64>;
     fn remove_modified_list(&self) -> Result<()>;
 }
 pub(crate) trait ForEachClauses {
@@ -892,6 +894,15 @@ SELECT DISTINCT x FROM dependants));",
             tok: FetchInputsForRule,
         })
     }
+
+    fn insert_trace_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self
+            .prepare("INSERT INTO DYNIO (path, pid, gen, typ, childcnt) VALUES (?, ?, ?, ?, ?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertTrace,
+        })
+    }
 }
 
 impl LibSqlExec for SqlStatement<'_> {
@@ -1282,6 +1293,20 @@ impl LibSqlExec for SqlStatement<'_> {
             vs.push(n);
         }
         Ok(vs)
+    }
+
+    fn insert_trace<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        pid: i32,
+        gen: u32,
+        typ: u8,
+        childcnt: i32,
+    ) -> Result<()> {
+        eyre::ensure!(self.tok == InsertTrace, "wrong token for insert trace");
+        let filepath = db_path_str(path);
+        self.stmt.insert((filepath, pid, gen, typ, childcnt))?;
+        Ok(())
     }
 }
 
@@ -1762,22 +1787,6 @@ FROM NodeChain;"
             self.prepare_cached("DELETE FROM ModifyList WHERE id in (SELECT id from DeleteList)")?;
         stmt.execute([])?;
         Ok(())
-    }
-
-    fn insert_trace<P: AsRef<Path>>(
-        &mut self,
-        filepath: P,
-        pid: u32,
-        gen: u32,
-        typ: i8,
-        childcnt: i32,
-    ) -> Result<i64> {
-        let mut stmt = self.prepare_cached(
-            "INSERT INTO DYNIO (path, pid, gen, typ, childcnt) VALUES (?, ?, ?, ?, ?)",
-        )?;
-        let filepath = db_path_str(filepath);
-        let id = stmt.insert((filepath, pid, gen, typ, childcnt))?;
-        Ok(id)
     }
 
     fn remove_modified_list(&self) -> Result<()> {
