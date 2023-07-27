@@ -22,6 +22,39 @@ use tupetw::{DynDepTracker, EventHeader, EventType};
 use crate::db::RowType::Excluded;
 use crate::db::{ForEachClauses, LibSqlExec, LibSqlPrepare, Node, RowType, SqlStatement};
 
+#[derive(Debug, Clone)]
+struct PoisonedState {
+    keep_going: bool,
+    poisoned: Arc<RwLock<u8>>,
+}
+
+impl PoisonedState {
+    fn new(keep_going: bool) -> Self {
+        Self {
+            keep_going,
+            poisoned: Arc::new(RwLock::new(0)),
+        }
+    }
+    fn is_poisoned(&self) -> bool {
+        *self.poisoned.read() != 0
+    }
+    fn update_poisoned(&self, poisoned: u8) -> bool {
+        if !self.is_poisoned() {
+            *self.poisoned.write() = poisoned;
+            true
+        } else {
+            false
+        }
+    }
+    fn force_poisoned(&self) {
+        *self.poisoned.write() = 1;
+    }
+    fn should_stop(&self) -> bool {
+        let p = self.poisoned.read();
+        *p == 1 && (!self.keep_going || *p > 1)
+    }
+}
+
 pub fn prepare_for_execution(
     conn: &mut Connection,
 ) -> Result<(IncrementalTopo, BiHashMap<i32, incremental_topo::Node>)> {
@@ -153,11 +186,12 @@ pub fn exec_rules_to_run(
     for v in valid_rules.iter() {
         topo_orders_set.insert(topo_order.get(&(v.get_id() as i32)).unwrap());
     }
-    let poisoned = Arc::new(RwLock::new(0));
+    let poisoned = PoisonedState::new(keep_going);
     let num_threads = std::cmp::min(num_cpus::get(), valid_rules.len());
     {
         let poisoned = poisoned.clone();
-        ctrlc::set_handler(move || *poisoned.write() = 1).expect("Error setting Ctrl-C handler");
+        ctrlc::set_handler(move || poisoned.force_poisoned())
+            .expect("Error setting Ctrl-C handler");
     }
     valid_rules.sort_by(|x, y| {
         let xid = x.get_id() as i32;
@@ -197,7 +231,6 @@ pub fn exec_rules_to_run(
                 if let Err(e) = listen_to_processes(
                     &mut conn,
                     root,
-                    keep_going,
                     tracker,
                     poisoned.clone(),
                     &trace_receiver,
@@ -205,7 +238,7 @@ pub fn exec_rules_to_run(
                     &spawned_child_id_receiver,
                 ) {
                     eprintln!("Error while listening to processes: {}", e);
-                    *poisoned.write() = 1;
+                    poisoned.force_poisoned();
                     return Err(e);
                 }
                 Ok(())
@@ -229,7 +262,7 @@ pub fn exec_rules_to_run(
             });
             for j in min_idx..max_idx {
                 let rule_node = &valid_rules[j];
-                if *poisoned.read() == 1 || (*poisoned.read() > 1 && !keep_going) {
+                if poisoned.should_stop() {
                     let rule_id = rule_node.get_id();
                     let rule_name = rule_node.get_name();
                     completed_child_id_sender.send((0, (rule_id, rule_name.to_owned(), false)))?;
@@ -260,7 +293,6 @@ pub fn exec_rules_to_run(
 
             {
                 let wg = crossbeam::sync::WaitGroup::new();
-                let poisoned = poisoned.clone();
                 for i in 0..num_threads {
                     let done = Arc::new(RwLock::new(false));
                     {
@@ -298,9 +330,8 @@ pub fn exec_rules_to_run(
             }
             min_idx = max_idx;
 
-            let p = poisoned.read();
-            if *p != 0 {
-                return Err(eyre!("Stopping further rule executions"));
+            if poisoned.should_stop() {
+                eyre::bail!("Stopping further rule executions");
             }
         } // min_topo_order..max topo order
         drop(completed_child_id_sender);
@@ -316,28 +347,21 @@ pub fn exec_rules_to_run(
     Ok(())
 }
 
-fn kill_poisoned(
-    poisoned: &Arc<RwLock<u8>>,
-    children: &Vec<Arc<Mutex<(Child, String)>>>,
-    keep_going: bool,
-) -> bool {
-    let guard = poisoned.read();
-    if *guard == 1 || *guard != 0 && !keep_going {
-        children.into_iter().for_each(|ch| {
-            let ref mut ch = ch.lock().0;
-            let id = ch.id();
-            ch.kill().ok();
-            eprintln!("Killed child process {}", id);
-        });
-        true
-    } else {
-        false
-    }
+fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String)>>>) -> Vec<u32> {
+    let mut failedids = Vec::new();
+    children.into_iter().for_each(|ch| {
+        let ref mut ch = ch.lock().0;
+        let id = ch.id();
+        failedids.push(id);
+        ch.kill().ok();
+        eprintln!("Killed child process {}", id);
+    });
+    failedids
 }
 
 fn wait_for_children(
     _keep_going: bool,
-    poisoned: Arc<RwLock<u8>>,
+    poisoned: PoisonedState,
     mut children: Vec<Arc<Mutex<(Child, String)>>>,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let (mut finished, mut failed) = (Vec::new(), Vec::new());
@@ -349,13 +373,8 @@ fn wait_for_children(
             let id = ch.0.id();
             if let Some(ref exit_status) = ch.0.try_wait()? {
                 if !exit_status.success() {
-                    if *poisoned.read() != 0 {
-                        continue;
-                    }
                     failed.push(id);
-                    let mut poisoned = poisoned.write();
-                    if *poisoned == 0 {
-                        *poisoned = 2_u8;
+                    if poisoned.update_poisoned(2) {
                         yield_now();
                     }
                 } else {
@@ -370,7 +389,8 @@ fn wait_for_children(
         yield_now();
         if !children.is_empty() {
             thread::sleep(std::time::Duration::from_nanos(100));
-            if kill_poisoned(&poisoned, &children, _keep_going) {
+            if poisoned.should_stop() {
+                failed.extend(kill_poisoned(&children).drain(..));
                 break;
             }
         }
@@ -518,12 +538,25 @@ impl<'b> IoConn<'b> {
     }
 }
 
+fn get_index<'a, P>(
+    receiver: &'a Receiver<P>,
+    condition: bool,
+    select: &mut crossbeam::channel::Select<'a>,
+) -> usize {
+    if condition {
+        usize::MAX
+    } else {
+        select.recv(receiver)
+    }
+}
+
+// Then use this function like this:
+
 fn listen_to_processes(
     conn: &mut Connection,
     root: &Path,
-    keep_going: bool,
     mut tracker: DynDepTracker,
-    poisoned: Arc<RwLock<u8>>,
+    poisoned: PoisonedState,
     trace_receiver: &Receiver<EventHeader>,
     child_id_receiver: &Receiver<(u32, (i64, String, bool))>,
     spawned_child_id_receiver: &Receiver<u32>,
@@ -544,27 +577,13 @@ fn listen_to_processes(
     let mut children = std::collections::BTreeSet::new();
     loop {
         let mut sel = crossbeam::channel::Select::new();
-        let index_child_ids = if end_completed_child_ids {
-            usize::MAX
-        } else {
-            sel.recv(&child_id_receiver)
-        };
 
-        let index_trace = if end_trace {
-            usize::MAX
-        } else {
-            sel.recv(&trace_receiver)
-        };
+        let index_child_ids = get_index(&child_id_receiver, end_completed_child_ids, &mut sel);
+        let index_trace = get_index(&trace_receiver, end_trace, &mut sel);
+        let index_spawned_child =
+            get_index(&spawned_child_id_receiver, end_spawned_child_ids, &mut sel);
 
-        let index_spawned_child = if end_spawned_child_ids {
-            usize::MAX
-        } else {
-            sel.recv(&spawned_child_id_receiver)
-        };
         while let Ok(oper) = sel.try_select() {
-            if !keep_going && *poisoned.read() != 0 {
-                break;
-            }
             match oper.index() {
                 i if i == index_child_ids => {
                     if let Ok((child_id, (rule_id, rule_name, succeeded))) =
@@ -601,8 +620,7 @@ fn listen_to_processes(
                     }
                 }
                 _ => {
-                    eprintln!("unknown index returned in select:{}", oper.index());
-                    break;
+                    unreachable!("unexpected index");
                 }
             }
             if end_spawned_child_ids && index_spawned_child != usize::MAX {
@@ -614,9 +632,14 @@ fn listen_to_processes(
             if end_completed_child_ids && index_child_ids != usize::MAX {
                 break;
             }
+            if poisoned.is_poisoned() {
+                break;
+            }
         }
         thread::sleep(std::time::Duration::from_nanos(100));
-        if end_completed_child_ids && !end_trace {
+        if poisoned.should_stop() {
+            tracker.stop();
+        } else if end_completed_child_ids && !end_trace {
             if index_child_ids != usize::MAX {
                 // run select once more to pick up more eventheaders from trace_receiver
                 yield_now();
@@ -652,14 +675,12 @@ fn listen_to_processes(
                                 e.to_string()
                             )
                         });
-                    if *poisoned.read() == 0 {
-                        *poisoned.write() = 2;
-                    }
+                    poisoned.update_poisoned(2);
                 }
             }
             to_verify.reverify(reverify);
         }
-        if !keep_going && *poisoned.read() != 0 {
+        if poisoned.should_stop() {
             break;
         }
         if end_completed_child_ids && end_trace && end_spawned_child_ids {
