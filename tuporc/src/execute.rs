@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::iter::FromIterator;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::slice::Iter;
@@ -9,7 +10,7 @@ use std::thread::yield_now;
 
 use bimap::hash::BiHashMap;
 use bimap::BiMap;
-use crossbeam::channel::Receiver;
+use crossbeam::channel::{Receiver, Select, SelectedOperation};
 use ex::shell;
 use eyre::{eyre, Result};
 use incremental_topo::IncrementalTopo;
@@ -110,6 +111,193 @@ pub fn execute_targets(target: &Vec<String>, keep_going: bool, root: PathBuf) ->
         keep_going,
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ProcReceivers {
+    child_id_receiver: Receiver<(u32, (i64, String, bool))>,
+    trace_receiver: Receiver<EventHeader>,
+    spawned_child_id_receiver: Receiver<u32>,
+    end_completed_child_ids: bool,
+    end_spawned_child_ids: bool,
+    end_trace: bool,
+}
+
+impl ProcReceivers {
+    fn new(
+        child_id_receiver: Receiver<(u32, (i64, String, bool))>,
+        trace_receiver: Receiver<EventHeader>,
+        spawned_child_id_receiver: Receiver<u32>,
+    ) -> Self {
+        Self {
+            child_id_receiver,
+            trace_receiver,
+            spawned_child_id_receiver,
+            end_completed_child_ids: false,
+            end_spawned_child_ids: false,
+            end_trace: false,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.end_completed_child_ids && self.end_spawned_child_ids && self.end_trace
+    }
+    fn should_stop_trace(&self) -> bool {
+        self.end_completed_child_ids && self.end_spawned_child_ids && !self.end_trace
+    }
+
+    fn get_index<'a, P: 'a>(
+        receiver: &'a Receiver<P>,
+        condition: bool,
+        select: &mut crossbeam::channel::Select<'a>,
+    ) -> usize {
+        if condition {
+            usize::MAX
+        } else {
+            select.recv(receiver)
+        }
+    }
+
+    fn handle_child_ids<'a>(
+        &'a self,
+        oper: SelectedOperation<'a>,
+        process_checker: &mut ProcessIOChecker,
+        rules_to_verify: &mut RulesToVerify,
+    ) -> Result<bool> {
+        let mut end_receive = false;
+        if let Ok((child_id, (rule_id, rule_name, succeeded))) = {
+            oper.recv(&self.child_id_receiver).map_err(|_| {
+                debug!("no more children  expected");
+                end_receive = true;
+            })
+        } {
+            log::info!(
+                "Child id {} finished executing rule: {}",
+                child_id,
+                rule_name
+            );
+            if succeeded {
+                rules_to_verify.add(child_id, rule_id, rule_name);
+            } else {
+                debug!("Error running rule: {}", rule_name);
+                process_checker.mark_failed(rule_id as _).map_err(|e| {
+                    eyre!(
+                        "Could not write failed rule {} with id :{} to db, \n {}",
+                        rule_name,
+                        rule_id,
+                        e.to_string()
+                    )
+                })?;
+            }
+        }
+        Ok(end_receive)
+    }
+
+    fn handle_trace(
+        &self,
+        oper: SelectedOperation,
+        root: &Path,
+        deleted_child_procs: &mut std::collections::BTreeSet<u32>,
+        io_conn: &mut IoConn,
+    ) -> Result<bool> {
+        let r = &self.trace_receiver;
+        let mut end = false;
+        if let Ok(evt_header) = oper.recv(r).map_err(|_| {
+            debug!("no more trace events expected");
+            end = true;
+        }) {
+            let process_id = evt_header.get_process_id();
+            let event_type = evt_header.get_event_type();
+            if event_type == EventType::ProcessDeletion as _ {
+                deleted_child_procs.insert(process_id);
+            }
+            io_conn
+                .insert_trace(root, &evt_header)
+                .expect("Failed to insert trace");
+        }
+        Ok(end)
+    }
+
+    fn handle_spawned_child(
+        &self,
+        oper: SelectedOperation,
+        children: &mut std::collections::BTreeSet<u32>,
+    ) -> bool {
+        let r = &self.spawned_child_id_receiver;
+        let mut end = false;
+        if let Ok(child_id) = oper.recv(r.deref()).map_err(|_| {
+            debug!("no more spawned children expected");
+            end = true;
+        }) {
+            children.insert(child_id);
+        }
+        end
+    }
+
+    fn should_break(
+        &self,
+        index_spawned_child: usize,
+        index_trace: usize,
+        index_child_ids: usize,
+    ) -> bool {
+        if self.end_spawned_child_ids && index_spawned_child != usize::MAX {
+            return true;
+        }
+        if self.end_trace && index_trace != usize::MAX {
+            return true;
+        }
+        if self.end_completed_child_ids && index_child_ids != usize::MAX {
+            return true;
+        }
+        return false;
+    }
+    fn process_sel<'a>(
+        &'a mut self,
+        process_checker: &mut ProcessIOChecker,
+        rules_to_verify: &mut RulesToVerify,
+        root: &Path,
+        deleted_child_procs: &mut std::collections::BTreeSet<u32>,
+        io_conn: &mut IoConn,
+        children: &mut std::collections::BTreeSet<u32>,
+        poisoned: &PoisonedState,
+    ) -> Result<(usize, usize, usize)> {
+        {
+            let ref mut sel = Select::new();
+            let index_child_ids =
+                Self::get_index(&self.child_id_receiver, self.end_completed_child_ids, sel);
+            let index_trace = Self::get_index(&self.trace_receiver, self.end_trace, sel);
+            let index_spawned_child = Self::get_index(
+                &self.spawned_child_id_receiver,
+                self.end_spawned_child_ids,
+                sel,
+            );
+
+            while let Ok(oper) = sel.try_select() {
+                match oper.index() {
+                    i if i == index_child_ids => {
+                        self.end_completed_child_ids =
+                            self.handle_child_ids(oper, process_checker, rules_to_verify)?;
+                    }
+                    i if i == index_trace => {
+                        self.end_trace =
+                            self.handle_trace(oper, root, deleted_child_procs, io_conn)?;
+                    }
+                    i if i == index_spawned_child => {
+                        self.end_spawned_child_ids = self.handle_spawned_child(oper, children);
+                    }
+                    _ => {
+                        unreachable!("unexpected index");
+                    }
+                }
+                if self.should_break(index_spawned_child, index_trace, index_child_ids) {
+                    break;
+                }
+                if poisoned.is_poisoned() {
+                    break;
+                }
+            }
+            Ok((index_child_ids, index_trace, index_spawned_child))
+        }
+    }
 }
 
 pub fn exec_rules_to_run(
@@ -221,22 +409,19 @@ pub fn exec_rules_to_run(
     let rule_for_child_id = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process()?;
+
     crossbeam::scope(|s| -> Result<()> {
         {
             let poisoned = poisoned.clone();
-            let trace_receiver = trace_receiver.clone();
-            let child_id_receiver = completed_child_id_receiver.clone();
-            let spawned_child_id_receiver = spawned_child_id_receiver.clone();
+            let proc_receivers = ProcReceivers::new(
+                completed_child_id_receiver,
+                trace_receiver,
+                spawned_child_id_receiver,
+            );
             s.spawn(move |_| -> Result<()> {
-                if let Err(e) = listen_to_processes(
-                    &mut conn,
-                    root,
-                    tracker,
-                    poisoned.clone(),
-                    &trace_receiver,
-                    &child_id_receiver,
-                    &spawned_child_id_receiver,
-                ) {
+                if let Err(e) =
+                    listen_to_processes(&mut conn, root, tracker, poisoned.clone(), proc_receivers)
+                {
                     eprintln!("Error while listening to processes: {}", e);
                     poisoned.force_poisoned();
                     return Err(e);
@@ -244,8 +429,6 @@ pub fn exec_rules_to_run(
                 Ok(())
             });
         }
-        drop(trace_receiver);
-        drop(completed_child_id_receiver);
         for o in topo_orders_set {
             let max_idx = valid_rules.partition_point(|x| {
                 let id = x.get_id() as i32;
@@ -291,46 +474,39 @@ pub fn exec_rules_to_run(
                 cmd.stderr(Stdio::piped());
             }
 
-            {
-                let wg = crossbeam::sync::WaitGroup::new();
-                for i in 0..num_threads {
-                    let done = Arc::new(RwLock::new(false));
+            let wg = crossbeam::sync::WaitGroup::new();
+            for i in 0..num_threads {
+                let poisoned = poisoned.clone();
+                let i = i.clone();
+                let children = children[i].clone();
+                // in this thread we wait for children to finish
+                let completed_child_id_sender = completed_child_id_sender.clone();
+                let rule_for_child_id = rule_for_child_id.clone();
+                let wg = wg.clone();
+                s.spawn(move |_| -> Result<()> {
+                    let (finished, failed) = wait_for_children(keep_going, poisoned, children)?;
+                    for (id, succeeded) in finished
+                        .iter()
+                        .map(|i| (*i, true))
+                        .chain(failed.iter().map(|j| (*j, false)))
                     {
-                        let poisoned = poisoned.clone();
-                        let i = i.clone();
-                        let children = children[i].clone();
-                        // in this thread we wait for children to finish
-                        let completed_child_id_sender = completed_child_id_sender.clone();
-                        let rule_for_child_id = rule_for_child_id.clone();
-                        let wg = wg.clone();
-                        s.spawn(move |_| -> Result<()> {
-                            let (finished, failed) =
-                                wait_for_children(keep_going, poisoned, children)?;
-                            for (id, succeeded) in finished
-                                .iter()
-                                .map(|i| (*i, true))
-                                .chain(failed.iter().map(|j| (*j, false)))
-                            {
-                                let rule_for_child_id = rule_for_child_id.read();
+                        let rule_for_child_id = rule_for_child_id.read();
 
-                                if let Some((rule_id, rule_name)) =
-                                    rule_for_child_id.get(&id).cloned()
-                                {
-                                    completed_child_id_sender
-                                        .send((id, (rule_id, rule_name, succeeded)))?;
-                                }
-                            }
-                            *done.write() = true;
-                            drop(wg);
-                            Ok(())
-                        });
+                        if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
+                            completed_child_id_sender
+                                .send((id, (rule_id, rule_name, succeeded)))?;
+                        }
                     }
-                }
-                wg.wait(); // wait for all processes to finish before next topo order rules are executed
+                    drop(wg);
+                    Ok(())
+                });
             }
+            wg.wait(); // wait for all processes to finish before next topo order rules are executed
             min_idx = max_idx;
 
             if poisoned.should_stop() {
+                drop(completed_child_id_sender);
+                drop(spawned_child_id_sender);
                 eyre::bail!("Stopping further rule executions");
             }
         } // min_topo_order..max topo order
@@ -538,18 +714,6 @@ impl<'b> IoConn<'b> {
     }
 }
 
-fn get_index<'a, P>(
-    receiver: &'a Receiver<P>,
-    condition: bool,
-    select: &mut crossbeam::channel::Select<'a>,
-) -> usize {
-    if condition {
-        usize::MAX
-    } else {
-        select.recv(receiver)
-    }
-}
-
 // Then use this function like this:
 
 fn listen_to_processes(
@@ -557,101 +721,41 @@ fn listen_to_processes(
     root: &Path,
     mut tracker: DynDepTracker,
     poisoned: PoisonedState,
-    trace_receiver: &Receiver<EventHeader>,
-    child_id_receiver: &Receiver<(u32, (i64, String, bool))>,
-    spawned_child_id_receiver: &Receiver<u32>,
+    mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
     let mut io_conn =
         Connection::open(root.join(".tup/io.db")).expect("Failed to open in memory db");
     crate::db::create_dyn_io_temp_tables(&mut io_conn)?;
-    let mut end_completed_child_ids = false;
-    let mut end_spawned_child_ids = false;
-    let mut end_trace = false;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();
 
-    let mut to_verify = RulesToVerify {
+    let mut rules_to_verify = RulesToVerify {
         to_verify: Vec::new(),
     };
     let mut io_conn = IoConn::new(&mut io_conn)?;
     let mut children = std::collections::BTreeSet::new();
     loop {
-        let mut sel = crossbeam::channel::Select::new();
-
-        let index_child_ids = get_index(&child_id_receiver, end_completed_child_ids, &mut sel);
-        let index_trace = get_index(&trace_receiver, end_trace, &mut sel);
-        let index_spawned_child =
-            get_index(&spawned_child_id_receiver, end_spawned_child_ids, &mut sel);
-
-        while let Ok(oper) = sel.try_select() {
-            match oper.index() {
-                i if i == index_child_ids => {
-                    if let Ok((child_id, (rule_id, rule_name, succeeded))) =
-                        oper.recv(&child_id_receiver).map_err(|_| {
-                            debug!("no more children  expected");
-                            end_completed_child_ids = true;
-                        })
-                    {
-                        handle_childids(
-                            &mut process_checker,
-                            child_id,
-                            rule_id,
-                            rule_name,
-                            succeeded,
-                            &mut to_verify,
-                        )?;
-                    }
-                }
-                i if i == index_trace => {
-                    if let Ok(evt_header) = oper.recv(&trace_receiver).map_err(|_| {
-                        debug!("no more trace events expected");
-                        end_trace = true;
-                    }) {
-                        handle_trace(root, &mut io_conn, &mut deleted_child_procs, evt_header);
-                    }
-                }
-                i if i == index_spawned_child => {
-                    if let Ok(child_id) = oper.recv(&spawned_child_id_receiver).map_err(|_| {
-                        debug!("no more spawned child ids expected");
-                        end_spawned_child_ids = true;
-                    }) {
-                        debug!("spawned child id recvd :{}", child_id);
-                        children.insert(child_id);
-                    }
-                }
-                _ => {
-                    unreachable!("unexpected index");
-                }
-            }
-            if end_spawned_child_ids && index_spawned_child != usize::MAX {
-                break;
-            }
-            if end_trace && index_trace != usize::MAX {
-                break;
-            }
-            if end_completed_child_ids && index_child_ids != usize::MAX {
-                break;
-            }
-            if poisoned.is_poisoned() {
-                break;
-            }
-        }
+        let (index_child_ids, _, _) = proc_receivers.process_sel(
+            &mut process_checker,
+            &mut rules_to_verify,
+            root,
+            &mut deleted_child_procs,
+            &mut io_conn,
+            &mut children,
+            &poisoned,
+        )?;
         thread::sleep(std::time::Duration::from_nanos(100));
-        if poisoned.should_stop() {
-            tracker.stop();
-        } else if end_completed_child_ids && !end_trace {
-            if index_child_ids != usize::MAX {
-                // run select once more to pick up more eventheaders from trace_receiver
-                yield_now();
-                continue;
-            }
-            if end_spawned_child_ids {
-                tracker.stop();
-            }
+        if index_child_ids != usize::MAX {
+            // run select once more to pick up more eventheaders from trace_receiver
+            yield_now();
+            continue;
         }
-        if !to_verify.is_empty() {
+        if poisoned.should_stop() || proc_receivers.should_stop_trace() {
+            tracker.stop();
+        }
+        if !rules_to_verify.is_empty() {
             let mut reverify = Vec::new();
-            for (child_id, rule_id, rule_name) in to_verify.iter() {
+            for (child_id, rule_id, rule_name) in rules_to_verify.iter() {
                 if !deleted_child_procs.contains(&child_id) {
                     reverify.push((*child_id, *rule_id, rule_name.clone()));
                     continue;
@@ -678,62 +782,15 @@ fn listen_to_processes(
                     poisoned.update_poisoned(2);
                 }
             }
-            to_verify.reverify(reverify);
+            rules_to_verify.reverify(reverify);
         }
         if poisoned.should_stop() {
             break;
         }
-        if end_completed_child_ids && end_trace && end_spawned_child_ids {
+        if proc_receivers.is_empty() {
             break;
         }
         yield_now();
-    }
-    Ok(())
-}
-
-fn handle_trace(
-    root: &Path,
-    //io_conn: &mut Connection,
-    io_conn: &mut IoConn,
-    deleted_child_procs: &mut std::collections::BTreeSet<u32>,
-    evt_header: EventHeader,
-) {
-    //dir_children_set.insert(p);
-    let process_id = evt_header.get_process_id();
-    let event_type = evt_header.get_event_type();
-    if event_type == EventType::ProcessDeletion as _ {
-        deleted_child_procs.insert(process_id);
-    }
-    io_conn
-        .insert_trace(root, &evt_header)
-        .expect("Failed to insert trace");
-}
-
-fn handle_childids(
-    process_checker: &mut ProcessIOChecker,
-    child_id: u32,
-    rule_id: i64,
-    rule_name: String,
-    succeeded: bool,
-    rules_to_verify: &mut RulesToVerify,
-) -> Result<()> {
-    log::info!(
-        "Child id {} finished executing rule: {}",
-        child_id,
-        rule_name
-    );
-    if succeeded {
-        rules_to_verify.add(child_id, rule_id, rule_name);
-    } else {
-        debug!("Error running rule: {}", rule_name);
-        process_checker.mark_failed(rule_id as _).map_err(|e| {
-            eyre!(
-                "Could not write failed rule {} with id :{} to db, \n {}",
-                rule_name,
-                rule_id,
-                e.to_string()
-            )
-        })?;
     }
     Ok(())
 }
