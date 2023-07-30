@@ -1,17 +1,18 @@
 extern crate bimap;
 extern crate clap;
+extern crate console;
 extern crate crossbeam;
 extern crate ctrlc;
 extern crate env_logger;
 extern crate execute as ex;
 extern crate eyre;
 extern crate incremental_topo;
+extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
 extern crate regex;
-extern crate termcolor;
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
@@ -32,6 +33,7 @@ use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::WaitGroup;
 use crossbeam::thread;
 use eyre::{eyre, Result};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::{Connection, Row};
 use walkdir::DirEntry;
 use walkdir::WalkDir;
@@ -48,6 +50,116 @@ mod db;
 mod execute;
 mod parse;
 
+#[derive(Clone)]
+pub(crate) struct TermProgress {
+    mb: MultiProgress,
+    pb_main: ProgressBar,
+}
+
+impl TermProgress {
+    pub fn new(msg: &'static str) -> Self {
+        let pb_main = ProgressBar::new_spinner();
+
+        let mb = MultiProgress::new();
+        let pb_main = mb.add(pb_main);
+        TermProgress { mb, pb_main }.set_main_with_ticker(msg)
+    }
+
+    pub fn get_main(&self) -> ProgressBar {
+        self.pb_main.clone()
+    }
+
+    pub fn make_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
+        let pb_main = ProgressBar::new(len);
+        let sty_main =
+            ProgressStyle::with_template("{bar:40.green/yellow} [{elapsed}] {pos:>4}/{len:4}")
+                .unwrap();
+        pb_main.set_style(sty_main);
+        pb_main.set_message(msg);
+        let _ = self.mb.clear();
+        self.mb.add(pb_main.clone());
+        pb_main
+    }
+    pub fn make_progress_bar(&self, msg: &'static str) -> ProgressBar {
+        let pb = ProgressBar::new_spinner();
+        pb.enable_steady_tick(Duration::from_millis(120));
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.blue} [{elapsed}] {msg}")
+                .unwrap()
+                // For more spinners check out the cli-spinners project:
+                // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
+                .tick_strings(&["+", "x", "*"]),
+        );
+        pb.set_message(msg);
+        self.mb.add(pb)
+    }
+
+    pub fn set_main_with_len(mut self, msg: &'static str, len: u64) -> TermProgress {
+        let pb_main = ProgressBar::new(len);
+        let sty_main =
+            ProgressStyle::with_template("{bar:40.green/yellow} {eta} {pos:>4}/{len:4}").unwrap();
+        pb_main.set_style(sty_main);
+        pb_main.set_message(msg);
+        self.clear();
+        self.pb_main = pb_main;
+        self
+    }
+
+    fn set_main_with_ticker(self, msg: &'static str) -> TermProgress {
+        self.pb_main.enable_steady_tick(Duration::from_millis(120));
+        self.pb_main.set_style(
+            ProgressStyle::with_template("{spinner:.green} [{elapsed}] {msg}")
+                .unwrap()
+                .tick_strings(&["+", "x", "*"]),
+        );
+        self.pb_main.set_message(msg);
+        self
+    }
+
+    pub fn tick(&self, pb: &ProgressBar) {
+        if let Some(l) = pb.length() {
+            if l > pb.position() {
+                pb.inc(1);
+            }
+        } else {
+            pb.tick();
+        }
+        if let Some(l) = self.pb_main.length() {
+            if l > pb.position() {
+                pb.inc(1);
+            }
+        } else {
+            pb.tick();
+        }
+    }
+
+    pub fn finish(&self, pb: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
+        pb.finish_with_message(msg);
+    }
+
+    pub fn abandon(&self, pb: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
+        if let Some(_) = pb.length() {
+            pb.abandon_with_message(msg);
+        } else {
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.red} {msg}")
+                    .unwrap()
+                    // For more spinners check out the cli-spinners project:
+                    // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
+                    .tick_strings(&["+", "x", "*"]),
+            );
+            pb.abandon_with_message(msg);
+        }
+    }
+
+    pub fn set_message(&self, msg: &str) {
+        self.mb.println(msg).expect("Failed to print message");
+    }
+
+    pub fn clear(&self) {
+        self.mb.clear().expect("Failed to clear progress bars");
+    }
+}
 const MAX_THRS_NODES: u8 = 4;
 const MAX_THRS_DIRS: u8 = 10;
 
@@ -139,9 +251,10 @@ fn main() -> Result<()> {
                         "Tup database is not initialized, use `tup init' to initialize",
                     ));
                 }
-                println!("Scanning for files");
                 let root = current_dir()?;
-                match scan_root(root.as_path(), &mut conn) {
+
+                let term_progress = TermProgress::new("Scanning for files");
+                match scan_root(root.as_path(), &mut conn, &term_progress) {
                     Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
@@ -150,20 +263,23 @@ fn main() -> Result<()> {
                 let root = current_dir()?;
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
-                let tupfiles = scan_and_get_tupfiles(&root, &mut connection)?;
-                parse_tupfiles_in_db(connection, tupfiles, root.as_path())?;
+                let term_progress = TermProgress::new("Scanning ");
+                let tupfiles = scan_and_get_tupfiles(&root, &mut connection, &term_progress)?;
+                parse_tupfiles_in_db(connection, tupfiles, root.as_path(), term_progress)?;
             }
             Action::Upd { target, keep_going } => {
                 println!("Updating db {}", target.join(" "));
                 let root = current_dir()?;
+                let term_progress = TermProgress::new("Building ");
                 {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
-                    let tupfiles = scan_and_get_tupfiles(&root, &mut conn)?;
-                    parse_tupfiles_in_db(conn, tupfiles, root.as_path())?;
+                    let tupfiles = scan_and_get_tupfiles(&root, &mut conn, &term_progress)?;
+                    parse_tupfiles_in_db(conn, tupfiles, root.as_path(), term_progress.clone())?;
+                    term_progress.clear();
                 }
 
-                execute::execute_targets(&target, keep_going, root)?;
+                execute::execute_targets(&target, keep_going, root, &term_progress)?;
                 // receive events from subprocesses.
                 //conn.remove_modified_list()?;
 
@@ -176,21 +292,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn scan_and_get_tupfiles(root: &PathBuf, connection: &mut Connection) -> Result<Vec<Node>> {
+fn scan_and_get_tupfiles(
+    root: &PathBuf,
+    connection: &mut Connection,
+    term_progress: &TermProgress,
+) -> Result<Vec<Node>> {
     let mut conn = connection;
     if !is_initialized(&conn, "Node") {
         return Err(eyre!(
             "Tup database is not initialized, use `tup init' to initialize",
         ));
     }
-    println!("Parsing tupfiles in database");
-    scan_root(root.as_path(), &mut conn)?;
+    scan_root(root.as_path(), &mut conn, &term_progress)?;
+    term_progress.clear();
     gather_tupfiles(&mut conn)
 }
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
-fn scan_root(root: &Path, conn: &mut Connection) -> Result<()> {
-    insert_direntries(root, conn)
+fn scan_root(root: &Path, conn: &mut Connection, term_progress: &TermProgress) -> Result<()> {
+    insert_direntries(root, conn, term_progress)
 }
 
 // WIP... delete files and rules in db that arent in the filesystem or in use
@@ -434,7 +554,11 @@ fn send_children(mut dir_children: DirChildren, pid: i64, ds: &Sender<ProtoNode>
     Ok(())
 }
 /// insert directory entries into Node table if not already added.
-fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
+fn insert_direntries(
+    root: &Path,
+    conn: &mut Connection,
+    term_progress: &TermProgress,
+) -> Result<()> {
     log::debug!("Inserting/updatng directory entries to db");
     db::create_temptables(conn)?;
     {
@@ -449,6 +573,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
         conn.add_to_present_prepare()?.add_to_present_exec(n, Dir)?;
     }
 
+    let pb = term_progress.pb_main.clone();
     // Begin processessing
     thread::scope(|s| -> Result<()> {
         let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
@@ -464,7 +589,7 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
         let root_hp = HashedPath::from(root.to_path_buf());
         let root_hash_path = root_hp.clone();
         dir_id_by_path.insert(root_hp, 1);
-        println!("root:{:?}", root.to_path_buf());
+        //println!("root:{:?}", root.to_path_buf());
         {
             s.spawn(move |_| -> Result<()> {
                 let mut end_dirs = false;
@@ -579,11 +704,15 @@ fn insert_direntries(root: &Path, conn: &mut Connection) -> Result<()> {
             // hidden in a corner is this thread below that works with sqlite db to upsert nodes
             // Nodes are expected to have parent dir ids.
             // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
+            let pb = pb.clone();
             s.spawn(move |_| -> Result<()> {
-                let res = add_modify_nodes(conn, nodereceiver, dirid_sender);
+                let res = add_modify_nodes(conn, nodereceiver, dirid_sender, &pb);
                 log::debug!("finished adding nodes");
                 if res.is_err() {
-                    log::debug!("with Err:{:?}", res)
+                    log::error!("Error:{:?}", res);
+                    term_progress.abandon(&pb, " Errors encountered during scanning.")
+                } else {
+                    term_progress.finish(&pb, "✔ Finished scanning");
                 }
                 res
             });
@@ -628,6 +757,7 @@ fn add_modify_nodes(
     conn: &mut Connection,
     nodereceiver: Receiver<NodeAtPath>,
     dirid_sender: Sender<(HashedPath, i64)>,
+    progressbar: &ProgressBar,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     {
@@ -644,6 +774,7 @@ fn add_modify_nodes(
             } else {
                 find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
             }
+            progressbar.tick();
         }
     }
     tx.populate_delete_list()?;

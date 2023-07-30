@@ -148,7 +148,7 @@ impl DynDepTracker {
                                 let ppid = gen_proc(parent_id);
                                 if parent_id == root_process_id || parents.contains_key(&ppid) {
                                     if active_processtreeids.insert(processid) {
-                                        println!("Child process id: {}", processid);
+                                        debug!("Child process id: {}", processid);
 
                                         let cur_id: i64 = gen_proc(processid);
                                         numchildren_and_self.insert(

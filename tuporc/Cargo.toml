@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release-with-debug]
+inherits = "release"
+debug = true
 
 [dependencies]
 clap = { version = "4.3.9", features = ["derive"] }
@@ -22,5 +25,7 @@ pathdiff = "0.2.1"
 ctrlc = "3.4.0"
 num_cpus = "1.16.0"
 tupetw = { path = "../tupetw" }
-termcolor = "1.2.0"
 regex = "1.5.4"
+indicatif = "0.17.5"
+console = "0.15.1"
+
