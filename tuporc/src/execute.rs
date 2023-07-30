@@ -14,6 +14,7 @@ use crossbeam::channel::{Receiver, Select, SelectedOperation};
 use ex::shell;
 use eyre::{eyre, Result};
 use incremental_topo::IncrementalTopo;
+use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
@@ -21,7 +22,10 @@ use rusqlite::Connection;
 use tupetw::{DynDepTracker, EventHeader, EventType};
 
 use crate::db::RowType::Excluded;
-use crate::db::{ForEachClauses, LibSqlExec, LibSqlPrepare, Node, RowType, SqlStatement};
+use crate::db::{
+    ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements, Node, RowType, SqlStatement,
+};
+use crate::TermProgress;
 
 #[derive(Debug, Clone)]
 struct PoisonedState {
@@ -56,11 +60,16 @@ impl PoisonedState {
     }
 }
 
-pub fn prepare_for_execution(
+fn prepare_for_execution(
     conn: &mut Connection,
+    term_progress: &TermProgress,
 ) -> Result<(IncrementalTopo, BiHashMap<i32, incremental_topo::Node>)> {
     let mut dag = IncrementalTopo::new();
     let mut unique_node_ids = HashMap::new();
+    term_progress.clear();
+    term_progress.set_message("Preparing for execution");
+    let pbar = term_progress.make_progress_bar("Adding edges..");
+    //term_progress.set_main_with_len( "..", 1);
     {
         let add_edge = |x, y| -> Result<()> {
             let node1 = unique_node_ids
@@ -73,14 +82,17 @@ pub fn prepare_for_execution(
                 .clone();
             let no_cyclic_dep = dag.add_dependency(node1, node2)?;
             if !no_cyclic_dep {
+                term_progress.abandon(&pbar, "Cyclic dependency detected!");
                 Err(eyre!("Cyclic dependency detected!"))
             } else {
+                term_progress.tick(&pbar);
                 Ok(())
             }
         };
 
         conn.for_each_link(add_edge)?
     }
+    term_progress.finish(&pbar, "✔ Done adding edges");
     Ok((
         dag,
         BiHashMap::<i32, incremental_topo::Node>::from_iter(
@@ -89,10 +101,15 @@ pub fn prepare_for_execution(
     ))
 }
 
-pub fn execute_targets(target: &Vec<String>, keep_going: bool, root: PathBuf) -> Result<()> {
+pub(crate) fn execute_targets(
+    target: &Vec<String>,
+    keep_going: bool,
+    root: PathBuf,
+    term_progress: &TermProgress,
+) -> Result<()> {
     let mut conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");
-    let (dag, node_bimap) = prepare_for_execution(&mut conn)?;
+    let (dag, node_bimap) = prepare_for_execution(&mut conn, &term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
@@ -109,6 +126,7 @@ pub fn execute_targets(target: &Vec<String>, keep_going: bool, root: PathBuf) ->
         root.as_path(),
         &target,
         keep_going,
+        term_progress,
     )?;
     Ok(())
 }
@@ -179,14 +197,16 @@ impl ProcReceivers {
                 rules_to_verify.add(child_id, rule_id, rule_name);
             } else {
                 debug!("Error running rule: {}", rule_name);
-                process_checker.mark_failed(rule_id as _).map_err(|e| {
-                    eyre!(
-                        "Could not write failed rule {} with id :{} to db, \n {}",
-                        rule_name,
-                        rule_id,
-                        e.to_string()
-                    )
-                })?;
+                process_checker
+                    .mark_rule_succeeded(rule_id as _)
+                    .map_err(|e| {
+                        eyre!(
+                            "Could not write failed rule {} with id :{} to db, \n {}",
+                            rule_name,
+                            rule_id,
+                            e.to_string()
+                        )
+                    })?;
             }
         }
         Ok(end_receive)
@@ -300,7 +320,7 @@ impl ProcReceivers {
     }
 }
 
-pub fn exec_rules_to_run(
+fn exec_rules_to_run(
     mut conn: Connection,
     mut rule_nodes: Vec<Node>,
     fwd_refs: &BiMap<i32, incremental_topo::Node>,
@@ -308,6 +328,7 @@ pub fn exec_rules_to_run(
     root: &Path,
     target: &Vec<String>,
     keep_going: bool,
+    term_progress: &TermProgress,
 ) -> Result<()> {
     // order the rules based on their dependencies
     let target_ids = conn.get_target_ids(root, target)?;
@@ -315,6 +336,7 @@ pub fn exec_rules_to_run(
     let (completed_child_id_sender, completed_child_id_receiver) = crossbeam::channel::unbounded();
     let (spawned_child_id_sender, spawned_child_id_receiver) = crossbeam::channel::unbounded();
     let mut valid_rules = Vec::new();
+
     if target_ids.is_empty() {
         valid_rules = rule_nodes;
     } else {
@@ -376,6 +398,7 @@ pub fn exec_rules_to_run(
     }
     let poisoned = PoisonedState::new(keep_going);
     let num_threads = std::cmp::min(num_cpus::get(), valid_rules.len());
+    let mut pbars: Vec<ProgressBar> = Vec::new();
     {
         let poisoned = poisoned.clone();
         ctrlc::set_handler(move || poisoned.force_poisoned())
@@ -398,13 +421,6 @@ pub fn exec_rules_to_run(
         }
     }
     let mut min_idx = 0;
-    /* let mut stream = termcolor::BufferedStandardStream::stdout(termcolor::ColorChoice::Always);
-    stream.set_color(
-        termcolor::ColorSpec::new()
-            .set_fg(Some(termcolor::Color::Green))
-            .set_bold(true),
-    )
-        .unwrap(); */
 
     let rule_for_child_id = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
@@ -424,8 +440,10 @@ pub fn exec_rules_to_run(
                 {
                     eprintln!("Error while listening to processes: {}", e);
                     poisoned.force_poisoned();
+                    conn.prune_modified_list()?;
                     return Err(e);
                 }
+                conn.prune_modified_list()?;
                 Ok(())
             });
         }
@@ -449,6 +467,9 @@ pub fn exec_rules_to_run(
                     let rule_id = rule_node.get_id();
                     let rule_name = rule_node.get_name();
                     completed_child_id_sender.send((0, (rule_id, rule_name.to_owned(), false)))?;
+                    for pb in pbars {
+                        pb.abandon();
+                    }
                     eyre::bail!("Aborted executing rule: \n{}", rule_name)
                 }
                 let mut cmd = shell(rule_node.get_name());
@@ -483,20 +504,23 @@ pub fn exec_rules_to_run(
                 let completed_child_id_sender = completed_child_id_sender.clone();
                 let rule_for_child_id = rule_for_child_id.clone();
                 let wg = wg.clone();
+                let pbar = term_progress.make_len_progress_bar("..", children.len() as u64);
+                pbars.push(pbar.clone());
                 s.spawn(move |_| -> Result<()> {
-                    let (finished, failed) = wait_for_children(keep_going, poisoned, children)?;
+                    let (finished, failed) =
+                        wait_for_children(poisoned, children, &pbar, &term_progress)?;
                     for (id, succeeded) in finished
                         .iter()
                         .map(|i| (*i, true))
                         .chain(failed.iter().map(|j| (*j, false)))
                     {
                         let rule_for_child_id = rule_for_child_id.read();
-
                         if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
                             completed_child_id_sender
                                 .send((id, (rule_id, rule_name, succeeded)))?;
                         }
                     }
+                    pbar.finish();
                     drop(wg);
                     Ok(())
                 });
@@ -507,6 +531,9 @@ pub fn exec_rules_to_run(
             if poisoned.should_stop() {
                 drop(completed_child_id_sender);
                 drop(spawned_child_id_sender);
+                for pb in pbars {
+                    pb.finish();
+                }
                 eyre::bail!("Stopping further rule executions");
             }
         } // min_topo_order..max topo order
@@ -536,9 +563,10 @@ fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String)>>>) -> Vec<u32> {
 }
 
 fn wait_for_children(
-    _keep_going: bool,
     poisoned: PoisonedState,
     mut children: Vec<Arc<Mutex<(Child, String)>>>,
+    pbar: &ProgressBar,
+    term_progress: &TermProgress,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let (mut finished, mut failed) = (Vec::new(), Vec::new());
     while !children.is_empty() {
@@ -557,6 +585,7 @@ fn wait_for_children(
                     debug!("finished executing rule: \n{:?}", ch.1);
                     finished.push(id);
                 }
+                term_progress.tick(pbar);
             } else {
                 tryagain.push(child.clone());
             }
@@ -565,6 +594,7 @@ fn wait_for_children(
         yield_now();
         if !children.is_empty() {
             thread::sleep(std::time::Duration::from_nanos(100));
+            // kill the remaining children..
             if poisoned.should_stop() {
                 failed.extend(kill_poisoned(&children).drain(..));
                 break;
@@ -580,7 +610,7 @@ struct ProcessIOChecker<'a> {
     fetch_id_stmt: SqlStatement<'a>,
     fetch_dirid_stmt: SqlStatement<'a>,
     add_link_stmt: SqlStatement<'a>,
-    rule_failed_stmt: SqlStatement<'a>,
+    rule_succeeded_stmt: SqlStatement<'a>,
 }
 
 struct IoConn<'b> {
@@ -618,7 +648,7 @@ impl<'a> ProcessIOChecker<'a> {
             fetch_id_stmt: conn.fetch_nodeid_prepare()?,
             fetch_dirid_stmt: conn.fetch_dirid_prepare()?,
             add_link_stmt: conn.insert_link_prepare()?,
-            rule_failed_stmt: conn.mark_rule_failed_prepare()?,
+            rule_succeeded_stmt: conn.mark_rule_success_prepare()?,
         };
         return Ok(s);
     }
@@ -641,8 +671,8 @@ impl<'a> ProcessIOChecker<'a> {
         Ok(nodeid)
     }
 
-    fn mark_failed(&mut self, rule_id: i64) -> Result<()> {
-        self.rule_failed_stmt.mark_rule_failed(rule_id)?;
+    fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()> {
+        self.rule_succeeded_stmt.mark_rule_succeeded(rule_id)?;
         Ok(())
     }
 
@@ -735,7 +765,7 @@ fn listen_to_processes(
     let mut io_conn = IoConn::new(&mut io_conn)?;
     let mut children = std::collections::BTreeSet::new();
     loop {
-        let (index_child_ids, _, _) = proc_receivers.process_sel(
+        proc_receivers.process_sel(
             &mut process_checker,
             &mut rules_to_verify,
             root,
@@ -745,11 +775,6 @@ fn listen_to_processes(
             &poisoned,
         )?;
         thread::sleep(std::time::Duration::from_nanos(100));
-        if index_child_ids != usize::MAX {
-            // run select once more to pick up more eventheaders from trace_receiver
-            yield_now();
-            continue;
-        }
         if poisoned.should_stop() || proc_receivers.should_stop_trace() {
             tracker.stop();
         }
@@ -769,17 +794,18 @@ fn listen_to_processes(
                     &mut process_checker,
                 ) {
                     eprintln!("Error verifying rule io {}\n{}", rule_name, e.to_string());
+                    poisoned.update_poisoned(2);
+                } else {
                     process_checker
-                        .mark_failed(*rule_id as _)
+                        .mark_rule_succeeded(*rule_id as _)
                         .unwrap_or_else(|e| {
                             panic!(
-                                "Could not write failed rule {} with id :{} to db, \n {}",
+                                "Could not write success of rule {} with id :{} to db, \n {}",
                                 rule_name,
                                 rule_id,
                                 e.to_string()
                             )
                         });
-                    poisoned.update_poisoned(2);
                 }
             }
             rules_to_verify.reverify(reverify);

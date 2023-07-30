@@ -262,14 +262,14 @@ pub enum StatementType {
     DeleteId,
     DeleteNormalRuleLinks,
     ImmediateDeps,
-    FailedRule,
+    RuleSuccess,
     RuleDepRules,
     RestoreDeleted,
     FetchIO,
     FetchEnvsForRule,
     RemovePresents,
-    RemoveFailed,
-    AddFailedToMod,
+    RemoveSuccess,
+    PruneMod,
     FetchOutputsForRule,
     FetchInputsForRule,
     InsertTrace,
@@ -285,8 +285,8 @@ pub(crate) trait LibSqlPrepare {
     fn add_to_delete_prepare(&self) -> Result<SqlStatement>;
     fn add_to_present_prepare(&self) -> Result<SqlStatement>;
     fn remove_presents_prepare(&self) -> Result<SqlStatement>;
-    fn remove_failed_prepare(&self) -> Result<SqlStatement>;
-    fn insert_failed_to_modified_prepare(&self) -> Result<SqlStatement>;
+    fn remove_success_prepare(&self) -> Result<SqlStatement>;
+    fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
@@ -314,7 +314,7 @@ pub(crate) trait LibSqlPrepare {
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
-    fn mark_rule_failed_prepare(&self) -> Result<SqlStatement>;
+    fn mark_rule_success_prepare(&self) -> Result<SqlStatement>;
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
     fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
     fn mark_deleted_prepare(&self) -> Result<SqlStatement>;
@@ -393,7 +393,7 @@ pub(crate) trait LibSqlExec {
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     /// deleted nodes that are outputs of a rule with the given rule id
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
-    fn mark_rule_failed(&mut self, rule_id: i64) -> Result<()>;
+    fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()>;
     /// fetch all tupfiles that depend on the given rule (usually via a group output)
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
     /// delete normal links between nodes that are inputs and outputs of a rule with the given rule id
@@ -563,22 +563,24 @@ impl LibSqlPrepare for Connection {
             tok: RemovePresents,
         })
     }
-    fn remove_failed_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("DELETE * from FailedList")?;
+
+    fn remove_success_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE * from SuccessList")?;
         Ok(SqlStatement {
             stmt,
-            tok: RemoveFailed,
+            tok: RemoveSuccess,
         })
     }
 
-    fn insert_failed_to_modified_prepare(&self) -> Result<SqlStatement> {
-        let rtype = RowType::Rule as u8;
+    // remove rules that succeeded and their inputs from the modify list
+    fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare(&*format!(
-            "INSERT or IGNORE into ModifyList(id, type) SELECT id, {rtype} from FailedList"
+            "DELETE from ModifyList where id in (SELECT id from SuccessList \
+             UNION SELECT from_id from NormalLink where to_id in (SELECT id from SuccessList))"
         ))?;
         Ok(SqlStatement {
             stmt,
-            tok: AddFailedToMod,
+            tok: PruneMod,
         })
     }
 
@@ -809,11 +811,11 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn mark_rule_failed_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(" INSERT or IGNORE into FailedList (id) Values(?)")?;
+    fn mark_rule_success_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(" INSERT or IGNORE into SuccessList (id) SELECT ? UNION ALL SELECT from_id from NormalLink where to_id=?")?;
         Ok(SqlStatement {
             stmt,
-            tok: FailedRule,
+            tok: RuleSuccess,
         })
     }
 
@@ -946,14 +948,14 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn remove_failed_exec(&mut self) -> Result<()> {
-        eyre::ensure!(self.tok == RemoveFailed, "wrong token for removing failed");
+        eyre::ensure!(self.tok == RemoveSuccess, "wrong token for removing failed");
         self.stmt.execute([])?;
         Ok(())
     }
 
     fn add_failed_to_modified_exec(&mut self) -> Result<()> {
         eyre::ensure!(
-            self.tok == AddFailedToMod,
+            self.tok == PruneMod,
             "wrong token for adding failed to modified"
         );
         self.stmt.execute([])?;
@@ -1193,12 +1195,12 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute([rule_id])?;
         Ok(())
     }
-    fn mark_rule_failed(&mut self, rule_id: i64) -> Result<()> {
+    fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()> {
         eyre::ensure!(
-            self.tok == FailedRule,
+            self.tok == RuleSuccess,
             "wrong token for mark immediate rule as failed"
         );
-        self.stmt.execute([rule_id])?;
+        self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
@@ -1719,14 +1721,23 @@ impl MiscStatements for Connection {
             // note that glob patterns are mapped to Tupfiles in  NormalLink table
             // which will then trigger a loading of these tupfiles
             let mut stmt = self.prepare(&*format!(
-                "INSERT or IGNORE into ModifyList  SELECT globPatterns.id, {globtype}
-FROM Node AS n
-JOIN Node AS globPatterns
-    ON n.dir = globPatterns.dir
-WHERE (n.type = {ftype} or n.type = {gentype})
-AND globPatterns.type = {globtype}
-AND n.name GLOB globPatterns.name
-AND n.id in (SELECT id from DeleteList UNION SELECT id from ModifyList)"
+                "INSERT OR IGNORE INTO ModifyList
+SELECT globPatterns.id, {globtype}
+FROM Node AS globPatterns
+WHERE globPatterns.type = {globtype}
+AND EXISTS (
+    SELECT 1
+    FROM Node AS n
+    WHERE
+    n.id IN (
+        SELECT id FROM DeleteList where type = {ftype} or type = {gentype}
+        UNION
+        SELECT id FROM ModifyList where type = {ftype} or type = {gentype}
+    )
+    AND n.dir = globPatterns.dir
+    AND n.name GLOB globPatterns.name
+)
+"
             ))?;
             stmt.execute([])?;
 
@@ -1784,7 +1795,7 @@ FROM NodeChain;"
 
     fn prune_modified_list(&self) -> Result<()> {
         let mut stmt =
-            self.prepare_cached("DELETE FROM ModifyList WHERE id in (SELECT id from DeleteList)")?;
+            self.prepare_cached("DELETE FROM ModifyList WHERE id in (SELECT id from DeleteList union SELECT id from SuccessList)")?;
         stmt.execute([])?;
         Ok(())
     }

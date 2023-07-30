@@ -24,7 +24,7 @@ use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
     create_path_buf_temptable, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
 };
-use crate::{get_dir_id, LibSqlPrepare, Node, RowType, MAX_THRS_DIRS};
+use crate::{get_dir_id, LibSqlPrepare, Node, RowType, TermProgress, MAX_THRS_DIRS};
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
@@ -166,18 +166,20 @@ impl PathSearcher for DbPathSearcher {
         &self.psx
     }
 
-    fn merge(&mut self, o: &impl OutputHandler) -> Result<(), Error> {
-        OutputHandler::merge(&mut self.psx, o)
+    fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
+        OutputHandler::merge(&mut self.psx, p, o)
     }
 }
 
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
-pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
+pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     connection: Connection,
     tupfiles: Vec<Node>,
     root: P,
+    mut term_progress: TermProgress,
 ) -> Result<Vec<ResolvedLink>> {
     let mut crossref = CrossRefMaps::default();
+    term_progress = term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
     let (arts, mut rwbufs, mut outs) = {
         let conn = connection;
 
@@ -199,21 +201,17 @@ pub fn parse_tupfiles_in_db<P: AsRef<Path>>(
                     if visited.insert(tupfile) {
                         let rules = s.fetch_rule_nodes_by_dirid(dir)?;
                         for r in rules {
-                            //db.conn.
-                            /*                            let deps = fetch_rule_deps.fetch_dependant_tupfiles(r.get_id())?;
-                                                        tupfile_to_process
-                                                            .extend(deps.into_iter().filter(|n| !visited.contains(&n)));
-                            */
                             del_normal_link.delete_normal_rule_links(r.get_id())?;
                             del_outputs.mark_rule_outputs_deleted(r.get_id())?;
                         }
                     }
+                    //pb.inc(1);
                 }
             }
             tx.commit()?;
         }
         let tupfiles: Vec<_> = visited.into_iter().collect();
-        let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice())?;
+        let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice(), &term_progress)?;
         let arts = parser.reresolve(arts)?;
         for tup_node in tupfiles.iter() {
             let tupid = *parser
@@ -303,48 +301,68 @@ pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
 fn gather_rules_from_tupfiles(
     p: &mut TupParser<DbPathSearcher>,
     tupfiles: &[Node],
+    term_progress: &TermProgress,
 ) -> Result<Artifacts> {
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let mut new_arts = Artifacts::new();
     let (sender, receiver) = crossbeam::channel::unbounded();
+    term_progress.set_message("Parsing Tupfiles");
     crossbeam::thread::scope(|s| -> Result<Artifacts> {
         let wg = WaitGroup::new();
         for ithread in 0..MAX_THRS_DIRS {
-            for tupfile in tupfiles
-                .iter()
-                .filter(|x| !x.get_name().ends_with(".lua"))
-                .cloned()
-                .skip(ithread as usize)
-                .step_by(MAX_THRS_DIRS as usize)
-            {
-                let mut p = p.clone();
-                let sender = sender.clone();
-                let wg = wg.clone();
-                s.spawn(move |_| -> Result<()> {
-                    p.send_tupfile(tupfile.get_name(), sender)
+            let mut p = p.clone();
+            let sender = sender.clone();
+            let wg = wg.clone();
+            let pb = term_progress.make_progress_bar("_");
+            s.spawn(move |_| -> Result<()> {
+                for tupfile in tupfiles
+                    .iter()
+                    .filter(|x| !x.get_name().ends_with(".lua"))
+                    .cloned()
+                    .skip(ithread as usize)
+                    .step_by(MAX_THRS_DIRS as usize)
+                {
+                    pb.set_message(format!("Parsing :{}", tupfile.get_name()));
+                    p.parse_tupfile(tupfile.get_name(), sender.clone())
                         .map_err(|error| {
                             let rwbuf = p.read_write_buffers();
                             let display_str = rwbuf.display_str(&error);
+                            let tupfile_name = tupfile.get_name();
+                            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
                             Report::new(error).wrap_err(format!(
                                 "Error while parsing tupfile: {}:\n {}",
                                 tupfile.get_name(),
                                 display_str
                             ))
                         })?;
-                    drop(wg);
-                    Ok(())
-                });
-            }
+                    pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+                    term_progress.tick(&pb);
+                }
+                drop(wg);
+                pb.set_message("Done");
+                Ok(())
+            });
         }
         drop(sender);
+
+        let pb = term_progress.get_main();
+        pb.set_message("Resolving statements..");
         for tupfile_lua in tupfiles
             .iter()
             .filter(|x| x.get_name().ends_with(".lua"))
             .cloned()
         {
-            let arts = p.parse(tupfile_lua.get_name())?;
+            let path = tupfile_lua.get_name();
+            pb.set_message(format!("Parsing :{}", path));
+            let arts = p.parse(path).map_err(|ref e| {
+                term_progress.abandon(&pb, format!("Error parsing {path}"));
+                eyre!("Error: {}", p.read_write_buffers().display_str(e))
+            })?;
             new_arts.extend(arts);
+            term_progress.tick(&pb);
+            pb.set_message(format!("Done parsing {}", path));
         }
+        pb.set_message("Resolving statements..");
         new_arts.extend(p.receive_resolved_statements(receiver).map_err(|error| {
             let read_write_buffers = p.read_write_buffers();
             let tup_node = read_write_buffers
@@ -352,12 +370,15 @@ fn gather_rules_from_tupfiles(
                 .to_string_lossy()
                 .to_string();
             let display_str = read_write_buffers.display_str(error.get_error_ref());
+            term_progress.abandon(&pb, format!("Error parsing {tup_node}"));
             eyre!(
                 "Unable to resolve statements in tupfile {}:\n{}",
                 tup_node.as_str(),
                 display_str,
             )
         })?);
+        term_progress.finish(&pb, "Done parsing tupfiles");
+        term_progress.clear();
         wg.wait();
         Ok(new_arts)
     })
@@ -704,10 +725,7 @@ fn insert_nodes(
                 .ok_or_else(|| eyre!("descriptor not found for path:{:?}", parent))?;
             let (dir, par_dir) = {
                 let x = find_dirid_with_par.fetch_dirid_with_par(parent);
-                if x.is_err() {
-                    debug!("failed to fetch dir id");
-                }
-                x?
+                x.map_err(|e| eyre!("failed to fetch dir id of {:?} due to {}", parent, e))?
             };
             crossref.add_path_xref(dir_desc, dir, par_dir);
 
@@ -769,39 +787,31 @@ fn insert_nodes(
             }
         }
         for r in arts.rules_by_tup().iter() {
-            debug!(
+            log::info!(
                 "Cross referencing inputs to insert with the db ids with same name and directory"
             );
             for rl in r.iter() {
                 for i in rl.get_sources() {
                     let inp = read_write_buf.get_input_path_str(i);
-                    let p = i.get_resolved_path_desc();
-                    if let Some(p) = p {
-                        if processed.insert(p) {
-                            if let Ok((nodeid, dirid, par_dir_id)) = find_by_path(
-                                Path::new(inp.as_str()),
-                                &mut find_nodeid,
-                                &mut find_dir_id_with_parent,
-                            ) {
-                                let parent_id = read_write_buf
-                                    .get_parent_id(p)
-                                    .ok_or_else(|| eyre!("no parent id found for:{:?}", p))?;
-                                crossref.add_path_xref(*p, nodeid, dirid);
-                                crossref.add_path_xref(parent_id, dirid, par_dir_id);
-                            } else {
-                                bail!(
-                                    "unresolved input found:{:?} for rule: {:?}",
-                                    inp,
-                                    rl.get_rule_ref()
-                                );
-                            }
-                        }
-                    } else {
-                        bail!(
-                            "unresolved input found:{:?} for rule: {:?}",
-                            p,
+                    let p = i.get_resolved_path_desc().ok_or_else(|| {
+                        eyre!(
+                            "No resolved path found for input:{:?} in rule:{:?}",
+                            inp,
                             rl.get_rule_ref()
-                        );
+                        )
+                    })?;
+                    if processed.insert(p) {
+                        let (nodeid, dirid, par_dir_id) = find_by_path(
+                            Path::new(inp.as_str()),
+                            &mut find_nodeid,
+                            &mut find_dir_id_with_parent,
+                        )
+                        .map_err(|e| eyre!("failed to find path for {:?} due to {}", inp, e))?;
+                        let parent_id = read_write_buf
+                            .get_parent_id(p)
+                            .ok_or_else(|| eyre!("no parent id found for:{:?}", p))?;
+                        crossref.add_path_xref(*p, nodeid, dirid);
+                        crossref.add_path_xref(parent_id, dirid, par_dir_id);
                     }
                 }
             }
