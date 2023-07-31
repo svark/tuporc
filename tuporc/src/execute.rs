@@ -20,10 +20,14 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
 
 use tupetw::{DynDepTracker, EventHeader, EventType};
+use tupparser::decode::{decode_group_captures, RuleRef};
+use tupparser::statements::Loc;
+use tupparser::TupPathDescriptor;
 
 use crate::db::RowType::Excluded;
 use crate::db::{
-    ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements, Node, RowType, SqlStatement,
+    AnyError, ConnWrapper, ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements, Node,
+    RowType, SqlStatement,
 };
 use crate::TermProgress;
 
@@ -69,9 +73,8 @@ fn prepare_for_execution(
     term_progress.clear();
     term_progress.set_message("Preparing for execution");
     let pbar = term_progress.make_progress_bar("Adding edges..");
-    //term_progress.set_main_with_len( "..", 1);
     {
-        let add_edge = |x, y| -> Result<()> {
+        let add_edge = |x, y| -> std::result::Result<(), AnyError> {
             let node1 = unique_node_ids
                 .entry(x)
                 .or_insert_with(|| dag.add_node())
@@ -80,14 +83,12 @@ fn prepare_for_execution(
                 .entry(y)
                 .or_insert_with(|| dag.add_node())
                 .clone();
-            let no_cyclic_dep = dag.add_dependency(node1, node2)?;
-            if !no_cyclic_dep {
+            dag.add_dependency(node1, node2).map_err(|e| {
                 term_progress.abandon(&pbar, "Cyclic dependency detected!");
-                Err(eyre!("Cyclic dependency detected!"))
-            } else {
-                term_progress.tick(&pbar);
-                Ok(())
-            }
+                AnyError::from(e.to_string())
+            })?;
+            term_progress.tick(&pbar);
+            Ok(())
         };
 
         conn.for_each_link(add_edge)?
@@ -113,7 +114,38 @@ pub(crate) fn execute_targets(
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
-    let rule_nodes = conn.rules_to_run_no_target()?;
+    let conn_wrapper = ConnWrapper::new(&conn);
+    let f = |node: &Node| -> std::result::Result<Node, AnyError> {
+        let rule_id = node.get_id();
+        let rule_ref = RuleRef::new(
+            &TupPathDescriptor::from(0),
+            &Loc::new(node.get_srcid() as _, 0),
+        );
+        let rule_string = node.get_name();
+        let new_name = decode_group_captures(
+            &conn_wrapper,
+            &rule_ref,
+            rule_id,
+            node.get_dir(),
+            rule_string,
+        )
+        .map_err(|e| {
+            AnyError::from(format!(
+                "Error decoding group captures for rule:{}\n Error:{}",
+                rule_string, e
+            ))
+        })?;
+
+        Ok(Node::new_rule(
+            node.get_id(),
+            node.get_dir(),
+            new_name,
+            node.get_display_str().to_string(),
+            node.get_flags().to_string(),
+            node.get_srcid() as _,
+        ))
+    };
+    let rule_nodes = conn.rules_to_run_no_target(f)?;
     if rule_nodes.is_empty() {
         println!("Nothing to do");
         return Ok(());
@@ -320,6 +352,40 @@ impl ProcReceivers {
     }
 }
 
+fn get_target_ids(conn: &Connection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
+    let dir = std::env::current_dir().unwrap();
+    let dirc = dir.clone();
+    let dir = pathdiff::diff_paths(dir, root).ok_or(eyre!(format!(
+        "Could not get relative path for:{:?}",
+        dirc.as_path()
+    )))?;
+    let mut fd = conn.fetch_dirid_prepare()?;
+    let mut fnode_stmt = conn.fetch_node_by_id_prepare()?;
+    let mut dirids = Vec::new();
+    for t in targets {
+        let path = dir.join(t.as_str());
+        if let Ok(id) = fd.fetch_dirid(dir.join(&targets[0])) {
+            dirids.push(id);
+        } else {
+            // get the parent dir id and fetch the node by its name
+            let parent = path
+                .parent()
+                .ok_or(eyre!(format!("Could not get parent for:{:?}", path)))?;
+            if let Some(parent_id) = fd.fetch_dirid(parent).ok() {
+                if let Ok(nodeid) = fnode_stmt.fetch_node_id(
+                    &*path.file_name().unwrap().to_string_lossy().to_string(),
+                    parent_id,
+                ) {
+                    dirids.push(nodeid);
+                } else {
+                    eyre::bail!(format!("Could not find target node id for:{:?}", path));
+                }
+            }
+        }
+    }
+    Ok(dirids)
+}
+
 fn exec_rules_to_run(
     mut conn: Connection,
     mut rule_nodes: Vec<Node>,
@@ -331,7 +397,7 @@ fn exec_rules_to_run(
     term_progress: &TermProgress,
 ) -> Result<()> {
     // order the rules based on their dependencies
-    let target_ids = conn.get_target_ids(root, target)?;
+    let target_ids = get_target_ids(&conn, root, target)?;
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
     let (completed_child_id_sender, completed_child_id_receiver) = crossbeam::channel::unbounded();
     let (spawned_child_id_sender, spawned_child_id_receiver) = crossbeam::channel::unbounded();
