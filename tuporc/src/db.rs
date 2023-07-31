@@ -1,18 +1,73 @@
 use std::cmp::Ordering;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
-use eyre::{Report, Result};
 use log::debug;
 use pathdiff::diff_paths;
-use rusqlite::{Connection, Params, Statement};
+use rusqlite::{Connection, Params, Row, Statement};
 
-use tupparser::decode::{decode_group_captures, MatchingPath, RuleRef};
-use tupparser::statements::Loc;
-use tupparser::TupPathDescriptor;
+use tupparser::decode::MatchingPath;
 
 use crate::db::StatementType::*;
-use crate::{make_node, make_tup_node};
+
+#[derive(Debug)]
+pub struct CallBackError {
+    inner: String,
+}
+
+impl CallBackError {
+    pub fn from(inner: String) -> Self {
+        Self { inner }
+    }
+}
+
+#[derive(Debug)]
+pub enum AnyError {
+    Db(rusqlite::Error),
+    CbErr(CallBackError),
+}
+
+impl Display for AnyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyError::Db(e) => e.fmt(f),
+            AnyError::CbErr(e) => e.inner.fmt(f),
+        }
+    }
+}
+
+impl Error for AnyError {}
+
+impl From<CallBackError> for AnyError {
+    fn from(value: CallBackError) -> Self {
+        AnyError::CbErr(value)
+    }
+}
+
+impl From<String> for AnyError {
+    fn from(value: String) -> Self {
+        AnyError::CbErr(CallBackError::from(value))
+    }
+}
+
+impl From<rusqlite::Error> for AnyError {
+    fn from(value: rusqlite::Error) -> Self {
+        AnyError::Db(value)
+    }
+}
+
+impl AnyError {
+    pub(crate) fn has_no_rows(&self) -> bool {
+        match self {
+            AnyError::Db(e) => e.eq(&rusqlite::Error::QueryReturnedNoRows),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) type Result<T> = std::result::Result<T, AnyError>;
 
 #[repr(u8)]
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -326,11 +381,11 @@ pub(crate) trait LibSqlPrepare {
 }
 
 pub(crate) trait LibSqlExec {
-    /// Add a node to the modify list. These are nodes(files rules, etc) that have been modified since the last run
+    /// Add a node to the modify list. These are nodes(files rules, etc.) that have been modified since the last run
     fn add_to_modify_exec(&mut self, node_id: i64, rtyp: RowType) -> Result<()>;
-    /// Add a node to the delete list. These are nodes(files rules, etc) that have been deleted since the last run
+    /// Add a node to the delete list. These are nodes(files rules, etc.) that have been deleted since the last run
     fn add_to_delete_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
-    /// Add a node to the present list. These are nodes(files rules, etc) that still exist after the last run
+    /// Add a node to the present list. These are nodes(files rules, etc.) that still exists after the last run
     fn add_to_present_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
     fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
     fn remove_presents_exec(&mut self) -> Result<()>;
@@ -338,7 +393,7 @@ pub(crate) trait LibSqlExec {
     fn add_failed_to_modified_exec(&mut self) -> Result<()>;
     /// Insert a directory node into the database
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
-    /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxillary table
+    /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxiliary table
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
     /// Insert a link between two nodes into the database. This is used to keep track of the dependencies between nodes and build a graph
     fn insert_link(
@@ -387,7 +442,7 @@ pub(crate) trait LibSqlExec {
     fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()>;
     /// update directory id for a node with the given id
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
-    /// update env value  for a env node with the given id
+    /// update env value  for an env node with the given id
     fn update_env_exec(&mut self, id: i64, val: String) -> Result<()>;
     /// delete a node with the given id
     fn delete_exec(&mut self, id: i64) -> Result<()>;
@@ -483,8 +538,9 @@ pub(crate) trait ForEachClauses {
     where
         F: FnMut(i32, i32) -> Result<()>;
     //fn populate_delete_list(&self) -> Result<()>;
-    fn rules_to_run_no_target(&self) -> Result<Vec<Node>>;
-    fn get_target_ids(&self, root: &Path, target_ids: &Vec<String>) -> Result<Vec<i64>>;
+    fn rules_to_run_no_target<F>(&self, f: F) -> Result<Vec<Node>>
+    where
+        F: FnMut(&Node) -> Result<Node>;
 }
 
 // Check if the node table exists in .tup/db
@@ -703,7 +759,13 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name = ?)")?;
+        let ftype = RowType::File as u8;
+        let gen_ftype = RowType::GenF as u8;
+        let statement: String = format!(
+            "SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name = ?) \
+         and (type = {ftype} or type = {gen_ftype})"
+        );
+        let stmt = self.prepare(statement.as_str())?;
         Ok(SqlStatement {
             stmt,
             tok: FindGlobNodes,
@@ -906,32 +968,28 @@ SELECT DISTINCT x FROM dependants));",
         })
     }
 }
-
 impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
-        eyre::ensure!(self.tok == AddToMod, "wrong token for update to modifylist");
+        assert_eq!(self.tok, AddToMod, "wrong token for update to modifylist");
         // statement ignores input if already present. So we call the method execute here rather than insert
         self.stmt.execute((id, (rtype as u8)))?;
         Ok(())
     }
     fn add_to_delete_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
-        eyre::ensure!(self.tok == AddToDel, "wrong token for update to deletelist");
+        assert_eq!(self.tok, AddToDel, "wrong token for update to deletelist");
         // statement ignores input if already present. So we call the method execute here rather than insert
         self.stmt.execute((id, (rtype as u8)))?;
         Ok(())
     }
     fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
-        eyre::ensure!(
-            self.tok == AddToPres,
-            "wrong token for update to presentlist"
-        );
+        assert_eq!(self.tok, AddToPres, "wrong token for update to presentlist");
         self.stmt.execute((id, (rtype as u8)))?;
         Ok(())
     }
 
     fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
-        eyre::ensure!(
-            self.tok == AddToTempIds,
+        assert_eq!(
+            self.tok, AddToTempIds,
             "wrong token for update to tempidslist"
         );
         self.stmt.insert((id, (rtype as u8)))?;
@@ -939,8 +997,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn remove_presents_exec(&mut self) -> Result<()> {
-        eyre::ensure!(
-            self.tok == RemovePresents,
+        assert_eq!(
+            self.tok, RemovePresents,
             "wrong token for removing presents"
         );
         self.stmt.execute([])?;
@@ -948,14 +1006,14 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn remove_failed_exec(&mut self) -> Result<()> {
-        eyre::ensure!(self.tok == RemoveSuccess, "wrong token for removing failed");
+        assert_eq!(self.tok, RemoveSuccess, "wrong token for removing failed");
         self.stmt.execute([])?;
         Ok(())
     }
 
     fn add_failed_to_modified_exec(&mut self) -> Result<()> {
-        eyre::ensure!(
-            self.tok == PruneMod,
+        assert_eq!(
+            self.tok, PruneMod,
             "wrong token for adding failed to modified"
         );
         self.stmt.execute([])?;
@@ -963,7 +1021,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64> {
-        eyre::ensure!(self.tok == InsertDir, "wrong token for Insert dir");
+        assert_eq!(self.tok, InsertDir, "wrong token for Insert dir");
         let id = self.stmt.insert([
             path_str,
             dir.to_string().as_str(),
@@ -973,8 +1031,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()> {
-        eyre::ensure!(
-            self.tok == InsertDirAux,
+        assert_eq!(
+            self.tok, InsertDirAux,
             "wrong token for Insert Dir Into DirPathBuf"
         );
         let path_str = db_path_str(path);
@@ -989,7 +1047,7 @@ impl LibSqlExec for SqlStatement<'_> {
         is_sticky: bool,
         to_type: RowType,
     ) -> Result<()> {
-        eyre::ensure!(self.tok == InsertLink, "wrong token for insert link");
+        assert_eq!(self.tok, InsertLink, "wrong token for insert link");
         debug!("Normal link: {} -> {}", from_id, to_id);
         self.stmt
             .execute((from_id, to_id, is_sticky as u8, to_type as u8))?;
@@ -997,7 +1055,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
-        eyre::ensure!(self.tok == InsertFile, "wrong token for Insert file");
+        assert_eq!(self.tok, InsertFile, "wrong token for Insert file");
         let r = self.stmt.insert((
             n.dirid,
             n.name.as_str(),
@@ -1011,13 +1069,13 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn insert_env_exec(&mut self, env: &str, val: &str) -> Result<i64> {
-        eyre::ensure!(self.tok == InsertEnv, "wrong token for Insert env");
+        assert_eq!(self.tok, InsertEnv, "wrong token for Insert env");
         let r = self.stmt.insert((env, val))?;
         Ok(r)
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64> {
-        eyre::ensure!(self.tok == FindDirId, "wrong token for find dir");
+        assert_eq!(self.tok, FindDirId, "wrong token for find dir");
         let path_str = db_path_str(p);
         let path_str = path_str.as_str();
         debug!("find dir id for :{}", path_str);
@@ -1026,8 +1084,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_dirid_with_par<P: AsRef<Path>>(&mut self, p: P) -> Result<(i64, i64)> {
-        eyre::ensure!(
-            self.tok == FindDirIdWithPar,
+        assert_eq!(
+            self.tok, FindDirIdWithPar,
             "wrong token for find dir with parent"
         );
         let path_str = db_path_str(p);
@@ -1040,7 +1098,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_group_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
-        eyre::ensure!(self.tok == FindGroupId, "wrong token for fetch groupid");
+        assert_eq!(self.tok, FindGroupId, "wrong token for fetch groupid");
         debug!("find group id for :{} at dir:{} ", node_name, dir);
         let v = self.stmt.query_row((dir, node_name), |r| {
             let v: i64 = r.get(0)?;
@@ -1050,7 +1108,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node> {
-        eyre::ensure!(self.tok == FindNode, "wrong token for fetch node");
+        assert_eq!(self.tok, FindNode, "wrong token for fetch node");
         log::info!("query for node:{:?}, {:?}", node_name, dir);
 
         let node = self.stmt.query_row((dir, node_name), make_node)?;
@@ -1058,20 +1116,20 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node> {
-        eyre::ensure!(self.tok == FindNodeById, "wrong token for fetch node by id");
+        assert_eq!(self.tok, FindNodeById, "wrong token for fetch node by id");
         let node = self.stmt.query_row([i], make_node)?;
         Ok(node)
     }
 
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
-        eyre::ensure!(self.tok == FindNodeId, "wrong token for fetch node");
+        assert_eq!(self.tok, FindNodeId, "wrong token for fetch node");
         debug!("query:{:?}, {:?}", node_name, dir);
         let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
         Ok(nodeid)
     }
 
     fn fetch_env_id(&mut self, env_name: &str) -> Result<(i64, String)> {
-        eyre::ensure!(self.tok == FindEnvId, "wrong token for fetch env");
+        assert_eq!(self.tok, FindEnvId, "wrong token for fetch env");
         debug!("query env:{:?}", env_name);
         let (nodeid, val) = self
             .stmt
@@ -1080,7 +1138,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>> {
-        eyre::ensure!(self.tok == FindRuleNodes, "wrong token for fetch nodes");
+        assert_eq!(self.tok, FindRuleNodes, "wrong token for fetch nodes");
         let mut rows = self.stmt.query([dir])?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1100,10 +1158,7 @@ impl LibSqlExec for SqlStatement<'_> {
         F: FnMut(&String) -> Option<MatchingPath>,
         P: AsRef<Path>,
     {
-        eyre::ensure!(
-            self.tok == FindGlobNodes,
-            "wrong token for fetch glob nodes"
-        );
+        assert_eq!(self.tok, FindGlobNodes, "wrong token for fetch glob nodes");
         let path_str = db_path_str(base_path);
         debug!("query glob:{:?}", gname.as_ref());
         let mut rows = self
@@ -1120,8 +1175,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>> {
-        eyre::ensure!(
-            self.tok == FindParentRule,
+        assert_eq!(
+            self.tok, FindParentRule,
             "wrong token for fetch parent rule"
         );
         let mut ids = Vec::new();
@@ -1134,26 +1189,26 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf> {
-        eyre::ensure!(self.tok == FindNodePath, "wrong token for fetch node path");
+        assert_eq!(self.tok, FindNodePath, "wrong token for fetch node path");
         let path_str: String = self.stmt.query_row([dirid], |r| r.get(0))?;
         Ok(Path::new(path_str.as_str()).join(name))
     }
 
     fn fetch_node_dir_path(&mut self, dirid: i64) -> Result<PathBuf> {
-        eyre::ensure!(self.tok == FindNodePath, "wrong token for fetch node path");
+        assert_eq!(self.tok, FindNodePath, "wrong token for fetch node path");
         let path_str: String = self.stmt.query_row([dirid], |r| r.get(0))?;
         Ok(PathBuf::from(path_str.as_str()))
     }
 
     fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()> {
-        eyre::ensure!(self.tok == UpdMTime, "wrong token for update mtime");
+        assert_eq!(self.tok, UpdMTime, "wrong token for update mtime");
         self.stmt.execute([mtime_ns, id])?;
         Ok(())
     }
 
     fn update_display_str(&mut self, id: i64, display_str: &str) -> Result<()> {
-        eyre::ensure!(
-            self.tok == UpdDisplayStr,
+        assert_eq!(
+            self.tok, UpdDisplayStr,
             "wrong token for update display string"
         );
         self.stmt.execute((display_str, id))?;
@@ -1161,53 +1216,50 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()> {
-        eyre::ensure!(self.tok == UpdFlags, "wrong token for update flags");
+        assert_eq!(self.tok, UpdFlags, "wrong token for update flags");
         self.stmt.execute((flags, id))?;
         Ok(())
     }
     fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()> {
-        eyre::ensure!(self.tok == UpdSrcId, "wrong token for srcid update");
+        assert_eq!(self.tok, UpdSrcId, "wrong token for srcid update");
         self.stmt.execute([srcid, id])?;
         Ok(())
     }
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()> {
-        eyre::ensure!(self.tok == UpdDirId, "wrong token for dirid update");
+        assert_eq!(self.tok, UpdDirId, "wrong token for dirid update");
         self.stmt.execute([dirid, id])?;
         Ok(())
     }
     fn update_env_exec(&mut self, id: i64, val: String) -> Result<()> {
-        eyre::ensure!(self.tok == UpdEnv, "wrong token for env display_str update");
+        assert_eq!(self.tok, UpdEnv, "wrong token for env display_str update");
         self.stmt.execute((id, val.as_str()))?;
         Ok(())
     }
 
     fn delete_exec(&mut self, id: i64) -> Result<()> {
-        eyre::ensure!(self.tok == DeleteId, "wrong token for delete node");
+        assert_eq!(self.tok, DeleteId, "wrong token for delete node");
         self.stmt.execute([id])?;
         Ok(())
     }
 
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()> {
-        eyre::ensure!(
-            self.tok == ImmediateDeps,
+        assert_eq!(
+            self.tok, ImmediateDeps,
             "wrong token for mark immediate rule as deleted"
         );
         self.stmt.execute([rule_id])?;
         Ok(())
     }
     fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()> {
-        eyre::ensure!(
-            self.tok == RuleSuccess,
+        assert_eq!(
+            self.tok, RuleSuccess,
             "wrong token for mark immediate rule as failed"
         );
         self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
     fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
-        eyre::ensure!(
-            self.tok == RuleDepRules,
-            "wrong token for delete rule links"
-        );
+        assert_eq!(self.tok, RuleDepRules, "wrong token for delete rule links");
         let mut rows = self.stmt.query([rule_id])?;
         let mut vs = Vec::new();
         while let Some(r) = rows.next()? {
@@ -1218,19 +1270,19 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()> {
-        eyre::ensure!(
-            self.tok == DeleteNormalRuleLinks,
+        assert_eq!(
+            self.tok, DeleteNormalRuleLinks,
             "wrong token for delete rule links"
         );
         self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
     fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)> {
-        eyre::ensure!(self.tok == FindNodeByPath, "wrong token for find by path");
+        assert_eq!(self.tok, FindNodeByPath, "wrong token for find by path");
         let dp = db_path_str(dir_path);
         let (id, dirid) = self.stmt.query_row(
             [name, dp.as_str()],
-            |r: &rusqlite::Row| -> Result<(i64, i64), rusqlite::Error> {
+            |r: &Row| -> std::result::Result<(i64, i64), rusqlite::Error> {
                 let id: i64 = r.get(0)?;
                 let dirid: i64 = r.get(1)?;
                 Ok((id, dirid))
@@ -1240,7 +1292,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_io(&mut self, proc_id: i32) -> Result<Vec<(String, u8)>> {
-        eyre::ensure!(self.tok == FetchIO, "wrong token for fetchio");
+        assert_eq!(self.tok, FetchIO, "wrong token for fetchio");
         let mut rows = self.stmt.query([proc_id])?;
         let mut vs = Vec::new();
         let mut lgen = 0;
@@ -1259,7 +1311,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_envs(&mut self, rule_id: i32) -> Result<Vec<String>> {
-        eyre::ensure!(self.tok == FetchEnvsForRule, "wrong token for fetchenvs");
+        assert_eq!(self.tok, FetchEnvsForRule, "wrong token for fetchenvs");
         let mut rows = self.stmt.query([rule_id])?;
         let mut vs = Vec::new();
         while let Some(r) = rows.next()? {
@@ -1270,8 +1322,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
-        eyre::ensure!(
-            self.tok == FetchInputsForRule,
+        assert_eq!(
+            self.tok, FetchInputsForRule,
             "wrong token for FetchInputsForRule"
         );
         let mut rows = self.stmt.query([rule_id])?;
@@ -1284,8 +1336,8 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
-        eyre::ensure!(
-            self.tok == FetchOutputsForRule,
+        assert_eq!(
+            self.tok, FetchOutputsForRule,
             "wrong token for FetchOutputsForRule"
         );
         let mut rows = self.stmt.query([rule_id])?;
@@ -1305,7 +1357,7 @@ impl LibSqlExec for SqlStatement<'_> {
         typ: u8,
         childcnt: i32,
     ) -> Result<()> {
-        eyre::ensure!(self.tok == InsertTrace, "wrong token for insert trace");
+        assert_eq!(self.tok, InsertTrace, "wrong token for insert trace");
         let filepath = db_path_str(path);
         self.stmt.insert((filepath, pid, gen, typ, childcnt))?;
         Ok(())
@@ -1333,7 +1385,7 @@ fn db_path_str<P: AsRef<Path>>(p: P) -> String {
         .to_string()
 }
 
-struct ConnWrapper<'a> {
+pub(crate) struct ConnWrapper<'a> {
     conn: &'a Connection,
 }
 
@@ -1366,7 +1418,13 @@ impl<'a> tupparser::decode::GroupInputs for ConnWrapper<'a> {
             rule_id, rule_dir
         ));
 
-        let mut fetch_input_groups_of_rule = self.conn.prepare(&*format!("SELECT id, name from Node where type = {grptype} and id in (SELECT from_id from NormalLink where to_id = ?)")).unwrap();
+        let mut fetch_input_groups_of_rule = self
+            .conn
+            .prepare(&*format!(
+                "SELECT id, name from Node where type = {grptype} and id in\
+         (SELECT from_id from NormalLink where to_id = ?)"
+            ))
+            .unwrap();
         let mut rows = fetch_input_groups_of_rule.query([rule_id]).unwrap();
         let mut find_group_id = |group_name: &str| {
             while let Some(row) = rows.next().unwrap() {
@@ -1566,11 +1624,11 @@ impl ForEachClauses for Connection {
             let name: String = row.get(3)?;
             let rtype = rtype as u8;
             let rty: RowType = RowType::try_from(rtype).map_err(|e| {
-                eyre::Error::msg(format!(
+                AnyError::from(CallBackError::from(format!(
                     "unknown row type returned \
                  in foreach node query :{}",
                     e
-                ))
+                )))
             })?;
             mut_f(Node::new(i, dir, 0, name, rty))?;
         }
@@ -1602,82 +1660,21 @@ impl ForEachClauses for Connection {
         Ok(())
     }
 
-    fn rules_to_run_no_target(&self) -> Result<Vec<Node>, Report> {
+    fn rules_to_run_no_target<F>(&self, mut f: F) -> Result<Vec<Node>>
+    where
+        F: FnMut(&Node) -> Result<Node>,
+    {
         let rtype = RowType::Rule as u8;
-        let stmt = &*format!("SELECT Node.id, Node.dir, Node.name, Node.display_str, Node.flags, Node.srcid  from Node inner join ModifyList on Node.id = ModifyList.id and Node.type = {rtype}");
+        let stmt = &*format!("SELECT id, dir, name, display_str, flags, srcid  from Node where id in (SELECT id in ModifyList and type = {rtype})");
         let mut stmt = self.prepare(stmt)?;
         let mut rules = Vec::new();
-        let conn_wrapper = ConnWrapper::new(self);
         let mut rule_nodes = stmt.query([])?;
         while let Some(rule_node) = rule_nodes.next()? {
-            let mut node = crate::make_rule_node(rule_node);
-            if let Ok(ref mut node) = node {
-                let rule_id = node.id;
-                let rule_ref =
-                    RuleRef::new(&TupPathDescriptor::from(0), &Loc::new(node.srcid as _, 0));
-                let rule_string = &node.name;
-                let new_name = decode_group_captures(
-                    &conn_wrapper,
-                    &rule_ref,
-                    rule_id,
-                    node.dirid,
-                    rule_string,
-                )
-                .map_err(|e| {
-                    eyre::Error::msg(format!(
-                        "Error decoding group captures for rule:{}\n error:{}",
-                        rule_string, e
-                    ))
-                })?;
-                rules.push(Node::new_rule(
-                    node.id,
-                    node.dirid,
-                    new_name,
-                    node.display_str.clone(),
-                    node.flags.clone(),
-                    node.srcid as _,
-                ));
-            }
+            let node = make_rule_node(rule_node)?;
+            let node = f(&node)?;
+            rules.push(node);
         }
         Ok(rules)
-    }
-
-    fn get_target_ids(&self, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
-        let dir = std::env::current_dir().unwrap();
-        let dirc = dir.clone();
-        let dir = diff_paths(dir, root).ok_or(eyre::Error::msg(format!(
-            "Could not get relative path for:{:?}",
-            dirc.as_path()
-        )))?;
-        let mut fd = self.fetch_dirid_prepare()?;
-        let mut fnode_stmt = self.fetch_node_by_id_prepare()?;
-        let mut dirids = Vec::new();
-        for t in targets {
-            let path = dir.join(t.as_str());
-            if let Ok(id) = fd.fetch_dirid(dir.join(&targets[0])) {
-                dirids.push(id);
-            } else {
-                // get the parent dir id and fetch the node by its name
-                let parent = path.parent().ok_or(eyre::Error::msg(format!(
-                    "Could not get parent for:{:?}",
-                    path
-                )))?;
-                if let Some(parent_id) = fd.fetch_dirid(parent).ok() {
-                    if let Ok(nodeid) = fnode_stmt.fetch_node_id(
-                        &*path.file_name().unwrap().to_string_lossy().to_string(),
-                        parent_id,
-                    ) {
-                        dirids.push(nodeid);
-                    } else {
-                        return Err(eyre::Error::msg(format!(
-                            "Could not find target node id for:{:?}",
-                            path
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(dirids)
     }
 }
 
@@ -1805,4 +1802,40 @@ FROM NodeChain;"
         stmt.execute([])?;
         Ok(())
     }
+}
+
+fn make_tup_node(row: &Row) -> rusqlite::Result<Node> {
+    let i = row.get(0)?;
+    let dir: i64 = row.get(1)?;
+    let name: String = row.get(2)?;
+    Ok(Node::new(i, dir, 0, name, RowType::TupF))
+}
+
+fn make_node(row: &Row) -> rusqlite::Result<Node> {
+    let id: i64 = row.get(0)?;
+    let dirid: i64 = row.get(1)?;
+    let rtype: u8 = row.get(2)?;
+    let name: String = row.get(3)?;
+    let mtime: i64 = row.get(4)?;
+    let rtype = RowType::try_from(rtype)
+        .unwrap_or_else(|_| panic!("Invalid row type {} for node {}", rtype, name));
+    Ok(Node::new(id, dirid, mtime, name, rtype))
+}
+
+fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
+    let id: i64 = row.get(0)?;
+    let dirid: i64 = row.get(1)?;
+    let name: String = row.get(2)?;
+    let display_str: String = row.get(3)?;
+    let flags: String = row.get(4)?;
+    let srcid: i64 = row.get(5)?;
+
+    Ok(Node::new_rule(
+        id,
+        dirid,
+        name,
+        display_str,
+        flags,
+        srcid as u32,
+    ))
 }

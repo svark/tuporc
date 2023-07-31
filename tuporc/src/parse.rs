@@ -12,7 +12,7 @@ use rusqlite::Connection;
 
 use tupparser::decode::{
     GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
-    PathSearcher, RuleRef,
+    PathSearcher,
 };
 use tupparser::errors::Error;
 use tupparser::{
@@ -22,19 +22,24 @@ use tupparser::{
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
-    create_path_buf_temptable, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
+    create_path_buf_temptable, AnyError, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
 };
-use crate::{get_dir_id, LibSqlPrepare, Node, RowType, TermProgress, MAX_THRS_DIRS};
+use crate::scan::{get_dir_id, MAX_THRS_DIRS};
+use crate::{LibSqlPrepare, Node, RowType, TermProgress};
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
 #[derive(Debug, Clone, Default)]
 pub struct CrossRefMaps {
     gbo: BiMap<GroupPathDescriptor, (i64, i64)>,
+    // group id and the corresponding db id,, parent id
     pbo: BiMap<PathDescriptor, (i64, i64)>,
+    // path id and the corresponding db id, parent id (includes globs)
     rbo: BiMap<RuleDescriptor, (i64, i64)>,
+    // rule id and the corresponding db id, parent id
     dbo: BiMap<TupPathDescriptor, (i64, i64)>,
-    ebo: BiMap<String, i64>,
+    // tup id and the corresponding db id, parent id
+    ebo: BiMap<String, i64>, // env id and the corresponding db id
 }
 
 impl CrossRefMaps {
@@ -99,7 +104,7 @@ impl DbPathSearcher {
         &self,
         ph: &mut (impl PathBuffers + Sized),
         glob_path: &GlobPath,
-    ) -> Result<Vec<MatchingPath>> {
+    ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
         let has_glob_pattern = glob_path.has_glob_pattern();
         if has_glob_pattern {
             debug!(
@@ -142,25 +147,23 @@ impl PathSearcher for DbPathSearcher {
         ph: &mut impl PathBuffers,
         glob_path: &GlobPath,
     ) -> std::result::Result<Vec<MatchingPath>, Error> {
-        let mps = self
-            .fetch_glob_nodes(ph, glob_path)
-            .and_then(|mut x| {
-                x.extend(self.get_outs().discover_paths(ph, glob_path)?);
-                Ok(x)
-            })
-            .map_err(|e| Error::new_path_search_error(e.to_string().as_str(), RuleRef::default()));
+        let mps = self.fetch_glob_nodes(ph, glob_path);
+        let mut mps = match mps {
+            Ok(mps) => Ok(mps),
+            Err(e) if e.has_no_rows() => self
+                .get_outs()
+                .discover_paths(ph, glob_path)
+                .map_err(|e| Error::new_path_search_error(e.to_string())),
+            Err(e) => Err(Error::new_path_search_error(e.to_string())),
+        }?;
         let c = |x: &MatchingPath, y: &MatchingPath| {
             let x = x.path_descriptor();
             let y = y.path_descriptor();
             x.cmp(y)
         };
-        if let Ok(mut mps) = mps {
-            mps.sort_by(c);
-            mps.dedup();
-            Ok(mps)
-        } else {
-            mps
-        }
+        mps.sort_by(c);
+        mps.dedup();
+        Ok(mps)
     }
     fn get_outs(&self) -> &OutputHolder {
         &self.psx
@@ -262,22 +265,14 @@ fn add_link_glob_dir_to_rules(
                 //               links_to_add.insert(glob_path_desc, tupfile_db_id);
                 let (glob_pattern_id, _) =
                     crossref.get_glob_db_id(&glob_path_desc).ok_or_else(|| {
-                        Error::new_path_search_error(
-                            &*format!(
-                                "glob path not found:{:?} in tup db",
-                                rw_buf.get_glob_path(&glob_path_desc)
-                            ),
-                            rlink.get_rule_ref().clone(),
-                        )
+                        Error::new_path_search_error(format!(
+                            "glob path not found:{:?} in tup db",
+                            rw_buf.get_glob_path(&glob_path_desc)
+                        ))
                     })?;
                 insert_link
                     .insert_link(glob_pattern_id, tupfile_db_id, true, RowType::TupF)
-                    .map_err(|e| {
-                        Error::new_path_search_error(
-                            e.to_string().as_str(),
-                            rlink.get_rule_ref().clone(),
-                        )
-                    })?;
+                    .map_err(|e| Error::new_path_search_error(e.to_string()))?;
                 Ok(())
             })?;
         }
@@ -329,11 +324,12 @@ fn gather_rules_from_tupfiles(
                             let display_str = rwbuf.display_str(&error);
                             let tupfile_name = tupfile.get_name();
                             term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-                            Report::new(error).wrap_err(format!(
-                                "Error while parsing tupfile: {}:\n {}",
+                            eyre!(
+                                "Error while parsing tupfile: {}:\n {} due to \n{}",
                                 tupfile.get_name(),
-                                display_str
-                            ))
+                                display_str,
+                                error
+                            )
                         })?;
                     pb.set_message(format!("Done parsing {}", tupfile.get_name()));
                     term_progress.tick(&pb);
@@ -593,13 +589,17 @@ fn fetch_group_provider_outputs(
     });
 
     for (group_desc, groupid) in vs {
-        conn.for_each_grp_node_provider(groupid, Some(GenF), |node| -> Result<()> {
-            // name of node is actually its path
-            // merge providers of this group from all available in db
-            let pd = rwbuf.add_abs(Path::new(node.get_name())).0;
-            outs.add_group_entry(&group_desc, pd);
-            Ok(())
-        })?;
+        conn.for_each_grp_node_provider(
+            groupid,
+            Some(GenF),
+            |node: Node| -> std::result::Result<(), AnyError> {
+                // name of node is actually its path
+                // merge providers of this group from all available in db
+                let pd = rwbuf.add_abs(Path::new(node.get_name())).0;
+                outs.add_group_entry(&group_desc, pd);
+                Ok(())
+            },
+        )?;
     }
     Ok(())
 }
@@ -898,23 +898,23 @@ impl NodeStatements<'_> {
             update_srcid,
         })
     }
-    fn insert_node_exec(&mut self, n: &Node) -> Result<i64> {
+    fn insert_node_exec(&mut self, n: &Node) -> crate::db::Result<i64> {
         self.insert_node.insert_node_exec(n)
     }
-    fn fetch_node(&mut self, name: &str, dirid: i64) -> Result<Node> {
+    fn fetch_node(&mut self, name: &str, dirid: i64) -> crate::db::Result<Node> {
         self.find_node.fetch_node(name, dirid)
     }
-    fn update_mtime_exec(&mut self, nodeid: i64, mtime: i64) -> Result<()> {
+    fn update_mtime_exec(&mut self, nodeid: i64, mtime: i64) -> crate::db::Result<()> {
         self.update_mtime.update_mtime_exec(nodeid, mtime)
     }
-    fn update_display_str_exec(&mut self, nodeid: i64, display_str: &str) -> Result<()> {
+    fn update_display_str_exec(&mut self, nodeid: i64, display_str: &str) -> crate::db::Result<()> {
         self.update_display_str
             .update_display_str(nodeid, display_str)
     }
-    fn update_flags_exec(&mut self, nodeid: i64, flags: &str) -> Result<()> {
+    fn update_flags_exec(&mut self, nodeid: i64, flags: &str) -> crate::db::Result<()> {
         self.update_flags.update_flags_exec(nodeid, flags)
     }
-    fn update_srcid_exec(&mut self, nodeid: i64, srcid: i64) -> Result<()> {
+    fn update_srcid_exec(&mut self, nodeid: i64, srcid: i64) -> crate::db::Result<()> {
         self.update_srcid.update_srcid_exec(nodeid, srcid)
     }
 }
@@ -933,10 +933,10 @@ impl AddIdsStatements<'_> {
             add_to_modify,
         })
     }
-    fn add_to_modify(&mut self, nodeid: i64, rowtype: RowType) -> Result<()> {
+    fn add_to_modify(&mut self, nodeid: i64, rowtype: RowType) -> crate::db::Result<()> {
         self.add_to_modify.add_to_modify_exec(nodeid, rowtype)
     }
-    fn add_to_present(&mut self, nodeid: i64, rowtype: RowType) -> Result<()> {
+    fn add_to_present(&mut self, nodeid: i64, rowtype: RowType) -> crate::db::Result<()> {
         self.add_to_present.add_to_present_exec(nodeid, rowtype)
     }
 }
@@ -1024,9 +1024,7 @@ pub(crate) fn find_upsert_node(
             Ok(existing_node)
         })
         .or_else(|e| {
-            if let Some(rusqlite::Error::QueryReturnedNoRows) =
-                e.root_cause().downcast_ref::<rusqlite::Error>()
-            {
+            if e.has_no_rows() {
                 let node = node_statements
                     .insert_node_exec(node)
                     .map(|i| Node::copy_from(i, node))?;
@@ -1034,7 +1032,7 @@ pub(crate) fn find_upsert_node(
                 add_ids_statements.add_to_present(node.get_id(), *node.get_type())?; // add to present list
                 Ok::<Node, eyre::Error>(node)
             } else {
-                Err::<Node, eyre::Error>(e)
+                Err::<Node, eyre::Error>(e.into())
             }
         })?;
     Ok(db_node)
