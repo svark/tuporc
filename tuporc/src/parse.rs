@@ -102,7 +102,7 @@ impl DbPathSearcher {
 
     fn fetch_glob_nodes(
         &self,
-        ph: &mut (impl PathBuffers + Sized),
+        ph: &impl PathBuffers,
         glob_path: &GlobPath,
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
         let has_glob_pattern = glob_path.has_glob_pattern();
@@ -123,6 +123,7 @@ impl DbPathSearcher {
                     let grps = glob_path.group(full_path.as_path());
                     Some(MatchingPath::with_captures(
                         pd,
+                        full_path.clone(),
                         glob_path.get_glob_desc(),
                         grps,
                     ))
@@ -130,7 +131,7 @@ impl DbPathSearcher {
                     None
                 }
             } else {
-                Some(MatchingPath::new(pd))
+                Some(MatchingPath::new(pd, ph.get_path(&pd).clone()))
             }
         };
         let conn = self.conn.deref().lock();
@@ -144,15 +145,15 @@ impl DbPathSearcher {
 impl PathSearcher for DbPathSearcher {
     fn discover_paths(
         &self,
-        ph: &mut impl PathBuffers,
+        path_buffers: &impl PathBuffers,
         glob_path: &GlobPath,
-    ) -> std::result::Result<Vec<MatchingPath>, Error> {
-        let mps = self.fetch_glob_nodes(ph, glob_path);
+    ) -> Result<Vec<MatchingPath>, Error> {
+        let mps = self.fetch_glob_nodes(path_buffers, glob_path);
         let mut mps = match mps {
             Ok(mps) => Ok(mps),
             Err(e) if e.has_no_rows() => self
                 .get_outs()
-                .discover_paths(ph, glob_path)
+                .discover_paths(path_buffers, glob_path)
                 .map_err(|e| Error::new_path_search_error(e.to_string())),
             Err(e) => Err(Error::new_path_search_error(e.to_string())),
         }?;

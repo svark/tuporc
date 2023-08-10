@@ -135,6 +135,8 @@ impl TryFrom<u8> for RowType {
             Ok(Self::DirGen)
         } else if value == 8 {
             Ok(Self::Excluded)
+        } else if value == 9 {
+            Ok(Self::Glob)
         } else {
             Err(value)
         }
@@ -147,8 +149,7 @@ pub struct Node {
     id: i64,
     /// parent folder id
     dirid: i64,
-
-    /// time in nano s
+    /// time in nano secs
     mtime: i64,
     /// name of file or dir or rule or group
     name: String,
