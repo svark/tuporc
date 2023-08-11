@@ -10,15 +10,14 @@ use log::debug;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use tupparser::decode::{
-    GlobPath, GlobPathDescriptor, MatchingPath, OutputHandler, OutputHolder, PathBuffers,
-    PathSearcher,
+use tupparser::buffers::{
+    GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers, PathDescriptor,
+    RuleDescriptor, TupPathDescriptor,
 };
+use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::{
-    Artifacts, GroupPathDescriptor, InputResolvedType, PathDescriptor, ReadWriteBufferObjects,
-    ResolvedLink, RuleDescriptor, TupParser, TupPathDescriptor,
-};
+use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath};
+use tupparser::{Artifacts, ReadWriteBufferObjects, ResolvedLink, TupParser};
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{

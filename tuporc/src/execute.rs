@@ -20,9 +20,9 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
 
 use tupetw::{DynDepTracker, EventHeader, EventType};
+use tupparser::buffers::TupPathDescriptor;
 use tupparser::decode::{decode_group_captures, RuleRef};
 use tupparser::statements::Loc;
-use tupparser::TupPathDescriptor;
 
 use crate::db::RowType::Excluded;
 use crate::db::{

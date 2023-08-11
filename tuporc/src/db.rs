@@ -8,7 +8,7 @@ use log::debug;
 use pathdiff::diff_paths;
 use rusqlite::{Connection, Params, Row, Statement};
 
-use tupparser::decode::MatchingPath;
+use tupparser::paths::MatchingPath;
 
 use crate::db::StatementType::*;
 
