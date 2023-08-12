@@ -16,7 +16,7 @@ use tupparser::buffers::{
 };
 use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath};
+use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
 use tupparser::{Artifacts, ReadWriteBufferObjects, ResolvedLink, TupParser};
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
@@ -101,7 +101,7 @@ impl DbPathSearcher {
 
     fn fetch_glob_nodes(
         &self,
-        ph: &impl PathBuffers,
+        ph: &mut impl PathBuffers,
         glob_path: &GlobPath,
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
         let has_glob_pattern = glob_path.has_glob_pattern();
@@ -118,11 +118,15 @@ impl DbPathSearcher {
             let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
             if has_glob_pattern {
                 let full_path = glob_path.get_base_abs_path().join(s.as_str());
+
                 if glob_path.is_match(full_path.as_path()) {
                     let grps = glob_path.group(full_path.as_path());
                     Some(MatchingPath::with_captures(
                         pd,
-                        full_path.clone(),
+                        NormalPath::absolute_from(
+                            Path::new(s.as_str()),
+                            glob_path.get_base_abs_path(),
+                        ),
                         glob_path.get_glob_desc(),
                         grps,
                     ))
@@ -144,7 +148,7 @@ impl DbPathSearcher {
 impl PathSearcher for DbPathSearcher {
     fn discover_paths(
         &self,
-        path_buffers: &impl PathBuffers,
+        path_buffers: &mut impl PathBuffers,
         glob_path: &GlobPath,
     ) -> Result<Vec<MatchingPath>, Error> {
         let mps = self.fetch_glob_nodes(path_buffers, glob_path);

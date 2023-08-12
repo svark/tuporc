@@ -119,7 +119,7 @@ pub(crate) fn execute_targets(
         let rule_id = node.get_id();
         let rule_ref = RuleRef::new(
             &TupPathDescriptor::from(0),
-            &Loc::new(node.get_srcid() as _, 0),
+            &Loc::new(node.get_srcid() as _, 0, 0),
         );
         let rule_string = node.get_name();
         let new_name = decode_group_captures(
