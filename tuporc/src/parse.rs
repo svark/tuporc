@@ -111,8 +111,9 @@ impl DbPathSearcher {
                 glob_path.get_abs_path()
             );
         }
+
         let base_path = ph.get_path(glob_path.get_base_desc()).clone();
-        let diff_path = ph.get_rel_path(&glob_path.get_path_desc(), glob_path.get_base_desc());
+        let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path.as_path());
         let fetch_row = |s: &String| -> Option<MatchingPath> {
             debug!("found:{} at {:?}", s, base_path.as_path());
             let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
@@ -138,9 +139,16 @@ impl DbPathSearcher {
             }
         };
         let conn = self.conn.deref().lock();
-        let mut glob_query = conn.fetch_glob_nodes_prepare()?;
-        let mps =
-            glob_query.fetch_glob_nodes(base_path.as_path(), diff_path.as_path(), fetch_row)?;
+        let recursive = glob_path.is_recursive_prefix();
+
+        let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
+
+        let mps = glob_query.fetch_glob_nodes(
+            base_path.as_path(),
+            glob_pattern.as_path(),
+            recursive,
+            fetch_row,
+        )?;
         Ok(mps)
     }
 }

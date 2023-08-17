@@ -357,7 +357,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_env_id_prepare(&self) -> Result<SqlStatement>;
     fn fetch_rules_nodes_prepare_by_dirid(&self) -> Result<SqlStatement>;
-    fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_glob_nodes_prepare(&self, is_recursive: bool) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
@@ -427,7 +427,13 @@ pub(crate) trait LibSqlExec {
     /// fetch all the nodes that are rules and are in the given directory
     fn fetch_rule_nodes_by_dirid(&mut self, dir: i64) -> Result<Vec<Node>>;
     /// fetch all the nodes that match the given glob pattern and are in the given directory
-    fn fetch_glob_nodes<F, P>(&mut self, base_path: P, gname: P, f: F) -> Result<Vec<MatchingPath>>
+    fn fetch_glob_nodes<F, P>(
+        &mut self,
+        base_path: P,
+        gname: P,
+        recursive: bool,
+        f: F,
+    ) -> Result<Vec<MatchingPath>>
     where
         F: FnMut(&String) -> Option<MatchingPath>,
         P: AsRef<Path>;
@@ -759,12 +765,13 @@ impl LibSqlPrepare for Connection {
         })
     }
 
-    fn fetch_glob_nodes_prepare(&self) -> Result<SqlStatement> {
+    fn fetch_glob_nodes_prepare(&self, is_recursive: bool) -> Result<SqlStatement> {
         let ftype = RowType::File as u8;
-        let gen_ftype = RowType::GenF as u8;
-        let statement: String = format!(
-            "SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name = ?) \
-         and (type = {ftype} or type = {gen_ftype})"
+        //let gen_ftype = RowType::GenF as u8;
+        let op = if is_recursive { "glob" } else { "=" };
+        let statement = format!(
+            "SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name {op} ?) \
+         and type = {ftype}"
         );
         let stmt = self.prepare(statement.as_str())?;
         Ok(SqlStatement {
@@ -1153,6 +1160,7 @@ impl LibSqlExec for SqlStatement<'_> {
         &mut self,
         base_path: P,
         gname: P,
+        recursive: bool,
         mut f: F,
     ) -> Result<Vec<MatchingPath>>
     where
@@ -1160,7 +1168,10 @@ impl LibSqlExec for SqlStatement<'_> {
         P: AsRef<Path>,
     {
         assert_eq!(self.tok, FindGlobNodes, "wrong token for fetch glob nodes");
-        let path_str = db_path_str(base_path);
+        let mut path_str = db_path_str(base_path);
+        if recursive {
+            path_str.push('*')
+        }
         debug!("query glob:{:?}", gname.as_ref());
         let mut rows = self
             .stmt
