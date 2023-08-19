@@ -13,3 +13,5 @@ tuporc/.vscode/*
 tuplua/
 out.txt
 ptrace*.txt
+/History.md
+/AUTHORS

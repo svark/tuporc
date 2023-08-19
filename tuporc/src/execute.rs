@@ -21,7 +21,7 @@ use rusqlite::Connection;
 
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::TupPathDescriptor;
-use tupparser::decode::{decode_group_captures, RuleRef};
+use tupparser::decode::{decode_group_captures, TupLoc};
 use tupparser::statements::Loc;
 
 use crate::db::RowType::Excluded;
@@ -117,7 +117,7 @@ pub(crate) fn execute_targets(
     let conn_wrapper = ConnWrapper::new(&conn);
     let f = |node: &Node| -> std::result::Result<Node, AnyError> {
         let rule_id = node.get_id();
-        let rule_ref = RuleRef::new(
+        let rule_ref = TupLoc::new(
             &TupPathDescriptor::from(0),
             &Loc::new(node.get_srcid() as _, 0, 0),
         );

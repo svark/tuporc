@@ -244,7 +244,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
 
     add_links_to_groups(&mut conn, &arts, &crossref)?;
-    fetch_group_provider_outputs(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
+    fetch_group_providers(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
     add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
     // add links from glob inputs to tupfiles's directory
     add_link_glob_dir_to_rules(&mut conn, &rwbufs, &arts, &mut crossref)?;
@@ -534,6 +534,9 @@ fn add_rule_links(
                                 rule_node_id
                             );
                         }
+                        InputResolvedType::TaskRef(_) => {
+                            bail!("Task reference cannot be an input to a rule:{}. Tasks can accept rules as input but not vice versa", rule_node_id);
+                        }
                     }
                 }
                 {
@@ -579,7 +582,7 @@ fn add_rule_links(
 }
 
 /// get a global list of files corresponding  to each group
-fn fetch_group_provider_outputs(
+fn fetch_group_providers(
     conn: &mut Connection,
     rwbuf: &mut ReadWriteBufferObjects,
     outs: &mut OutputHolder,
