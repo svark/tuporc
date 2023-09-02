@@ -102,54 +102,73 @@ impl DbPathSearcher {
     fn fetch_glob_nodes(
         &self,
         ph: &mut impl PathBuffers,
-        glob_path: &GlobPath,
+        glob_paths: &[GlobPath],
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
-        let has_glob_pattern = glob_path.has_glob_pattern();
-        if has_glob_pattern {
-            debug!(
-                "looking for matches in db for glob pattern: {:?}",
-                glob_path.get_abs_path()
-            );
-        }
-
-        let base_path = ph.get_path(glob_path.get_base_desc()).clone();
-        let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path.as_path());
-        let fetch_row = |s: &String| -> Option<MatchingPath> {
-            debug!("found:{} at {:?}", s, base_path.as_path());
-            let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
+        for glob_path in glob_paths {
+            let has_glob_pattern = glob_path.has_glob_pattern();
             if has_glob_pattern {
-                let full_path = glob_path.get_base_abs_path().join(s.as_str());
-
-                if glob_path.is_match(full_path.as_path()) {
-                    let grps = glob_path.group(full_path.as_path());
-                    Some(MatchingPath::with_captures(
-                        pd,
-                        NormalPath::absolute_from(
-                            Path::new(s.as_str()),
-                            glob_path.get_base_abs_path(),
-                        ),
-                        glob_path.get_glob_desc(),
-                        grps,
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                Some(MatchingPath::new(pd, ph.get_path(&pd).clone()))
+                debug!(
+                    "looking for matches in db for glob pattern: {:?}",
+                    glob_path.get_abs_path()
+                );
             }
-        };
-        let conn = self.conn.deref().lock();
-        let recursive = glob_path.is_recursive_prefix();
 
-        let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
+            let base_path = glob_path.get_base_abs_path();
+            if base_path.is_dir() {
+                debug!("base path is dir: {:?}", base_path);
+            } else {
+                debug!("base path is not dir: {:?}", base_path);
+                continue;
+            }
+            let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
+            let fetch_row = |s: &String| -> Option<MatchingPath> {
+                debug!("found:{} at {:?}", s, base_path.as_path());
+                let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
+                if has_glob_pattern {
+                    let full_path = glob_path.get_base_abs_path().join(s.as_str());
 
-        let mps = glob_query.fetch_glob_nodes(
-            base_path.as_path(),
-            glob_pattern.as_path(),
-            recursive,
-            fetch_row,
-        )?;
-        Ok(mps)
+                    if glob_path.is_match(full_path.as_path()) {
+                        let grps = glob_path.group(full_path.as_path());
+                        Some(MatchingPath::with_captures(
+                            pd,
+                            NormalPath::absolute_from(
+                                Path::new(s.as_str()),
+                                glob_path.get_base_abs_path(),
+                            ),
+                            glob_path.get_glob_desc(),
+                            grps,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(MatchingPath::new(pd, ph.get_path(&pd).clone()))
+                }
+            };
+            let conn = self.conn.deref().lock();
+            let recursive = glob_path.is_recursive_prefix();
+
+            let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
+
+            let mut mps = glob_query.fetch_glob_nodes(
+                base_path.as_path(),
+                glob_pattern.as_path(),
+                recursive,
+                fetch_row,
+            );
+            match mps {
+                Ok(mps) => {
+                    if !mps.is_empty() {
+                        return Ok(mps);
+                    }
+                }
+                Err(e) if e.has_no_rows() => {
+                    debug!("no rows found for glob pattern: {:?}", glob_pattern);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows));
     }
 }
 
@@ -157,7 +176,7 @@ impl PathSearcher for DbPathSearcher {
     fn discover_paths(
         &self,
         path_buffers: &mut impl PathBuffers,
-        glob_path: &GlobPath,
+        glob_path: &[GlobPath],
     ) -> Result<Vec<MatchingPath>, Error> {
         let mps = self.fetch_glob_nodes(path_buffers, glob_path);
         let mut mps = match mps {
@@ -183,6 +202,10 @@ impl PathSearcher for DbPathSearcher {
 
     fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
         OutputHandler::merge(&mut self.psx, p, o)
+    }
+
+    fn search_roots(&self) -> &Vec<PathDescriptor> {
+        &self.search_dirs
     }
 }
 
