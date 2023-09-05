@@ -12,12 +12,12 @@ use rusqlite::Connection;
 
 use tupparser::buffers::{
     GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers, PathDescriptor,
-    RuleDescriptor, TupPathDescriptor,
+    RuleDescriptor, TaskDescriptor, TupPathDescriptor,
 };
 use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
-use tupparser::{Artifacts, ReadWriteBufferObjects, ResolvedLink, TupParser};
+use tupparser::{Artifacts, ReadWriteBufferObjects, TupParser};
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
@@ -39,6 +39,8 @@ pub struct CrossRefMaps {
     dbo: BiMap<TupPathDescriptor, (i64, i64)>,
     // tup id and the corresponding db id, parent id
     ebo: BiMap<String, i64>, // env id and the corresponding db id
+    // task id and the corresponding db id, parent id
+    tbo: BiMap<TaskDescriptor, (i64, i64)>,
 }
 
 impl CrossRefMaps {
@@ -65,6 +67,10 @@ impl CrossRefMaps {
         self.pbo.get_by_left(&p).copied()
     }
 
+    pub fn get_task_id(&self, t: &TaskDescriptor) -> Option<(i64, i64)> {
+        self.tbo.get_by_left(t).copied()
+    }
+
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64, par_db_id: i64) {
         self.gbo.insert(g, (db_id, par_db_id));
     }
@@ -80,6 +86,9 @@ impl CrossRefMaps {
     }
     pub fn add_tup_xref(&mut self, t: TupPathDescriptor, db_id: i64, par_db_id: i64) {
         self.dbo.insert(t, (db_id, par_db_id));
+    }
+    pub fn add_task_xref(&mut self, t: TaskDescriptor, db_id: i64, par_db_id: i64) {
+        self.tbo.insert(t.into(), (db_id, par_db_id));
     }
 }
 
@@ -102,7 +111,7 @@ impl DbPathSearcher {
     fn fetch_glob_nodes(
         &self,
         ph: &mut impl PathBuffers,
-        glob_paths: &[GlobPath],
+        glob_paths: &[GlobPath], // glob paths to search for (corresponding to search dirs that were specified before)
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
         for glob_path in glob_paths {
             let has_glob_pattern = glob_path.has_glob_pattern();
@@ -122,8 +131,8 @@ impl DbPathSearcher {
             }
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
             let fetch_row = |s: &String| -> Option<MatchingPath> {
-                debug!("found:{} at {:?}", s, base_path.as_path());
-                let (pd, _) = ph.add_path_from(base_path.as_path(), Path::new(s.as_str()));
+                debug!("found:{} at {:?}", s, base_path);
+                let (pd, _) = ph.add_path_from(base_path, Path::new(s.as_str()));
                 if has_glob_pattern {
                     let full_path = glob_path.get_base_abs_path().join(s.as_str());
 
@@ -150,8 +159,8 @@ impl DbPathSearcher {
 
             let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
 
-            let mut mps = glob_query.fetch_glob_nodes(
-                base_path.as_path(),
+            let mps = glob_query.fetch_glob_nodes(
+                base_path,
                 glob_pattern.as_path(),
                 recursive,
                 fetch_row,
@@ -203,10 +212,6 @@ impl PathSearcher for DbPathSearcher {
     fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
         OutputHandler::merge(&mut self.psx, p, o)
     }
-
-    fn search_roots(&self) -> &Vec<PathDescriptor> {
-        &self.search_dirs
-    }
 }
 
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
@@ -215,7 +220,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     tupfiles: Vec<Node>,
     root: P,
     mut term_progress: TermProgress,
-) -> Result<Vec<ResolvedLink>> {
+) -> Result<()> {
     let mut crossref = CrossRefMaps::default();
     term_progress = term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
     let (arts, mut rwbufs, mut outs) = {
@@ -271,7 +276,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
     // add links from glob inputs to tupfiles's directory
     add_link_glob_dir_to_rules(&mut conn, &rwbufs, &arts, &mut crossref)?;
-    Ok(Vec::new())
+    Ok(())
 }
 
 /// adds links from glob patterns specified at each directory that are inputs to rules  to the tupfile directory
@@ -287,12 +292,12 @@ fn add_link_glob_dir_to_rules(
     {
         let mut insert_link = tx.insert_link_prepare()?;
         for rlink in arts.get_resolved_links() {
-            let tupfile_desc = rlink.get_rule_ref().get_tupfile_desc();
+            let tupfile_desc = rlink.get_tup_loc().get_tupfile_desc();
             let (tupfile_db_id, _) = crossref.get_tup_db_id(tupfile_desc).ok_or_else(|| {
                 eyre!(
                     "tupfile dir not found:{:?} mentioned in rule {:?}",
                     tupfile_desc,
-                    rlink.get_rule_ref()
+                    rlink.get_tup_loc()
                 )
             })?;
 
@@ -700,49 +705,6 @@ fn insert_nodes(
 
         let mut unique_rule_check = HashMap::new();
 
-        let mut collect_rule_nodes_to_insert = |rule_desc: &RuleDescriptor,
-                                                dir: i64,
-                                                crossref: &mut CrossRefMaps,
-                                                find_nodeid: &mut SqlStatement|
-         -> Result<()> {
-            let isz: usize = (*rule_desc).into();
-            let rule_formula = read_write_buf.get_rule(rule_desc);
-            let name = rule_formula.get_rule_str();
-            let display_str = rule_formula.get_display_str();
-            let flags = rule_formula.get_flags();
-            let srcid = rule_formula.get_rule_ref().get_line();
-            if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
-                crossref.add_rule_xref(*rule_desc, nodeid, dir);
-                nodeids.insert((nodeid, RowType::Rule));
-            } else {
-                let tuppath =
-                    read_write_buf.get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
-                let tuppathstr = tuppath.to_string_lossy();
-                let line = rule_formula.get_rule_ref().get_line();
-                debug!(" rule to insert: {} at  {}:{}", name, tuppathstr, line);
-                let prevline =
-                    unique_rule_check.insert(dir.to_string() + "/" + name.as_str(), line);
-                if prevline.is_none() {
-                    rules_to_insert.push(Node::new_rule(
-                        isz as i64,
-                        dir,
-                        name,
-                        display_str,
-                        flags,
-                        srcid,
-                    ));
-                } else {
-                    bail!(
-                        "Rule at  {}:{} was previously defined at line {}. \
-                        Ensure that rule definitions take the inputs as arguments.",
-                        tuppathstr.to_string().as_str(),
-                        line,
-                        prevline.unwrap()
-                    );
-                }
-            }
-            Ok(())
-        };
         let mut existing_nodeids = BTreeSet::new();
         let mut find_dirid_with_par = conn.fetch_dirid_with_par_prepare()?;
         let mut collect_nodes_to_insert = |p: &PathDescriptor,
@@ -789,41 +751,178 @@ fn insert_nodes(
         };
         let mut processed = std::collections::HashSet::new();
         let mut processed_globs = std::collections::HashSet::new();
-        for r in arts.rules_by_tup().iter() {
-            for rl in r.iter() {
-                let rd = rl.get_rule_desc();
-                let rule_ref = rl.get_rule_ref();
-                let tup_desc = rule_ref.get_tupfile_desc();
-                let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
-                    eyre::Error::msg(format!(
-                        "No tup directory found in db for tup descriptor:{:?}",
-                        tup_desc
-                    ))
-                })?;
-                collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid)?;
-                for p in rl.get_targets() {
-                    if processed.insert(p) {
-                        collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
+        let mut collect_inps = |s: &InputResolvedType, dir: i64| -> Result<()> { Ok(()) };
+        {
+            let mut collect_task_nodes_to_insert = |task_desc: &TaskDescriptor,
+                                                    dir: i64,
+                                                    crossref: &mut CrossRefMaps,
+                                                    find_nodeid: &mut SqlStatement|
+             -> Result<()> {
+                let isz: usize = (*task_desc).into();
+                let task_instance = read_write_buf.get_task(task_desc);
+                let name = task_instance.get_target();
+                let display_str = name.to_string();
+                let flags = String::new();
+                let srcid = u32::MAX;
+                if let Ok(nodeid) = find_nodeid.fetch_node_id(name, dir) {
+                    crossref.add_task_xref(*task_desc, nodeid, dir);
+                    nodeids.insert((nodeid, RowType::Task));
+                } else {
+                    let tuppath =
+                        read_write_buf.get_tup_path(task_instance.get_tup_loc().get_tupfile_desc());
+                    let tuppathstr = tuppath.to_string_lossy();
+                    let line = task_instance.get_tup_loc().get_line();
+                    debug!(" task to insert: {} at  {}:{}", name, tuppathstr, line);
+                    let prevline = unique_rule_check.insert(name.to_string(), line);
+                    if prevline.is_none() {
+                        rules_to_insert.push(Node::new_task(
+                            isz as i64,
+                            dir,
+                            name.to_string(),
+                            display_str,
+                            flags,
+                            srcid,
+                        ));
+                    } else {
+                        bail!(
+                            "Task at  {}:{} was previously defined at line {}. \
+                        Ensure that rule definitions take the inputs as arguments.",
+                            tuppathstr.to_string().as_str(),
+                            line,
+                            prevline.unwrap()
+                        );
                     }
                 }
-                for s in rl.get_sources() {
-                    if let Some(p) = s.get_glob_path_desc() {
-                        if processed_globs.insert(p) && s.is_glob_match() {
-                            let p = PathDescriptor::new(p.into());
-                            collect_nodes_to_insert(&p, &Glob, 0, dir, crossref, &mut find_nodeid)?;
+                Ok(())
+            };
+
+            for r in arts.tasks_by_tup().iter() {
+                for rl in r.iter() {
+                    let rd = rl.get_task_descriptor();
+                    let tup_desc = rl.get_loc().get_tupfile_desc();
+                    let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
+                        eyre::Error::msg(format!(
+                            "No tup directory found in db for tup descriptor:{:?}",
+                            tup_desc
+                        ))
+                    })?;
+                    collect_task_nodes_to_insert(rd, dir, crossref, &mut find_nodeid)?;
+                    for s in rl.get_deps() {
+                        if let Some(p) = s.get_glob_path_desc() {
+                            if processed_globs.insert(p) && s.is_glob_match() {
+                                let p = PathDescriptor::new(p.into());
+                                collect_nodes_to_insert(
+                                    &p,
+                                    &Glob,
+                                    0,
+                                    dir,
+                                    crossref,
+                                    &mut find_nodeid,
+                                )?;
+                            }
                         }
                     }
+                    let env_desc = rl.get_env_desc();
+                    let environs = read_write_buf.get_envs(&env_desc);
+                    envs_to_insert.extend(environs.getenv());
                 }
-                for p in rl.get_excluded_targets() {
-                    if processed.insert(p) {
-                        collect_nodes_to_insert(p, &Excluded, 0, dir, crossref, &mut find_nodeid)?;
-                    }
-                }
-                let env_desc = rl.get_env_desc();
-                let environs = read_write_buf.get_envs(env_desc);
-                envs_to_insert.extend(environs.getenv());
             }
         }
+        {
+            let mut collect_rule_nodes_to_insert = |rule_desc: &RuleDescriptor,
+                                                    dir: i64,
+                                                    crossref: &mut CrossRefMaps,
+                                                    find_nodeid: &mut SqlStatement|
+             -> Result<()> {
+                let isz: usize = (*rule_desc).into();
+                let rule_formula = read_write_buf.get_rule(rule_desc);
+                let name = rule_formula.get_rule_str();
+                let display_str = rule_formula.get_display_str();
+                let flags = rule_formula.get_flags();
+                let srcid = rule_formula.get_rule_ref().get_line();
+                if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
+                    crossref.add_rule_xref(*rule_desc, nodeid, dir);
+                    nodeids.insert((nodeid, RowType::Rule));
+                } else {
+                    let tuppath =
+                        read_write_buf.get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
+                    let tuppathstr = tuppath.to_string_lossy();
+                    let line = rule_formula.get_rule_ref().get_line();
+                    debug!(" rule to insert: {} at  {}:{}", name, tuppathstr, line);
+                    let prevline =
+                        unique_rule_check.insert(dir.to_string() + "/" + name.as_str(), line);
+                    if prevline.is_none() {
+                        rules_to_insert.push(Node::new_rule(
+                            isz as i64,
+                            dir,
+                            name,
+                            display_str,
+                            flags,
+                            srcid,
+                        ));
+                    } else {
+                        bail!(
+                            "Rule at  {}:{} was previously defined at line {}. \
+                        Ensure that rule definitions take the inputs as arguments.",
+                            tuppathstr.to_string().as_str(),
+                            line,
+                            prevline.unwrap()
+                        );
+                    }
+                }
+                Ok(())
+            };
+            for r in arts.rules_by_tup().iter() {
+                for rl in r.iter() {
+                    let rd = rl.get_rule_desc();
+                    let rule_ref = rl.get_tup_loc();
+                    let tup_desc = rule_ref.get_tupfile_desc();
+                    let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
+                        eyre::Error::msg(format!(
+                            "No tup directory found in db for tup descriptor:{:?}",
+                            tup_desc
+                        ))
+                    })?;
+                    collect_rule_nodes_to_insert(rd, dir, crossref, &mut find_nodeid)?;
+                    for p in rl.get_targets() {
+                        if processed.insert(p) {
+                            collect_nodes_to_insert(p, &GenF, 0, dir, crossref, &mut find_nodeid)?;
+                        }
+                    }
+                    for s in rl.get_sources() {
+                        if let Some(p) = s.get_glob_path_desc() {
+                            if processed_globs.insert(p) && s.is_glob_match() {
+                                let p = PathDescriptor::new(p.into());
+                                collect_nodes_to_insert(
+                                    &p,
+                                    &Glob,
+                                    0,
+                                    dir,
+                                    crossref,
+                                    &mut find_nodeid,
+                                )?;
+                            }
+                        }
+                    }
+                    for p in rl.get_excluded_targets() {
+                        if processed.insert(p) {
+                            collect_nodes_to_insert(
+                                p,
+                                &Excluded,
+                                0,
+                                dir,
+                                crossref,
+                                &mut find_nodeid,
+                            )?;
+                        }
+                    }
+                    let env_desc = rl.get_env_desc();
+                    let environs = read_write_buf.get_envs(env_desc);
+                    envs_to_insert.extend(environs.getenv());
+                }
+            }
+        }
+
         for r in arts.rules_by_tup().iter() {
             log::info!(
                 "Cross referencing inputs to insert with the db ids with same name and directory"
@@ -835,7 +934,7 @@ fn insert_nodes(
                         eyre!(
                             "No resolved path found for input:{:?} in rule:{:?}",
                             inp,
-                            rl.get_rule_ref()
+                            rl.get_tup_loc()
                         )
                     })?;
                     if processed.insert(p) {

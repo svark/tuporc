@@ -92,6 +92,8 @@ pub enum RowType {
     Excluded = 8,
     /// Glob input type for a rule
     Glob = 9,
+    /// named Task that may not have any outputs or inputs
+    Task = 10,
 }
 
 impl PartialOrd<Self> for RowType {
@@ -240,6 +242,25 @@ impl Node {
             mtime: 0,
             name,
             rtype: RowType::Rule,
+            display_str,
+            flags,
+            srcid: srcid as i64,
+        }
+    }
+    pub fn new_task(
+        id: i64,
+        dirid: i64,
+        name: String,
+        display_str: String,
+        flags: String,
+        srcid: u32,
+    ) -> Node {
+        Node {
+            id,
+            dirid,
+            mtime: 0,
+            name,
+            rtype: RowType::Task,
             display_str,
             flags,
             srcid: srcid as i64,
