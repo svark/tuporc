@@ -138,6 +138,7 @@ impl DbPathSearcher {
 
                     if glob_path.is_match(full_path.as_path()) {
                         let grps = glob_path.group(full_path.as_path());
+                        debug!("found match: {:?} for {:?}", grps, glob_pattern);
                         Some(MatchingPath::with_captures(
                             pd,
                             NormalPath::absolute_from(
@@ -685,7 +686,7 @@ fn insert_nodes(
         let mut find_dirid = conn.fetch_dirid_prepare()?;
         let mut find_group_id = conn.fetch_groupid_prepare()?;
         read_write_buf.for_each_group(|(group_path, grp_id)| {
-            let parent = tupparser::transform::get_parent_str(group_path.as_path());
+            let parent = tupparser::transform::get_parent_with_fsep(group_path.as_path());
             if let Some(dir) = get_dir_id(&mut find_dirid, parent.to_cow_str().as_ref()) {
                 let grp_name = group_path.file_name();
                 let id = find_group_id.fetch_group_id(grp_name.as_str(), dir).ok();
@@ -751,7 +752,6 @@ fn insert_nodes(
         };
         let mut processed = std::collections::HashSet::new();
         let mut processed_globs = std::collections::HashSet::new();
-        let mut collect_inps = |s: &InputResolvedType, dir: i64| -> Result<()> { Ok(()) };
         {
             let mut collect_task_nodes_to_insert = |task_desc: &TaskDescriptor,
                                                     dir: i64,
@@ -799,7 +799,7 @@ fn insert_nodes(
             for r in arts.tasks_by_tup().iter() {
                 for rl in r.iter() {
                     let rd = rl.get_task_descriptor();
-                    let tup_desc = rl.get_loc().get_tupfile_desc();
+                    let tup_desc = rl.get_tup_loc().get_tupfile_desc();
                     let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
                         eyre::Error::msg(format!(
                             "No tup directory found in db for tup descriptor:{:?}",
@@ -922,35 +922,49 @@ fn insert_nodes(
                 }
             }
         }
-
-        for r in arts.rules_by_tup().iter() {
+        let rules = arts.rules_by_tup();
+        let tasks = arts.tasks_by_tup();
+        let srcs_from_links = {
             log::info!(
-                "Cross referencing inputs to insert with the db ids with same name and directory"
+                "Cross referencing rule inputs to insert with the db ids with same name and directory"
             );
-            for rl in r.iter() {
-                for i in rl.get_sources() {
-                    let inp = read_write_buf.get_input_path_str(i);
-                    let p = i.get_resolved_path_desc().ok_or_else(|| {
-                        eyre!(
-                            "No resolved path found for input:{:?} in rule:{:?}",
-                            inp,
-                            rl.get_tup_loc()
-                        )
-                    })?;
-                    if processed.insert(p) {
-                        let (nodeid, dirid, par_dir_id) = find_by_path(
-                            Path::new(inp.as_str()),
-                            &mut find_nodeid,
-                            &mut find_dir_id_with_parent,
-                        )
-                        .map_err(|e| eyre!("failed to find path for {:?} due to {}", inp, e))?;
-                        let parent_id = read_write_buf
-                            .get_parent_id(p)
-                            .ok_or_else(|| eyre!("no parent id found for:{:?}", p))?;
-                        crossref.add_path_xref(*p, nodeid, dirid);
-                        crossref.add_path_xref(parent_id, dirid, par_dir_id);
-                    }
-                }
+            rules
+                .iter()
+                .flat_map(|rl| rl.iter())
+                .flat_map(|rl| rl.get_sources().map(|s| (rl.get_tup_loc(), s)))
+        };
+
+        let srcs_from_tasks = {
+            log::info!(
+                "Cross referencing task inputs to insert with the db ids with same name and directory"
+            );
+            tasks
+                .iter()
+                .flat_map(|rl| rl.iter())
+                .flat_map(|rl| rl.get_deps().iter().map(|s| (rl.get_tup_loc(), s)))
+        };
+
+        for (tup_loc, i) in srcs_from_links.chain(srcs_from_tasks) {
+            let inp = read_write_buf.get_input_path_str(&i);
+            let p = i.get_resolved_path_desc().ok_or_else(|| {
+                eyre!(
+                    "No resolved path found for input:{:?} in rule:{:?}",
+                    inp,
+                    tup_loc.clone()
+                )
+            })?;
+            if processed.insert(p) {
+                let (nodeid, dirid, par_dir_id) = find_by_path(
+                    Path::new(inp.as_str()),
+                    &mut find_nodeid,
+                    &mut find_dir_id_with_parent,
+                )
+                .map_err(|e| eyre!("failed to find path for {:?} due to {}", inp, e))?;
+                let parent_id = read_write_buf
+                    .get_parent_id(p)
+                    .ok_or_else(|| eyre!("no parent id found for:{:?}", p))?;
+                crossref.add_path_xref(*p, nodeid, dirid);
+                crossref.add_path_xref(parent_id, dirid, par_dir_id);
             }
         }
         nodeids.extend(existing_nodeids.iter());
@@ -1078,8 +1092,8 @@ impl AddIdsStatements<'_> {
     }
 }
 
-// this is pretends to be the sqlite upsert operation
-// it also adds the node to the present list, modify list and updates nodes mtime
+/// [find_upsert_node] pretends to be the sqlite upsert operation
+/// it also adds the node to the present list, modify list and updates nodes mtime
 pub(crate) fn find_upsert_node(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
