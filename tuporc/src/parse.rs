@@ -67,6 +67,7 @@ impl CrossRefMaps {
         self.pbo.get_by_left(&p).copied()
     }
 
+    #[allow(dead_code)]
     pub fn get_task_id(&self, t: &TaskDescriptor) -> Option<(i64, i64)> {
         self.tbo.get_by_left(t).copied()
     }
@@ -98,13 +99,15 @@ impl CrossRefMaps {
 struct DbPathSearcher {
     conn: Arc<Mutex<Connection>>,
     psx: OutputHolder,
+    root: std::path::PathBuf,
 }
 
 impl DbPathSearcher {
-    pub fn new(conn: Connection) -> DbPathSearcher {
+    pub fn new<P: AsRef<Path>>(conn: Connection, root: P) -> DbPathSearcher {
         DbPathSearcher {
             conn: Arc::new(Mutex::new(conn)),
             psx: OutputHolder::new(),
+            root: root.as_ref().to_path_buf(),
         }
     }
 
@@ -210,6 +213,10 @@ impl PathSearcher for DbPathSearcher {
         &self.psx
     }
 
+    fn get_root(&self) -> &Path {
+        self.root.as_path()
+    }
+
     fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
         OutputHandler::merge(&mut self.psx, p, o)
     }
@@ -227,7 +234,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     let (arts, mut rwbufs, mut outs) = {
         let conn = connection;
 
-        let db = DbPathSearcher::new(conn);
+        let db = DbPathSearcher::new(conn, root.as_ref());
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
         let mut visited = BTreeSet::new();
         {
