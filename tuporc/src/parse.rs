@@ -499,7 +499,7 @@ fn add_rule_links(
                     let env_id = crossref.get_env_db_id(&env_var).ok_or_else(|| {
                         eyre!("database env id not found for env var: {}", env_var)
                     })?;
-                    inp_linker.insert_link(env_id, rule_node_id, false, RowType::Rule)?;
+                    inp_linker.insert_link(env_id, rule_node_id, false, Rule)?;
                 }
                 log::info!(
                     "adding links from inputs  {:?} to rule: {:?}",
@@ -512,7 +512,7 @@ fn add_rule_links(
                             let (group_id, _) = crossref.get_group_db_id(&g).ok_or_else(|| {
                                 eyre!("db group not found with descriptor {:?}", g)
                             })?;
-                            inp_linker.insert_link(group_id, rule_node_id, true, RowType::Rule)?;
+                            inp_linker.insert_link(group_id, rule_node_id, true, Rule)?;
                         }
                         InputResolvedType::Deglob(mp) => {
                             let (pid, _) = crossref
@@ -526,7 +526,7 @@ fn add_rule_links(
                                 })?;
                             debug!("slink {} => {}", pid, rule_node_id);
                             if processed.insert(pid) {
-                                inp_linker.insert_link(pid, rule_node_id, true, RowType::Rule)?;
+                                inp_linker.insert_link(pid, rule_node_id, true, Rule)?;
                             }
                         }
                         InputResolvedType::BinEntry(_, p) => {
@@ -535,7 +535,7 @@ fn add_rule_links(
                                 .ok_or_else(|| eyre!("bin entry not found in db:{:?}", p))?;
                             debug!("bin slink {} => {}", pid, rule_node_id);
                             if processed.insert(pid) {
-                                inp_linker.insert_link(pid, rule_node_id, true, RowType::Rule)?;
+                                inp_linker.insert_link(pid, rule_node_id, true, Rule)?;
                             }
                         }
                         InputResolvedType::GroupEntry(g, p) => {
@@ -544,21 +544,11 @@ fn add_rule_links(
                             })?;
                             debug!("group link {} => {}", group_id, rule_node_id);
                             if processed_group.insert(group_id) {
-                                inp_linker.insert_link(
-                                    group_id,
-                                    rule_node_id,
-                                    true,
-                                    RowType::Rule,
-                                )?;
+                                inp_linker.insert_link(group_id, rule_node_id, true, Rule)?;
                             }
                             if let Some((pid, _)) = crossref.get_path_db_id(&p) {
                                 if processed.insert(pid) {
-                                    inp_linker.insert_link(
-                                        pid,
-                                        rule_node_id,
-                                        true,
-                                        RowType::Rule,
-                                    )?;
+                                    inp_linker.insert_link(pid, rule_node_id, true, Rule)?;
                                 }
                             }
                         }
@@ -593,21 +583,21 @@ fn add_rule_links(
                                 .get_path_db_id(t)
                                 .ok_or_else(|| eyre!("failed to fetch db id of path {}", t))?;
                             out_linker.insert_link(p, g, true, RowType::Grp)?;
-                            out_linker.insert_link(rule_node_id, p, true, RowType::GenF)?;
+                            out_linker.insert_link(rule_node_id, p, true, GenF)?;
                         }
                     } else {
                         for t in rl.get_targets() {
                             let (p, _) = crossref
                                 .get_path_db_id(t)
                                 .ok_or_else(|| eyre!("failed to fetch db id of path {}", t))?;
-                            out_linker.insert_link(rule_node_id, p, true, RowType::GenF)?;
+                            out_linker.insert_link(rule_node_id, p, true, GenF)?;
                         }
                     }
                     for t in rl.get_excluded_targets() {
                         let (p, _) = crossref
                             .get_path_db_id(t)
                             .ok_or_else(|| eyre!("failed to fetch db id of path {}", t))?;
-                        out_linker.insert_link(rule_node_id, p, true, RowType::Excluded)?;
+                        out_linker.insert_link(rule_node_id, p, true, Excluded)?;
                     }
                 }
             }
@@ -849,7 +839,7 @@ fn insert_nodes(
                 let srcid = rule_formula.get_rule_ref().get_line();
                 if let Ok(nodeid) = find_nodeid.fetch_node_id(name.as_str(), dir) {
                     crossref.add_rule_xref(*rule_desc, nodeid, dir);
-                    nodeids.insert((nodeid, RowType::Rule));
+                    nodeids.insert((nodeid, Rule));
                 } else {
                     let tuppath =
                         read_write_buf.get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
@@ -1009,11 +999,11 @@ fn insert_nodes(
                     add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
                 }
                 crossref.add_env_xref(env_var, env_id);
-                nodeids.insert((env_id, RowType::Env));
+                nodeids.insert((env_id, Env));
             } else {
                 let env_id = inst_env_stmt.insert_env_exec(env_var.as_str(), env_val.as_str())?;
                 crossref.add_env_xref(env_var, env_id);
-                nodeids.insert((env_id, RowType::Env));
+                nodeids.insert((env_id, Env));
                 add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
             }
         }

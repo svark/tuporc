@@ -198,7 +198,7 @@ impl ProcReceivers {
     fn get_index<'a, P: 'a>(
         receiver: &'a Receiver<P>,
         condition: bool,
-        select: &mut crossbeam::channel::Select<'a>,
+        select: &mut Select<'a>,
     ) -> usize {
         if condition {
             usize::MAX

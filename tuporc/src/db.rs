@@ -110,9 +110,9 @@ impl Ord for RowType {
 
 const ENVDIR: i8 = -2;
 
-impl ToString for RowType {
-    fn to_string(&self) -> String {
-        (*self as u8).to_string()
+impl Display for RowType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", (*self as u8).to_string())
     }
 }
 
@@ -658,10 +658,10 @@ impl LibSqlPrepare for Connection {
 
     // remove rules that succeeded and their inputs from the modify list
     fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!(
+        let stmt = self.prepare(
             "DELETE from ModifyList where id in (SELECT id from SuccessList \
-             UNION SELECT from_id from NormalLink where to_id in (SELECT id from SuccessList))"
-        ))?;
+             UNION SELECT from_id from NormalLink where to_id in (SELECT id from SuccessList))",
+        )?;
         Ok(SqlStatement {
             stmt,
             tok: PruneMod,
@@ -823,11 +823,9 @@ impl LibSqlPrepare for Connection {
         })
     }
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement> {
-        let stmtstr = format!(
-            "SELECT Node.id, Node.dir from Node where Node.name = ? and dir in \
-        (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)"
-        );
-        let stmt = self.prepare(stmtstr.as_str())?;
+        let stmtstr = "SELECT Node.id, Node.dir from Node where Node.name = ? and dir in \
+        (SELECT id from DIRPATHBUF where DIRPATHBUF.name=?)";
+        let stmt = self.prepare(stmtstr)?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodeByPath,
@@ -931,7 +929,7 @@ SELECT DISTINCT x FROM dependants));",
     }
 
     fn restore_deleted_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!("DELETE from DeletedList where id = ?"))?;
+        let stmt = self.prepare("DELETE from DeletedList where id = ?")?;
         Ok(SqlStatement {
             stmt,
             tok: RestoreDeleted,
@@ -939,7 +937,7 @@ SELECT DISTINCT x FROM dependants));",
     }
 
     fn mark_deleted_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare(&*format!("Insert into DeletedList (id) VALUES(?)"))?;
+        let stmt = self.prepare("Insert into DeletedList (id) VALUES(?)")?;
         Ok(SqlStatement {
             stmt,
             tok: RestoreDeleted,
@@ -1001,18 +999,18 @@ impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         assert_eq!(self.tok, AddToMod, "wrong token for update to modifylist");
         // statement ignores input if already present. So we call the method execute here rather than insert
-        self.stmt.execute((id, (rtype as u8)))?;
+        self.stmt.execute((id, rtype as u8))?;
         Ok(())
     }
     fn add_to_delete_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         assert_eq!(self.tok, AddToDel, "wrong token for update to deletelist");
         // statement ignores input if already present. So we call the method execute here rather than insert
-        self.stmt.execute((id, (rtype as u8)))?;
+        self.stmt.execute((id, rtype as u8))?;
         Ok(())
     }
     fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         assert_eq!(self.tok, AddToPres, "wrong token for update to presentlist");
-        self.stmt.execute((id, (rtype as u8)))?;
+        self.stmt.execute((id, rtype as u8))?;
         Ok(())
     }
 
@@ -1021,7 +1019,7 @@ impl LibSqlExec for SqlStatement<'_> {
             self.tok, AddToTempIds,
             "wrong token for update to tempidslist"
         );
-        self.stmt.insert((id, (rtype as u8)))?;
+        self.stmt.insert((id, rtype as u8))?;
         Ok(())
     }
 
@@ -1089,7 +1087,7 @@ impl LibSqlExec for SqlStatement<'_> {
             n.dirid,
             n.name.as_str(),
             n.mtime,
-            (*n.get_type() as u8),
+            *n.get_type() as u8,
             n.get_display_str(),
             n.get_flags(),
             n.get_srcid(),
@@ -1153,7 +1151,7 @@ impl LibSqlExec for SqlStatement<'_> {
     fn fetch_node_id(&mut self, node_name: &str, dir: i64) -> Result<i64> {
         assert_eq!(self.tok, FindNodeId, "wrong token for fetch node");
         debug!("query:{:?}, {:?}", node_name, dir);
-        let nodeid = self.stmt.query_row((dir, node_name), |r| (r.get(0)))?;
+        let nodeid = self.stmt.query_row((dir, node_name), |r| r.get(0))?;
         Ok(nodeid)
     }
 
