@@ -261,7 +261,7 @@ fn walkdir_from(
         .min_depth(1)
         .max_depth(1)
         .into_iter()
-        .filter_map(eyre::Result::ok)
+        .filter_map(Result::ok)
     {
         let pp = HashedPath::from(e.path().to_path_buf());
         let cur_path = pp.clone();
