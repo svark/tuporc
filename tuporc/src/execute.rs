@@ -697,7 +697,7 @@ impl RulesToVerify {
         self.to_verify.iter()
     }
 
-    fn reverify(&mut self, to_verify: Vec<(u32, i64, String)>) {
+    fn verify_again(&mut self, to_verify: Vec<(u32, i64, String)>) {
         self.to_verify = to_verify;
     }
 
@@ -726,6 +726,11 @@ impl<'a> ProcessIOChecker<'a> {
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
         let fetch_outputs = self.output_getter.fetch_outputs(rule_id)?;
         Ok(fetch_outputs)
+    }
+
+    fn fetch_flags(&mut self, rule_id: i32) -> Result<Option<String>> {
+        let flags = self.output_getter.fetch_flags(rule_id)?;
+        Ok(flags)
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, node_path: P) -> Result<i64> {
@@ -874,7 +879,7 @@ fn listen_to_processes(
                         });
                 }
             }
-            rules_to_verify.reverify(reverify);
+            rules_to_verify.verify_again(reverify);
         }
         if poisoned.should_stop() {
             break;
@@ -897,6 +902,9 @@ fn verify_rule_io(
     let io_vec = io_conn.fetch_io(ch_id)?;
     let inps = process_checker.fetch_inputs(rule_id as _)?;
     let outs = process_checker.fetch_outputs(rule_id as _)?;
+    let flags = process_checker
+        .fetch_flags(rule_id as _)?
+        .unwrap_or(String::new());
     let mut processed_io = std::collections::BTreeSet::new();
     'outer: for (fnode, ty) in io_vec.iter() {
         if !processed_io.insert((fnode.clone(), *ty)) {
@@ -954,10 +962,12 @@ fn verify_rule_io(
                 continue 'outer2;
             }
         }
-        eprintln!(
-            "Proc:{} File {} was not read by rule {}",
-            ch_id, fname, rule_name
-        );
+        if flags.contains('*') {
+            eprintln!(
+                "Proc:{} file {} was not read by rule {}",
+                ch_id, fname, rule_name
+            );
+        }
         //return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
     }
     'outer3: for out in outs.iter() {

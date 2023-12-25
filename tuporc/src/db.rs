@@ -349,6 +349,7 @@ pub enum StatementType {
     PruneMod,
     FetchOutputsForRule,
     FetchInputsForRule,
+    FetchFlagsForRule,
     InsertTrace,
 }
 
@@ -399,6 +400,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_envs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_flags_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn insert_trace_prepare(&self) -> Result<SqlStatement>;
 }
 
@@ -489,6 +491,8 @@ pub(crate) trait LibSqlExec {
     fn fetch_envs(&mut self, rule_id: i32) -> Result<Vec<String>>;
     /// fetch all inputs of the given rule
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
+    /// fetch flags of the given rule
+    fn fetch_flags(&mut self, rule_id: i32) -> Result<Option<String>>;
     /// fetch all outputs of the given rule
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
     fn insert_trace<P: AsRef<Path>>(
@@ -985,6 +989,13 @@ SELECT DISTINCT x FROM dependants));",
             tok: FetchInputsForRule,
         })
     }
+    fn fetch_flags_for_rule_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(&"SELECT flags from Node where id=?".to_string())?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchFlagsForRule,
+        })
+    }
 
     fn insert_trace_prepare(&self) -> Result<SqlStatement> {
         let stmt = self
@@ -1364,6 +1375,18 @@ impl LibSqlExec for SqlStatement<'_> {
             vs.push(n);
         }
         Ok(vs)
+    }
+    fn fetch_flags(&mut self, rule_id: i32) -> Result<Option<String>> {
+        assert_eq!(
+            self.tok, FetchFlagsForRule,
+            "wrong token for FetchFlagsForRule"
+        );
+        let mut rows = self.stmt.query([rule_id])?;
+        if let Some(r) = rows.next()? {
+            let n: String = r.get(0)?;
+            return Ok(Some(n));
+        }
+        Ok(None)
     }
 
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
