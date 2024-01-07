@@ -15,7 +15,6 @@ extern crate regex;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::env::current_dir;
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -31,6 +30,7 @@ use crate::parse::{gather_tupfiles, parse_tupfiles_in_db};
 
 mod db;
 mod execute;
+mod monitor;
 mod parse;
 mod scan;
 
@@ -176,8 +176,8 @@ enum Action {
     },
 }
 
-fn is_tupfile(s: &OsStr) -> bool {
-    s == "Tupfile" || s == "Tupfile.lua"
+fn is_tupfile<S: AsRef<str>>(s: S) -> bool {
+    s.as_ref().eq("Tupfile") || s.as_ref().eq("Tupfile.lua")
 }
 
 fn main() -> Result<()> {
@@ -190,20 +190,25 @@ fn main() -> Result<()> {
                 init_db();
             }
             Action::Scan => {
-                let mut conn = Connection::open(".tup/db")
-                    .expect("Connection to tup database in .tup/db could not be established");
-                if !is_initialized(&conn, "Node") {
-                    return Err(eyre!(
-                        "Tup database is not initialized, use `tup init' to initialize",
-                    ));
-                }
-                let root = current_dir()?;
+                {
+                    let mut conn = Connection::open(".tup/db")
+                        .expect("Connection to tup database in .tup/db could not be established");
+                    if !is_initialized(&conn, "Node") {
+                        return Err(eyre!(
+                            "Tup database is not initialized, use `tup init' to initialize",
+                        ));
+                    }
+                    let root = current_dir()?;
 
-                let term_progress = TermProgress::new("Scanning for files");
-                match scan::scan_root(root.as_path(), &mut conn, &term_progress) {
-                    Err(e) => eprintln!("{}", e),
-                    Ok(()) => println!("Scan was successful"),
-                };
+                    let term_progress = TermProgress::new("Scanning for files");
+                    match scan::scan_root(root.as_path(), &mut conn, &term_progress) {
+                        Err(e) => eprintln!("{}", e),
+                        Ok(()) => println!("Scan was successful"),
+                    };
+                }
+                {
+                    monitor::monitor();
+                }
             }
             Action::Parse => {
                 let root = current_dir()?;

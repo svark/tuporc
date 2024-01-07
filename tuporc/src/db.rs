@@ -10,6 +10,7 @@ use rusqlite::{Connection, Params, Row, Statement};
 
 use tupparser::paths::MatchingPath;
 
+use crate::db::RowType::GenF;
 use crate::db::StatementType::*;
 
 #[derive(Debug)]
@@ -351,6 +352,11 @@ pub enum StatementType {
     FetchInputsForRule,
     FetchFlagsForRule,
     InsertTrace,
+    FetchMonitored,
+    InsertMonitored,
+    RemoveMonitoredByPath,
+    RemoveMonitoredById,
+    FetchMessage,
 }
 
 pub struct SqlStatement<'conn> {
@@ -402,6 +408,12 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_flags_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn insert_trace_prepare(&self) -> Result<SqlStatement>;
+    fn insert_monitored_prepare(&self) -> Result<SqlStatement>;
+    fn remove_monitored_by_id_prepare(&self) -> Result<SqlStatement>;
+    fn remove_monitored_gen_files_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_monitored_prepare(&self) -> Result<SqlStatement>;
+    // fetch the next message from build system.
+    fn fetch_message_prepare(&self) -> Result<SqlStatement>;
 }
 
 pub(crate) trait LibSqlExec {
@@ -503,6 +515,11 @@ pub(crate) trait LibSqlExec {
         typ: u8,
         childcnt: i32,
     ) -> Result<()>;
+
+    fn insert_monitored<P: AsRef<Path>>(&mut self, p: P, keyword_id: i64, event: i32)
+        -> Result<()>;
+    fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, generation_id: i64) -> Result<()>;
+    fn remove_monitored_by_generation_id(&mut self, generation_id: i64) -> Result<()>;
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
@@ -512,6 +529,8 @@ pub(crate) trait MiscStatements {
     fn prune_present_list(&self) -> Result<()>;
     fn prune_modified_list(&self) -> Result<()>;
     fn remove_modified_list(&self) -> Result<()>;
+    fn write_message(&self, message: &str) -> Result<()>;
+    fn read_message(&self, last_id: i64) -> Result<String>;
 }
 pub(crate) trait ForEachClauses {
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
@@ -1005,6 +1024,53 @@ SELECT DISTINCT x FROM dependants));",
             tok: InsertTrace,
         })
     }
+
+    fn insert_monitored_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self
+            .prepare("INSERT INTO MONITORED_FILES (path, generation_id, event) VALUES (?, ?, ?)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertMonitored,
+        })
+    }
+    fn remove_monitored_by_id_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE from MONITORED_FILES where generation_id < ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RemoveMonitoredById,
+        })
+    }
+
+    fn remove_monitored_gen_files_prepare(&self) -> Result<SqlStatement> {
+        let ftype = GenF;
+        let stmt = self
+            .prepare(&*format!(
+                "DELETE from MONITORED_FILES where generation_id = ? and path in (\
+            SELECT (DirPathBuf.name || '/' || Node.name) name from NODE inner join \
+            DirPathBuf on (Node.dir = DirPathBuf.id) where (Node.type = {ftype} ) \
+            and Node.id in (SELECT id from ModifyList)"
+            ))
+            .expect("unable to prepare stmt to fetch generated files in last build");
+        Ok(SqlStatement {
+            stmt,
+            tok: RemoveMonitoredByPath,
+        })
+    }
+
+    fn fetch_monitored_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT path from MONITORED_FILES where generation_id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchMonitored,
+        })
+    }
+    fn fetch_message_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT message from MESSAGE where id = (SELECT (MAX(id)")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchMessage,
+        })
+    }
 }
 impl LibSqlExec for SqlStatement<'_> {
     fn add_to_modify_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
@@ -1414,6 +1480,39 @@ impl LibSqlExec for SqlStatement<'_> {
         assert_eq!(self.tok, InsertTrace, "wrong token for insert trace");
         let filepath = db_path_str(path);
         self.stmt.insert((filepath, pid, gen, typ, childcnt))?;
+        Ok(())
+    }
+
+    fn insert_monitored<P: AsRef<Path>>(
+        &mut self,
+        p: P,
+        generation_id: i64,
+        event: i32,
+    ) -> Result<()> {
+        assert_eq!(
+            self.tok, InsertMonitored,
+            "wrong token for insert monitored"
+        );
+        let path = db_path_str(p);
+        self.stmt.insert((path, generation_id, event)).unwrap();
+        Ok(())
+    }
+    fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, id: i64) -> Result<()> {
+        assert_eq!(
+            self.tok, RemoveMonitoredByPath,
+            "wrong token for remove monitored"
+        );
+        //let path = db_path_str(p);
+        self.stmt.execute((id,)).unwrap();
+        Ok(())
+    }
+    fn remove_monitored_by_generation_id(&mut self, id: i64) -> Result<()> {
+        assert_eq!(
+            self.tok,
+            StatementType::RemoveMonitoredById,
+            "wrong token for remove monitored"
+        );
+        self.stmt.execute((id,)).unwrap();
         Ok(())
     }
 }
@@ -1855,6 +1954,25 @@ FROM NodeChain;"
         let mut stmt = self.prepare_cached("DELETE FROM ModifyList")?;
         stmt.execute([])?;
         Ok(())
+    }
+    fn write_message(&self, message: &str) -> Result<()> {
+        self.execute("INSERT INTO MESSAGE (message) VALUES (?1)", (message))?;
+        Ok(())
+    }
+
+    fn read_message(&self, last_id: i64) -> Result<String> {
+        let mut stmt = self.prepare("SELECT id, message FROM MESSAGE ORDER BY id DESC LIMIT 1")?;
+        let mut message_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        if let Some(message_row) = message_iter.next() {
+            let (id, message): (i64, String) = message_row?;
+            if (id == last_id) {
+                return Err(rusqlite::Error::QueryReturnedNoRows).into();
+            }
+            Ok(message)
+        } else {
+            return Err(rusqlite::Error::QueryReturnedNoRows).into();
+        }
     }
 }
 

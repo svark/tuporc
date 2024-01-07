@@ -58,3 +58,27 @@ VALUES ('File', 0),
        ('Glob', 9)
 
 
+-- create a table containing a live list of files monitored under a root directory based on presence of keyword in the file
+CREATE TABLE MONITORED_FILES
+(
+    id INTEGER PRIMARY KEY not NULL,
+    name VARCHAR(4096) not NULL,
+    event INTEGER not NULL,
+    generation_id INTEGER not NULL,
+);
+CREATE TABLE MESSAGES (id INTEGER PRIMARY KEY not NULL, message CHAR(8) not NULL);
+
+PRAGMA journal_mode = WAL
+PRAGMA synchronous = NORMAL
+PRAGMA temp_store = MEMORY
+PRAGMA cache_size = 10000
+PRAGMA mmap_size = 30000000000
+PRAGMA threads = 12
+PRAGMA foreign_keys = ON
+PRAGMA busy_timeout = 10000
+PRAGMA encoding = "UTF-8"
+PRAGMA page_size = 4096
+PRAGMA auto_vacuum = INCREMENTAL
+PRAGMA incremental_vacuum(100)
+PRAGMA wal_autocheckpoint = 1000
+PRAGMA wal_checkpoint(TRUNCATE)

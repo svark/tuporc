@@ -55,7 +55,7 @@ struct DirE {
     file_type: FileType,
     file_name: OsString,
     metadata: Option<Metadata>,
-    hashed_path: HashedPath,
+    hashed_path: Option<HashedPath>, // this is an option to enable taking ownership of the path
 }
 
 impl DirE {
@@ -64,12 +64,12 @@ impl DirE {
             file_type: de.file_type(),
             file_name: de.file_name().to_owned(),
             metadata: de.metadata().ok(),
-            hashed_path,
+            hashed_path: Some(hashed_path),
         }
     }
 
-    fn get_path(&self) -> &HashedPath {
-        &self.hashed_path
+    fn take_path(&mut self) -> HashedPath {
+        self.hashed_path.take().unwrap()
     }
 
     fn file_type(&self) -> &FileType {
@@ -80,13 +80,13 @@ impl DirE {
         &self.file_name
     }
 
-    fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
+    fn take_metadata(&mut self) -> Option<Metadata> {
+        self.metadata.take()
     }
 }
 
 #[derive(Debug, Clone)]
-struct HashedPath {
+pub(crate) struct HashedPath {
     path: Arc<PathBuf>,
     hash: u64,
 }
@@ -195,12 +195,12 @@ impl ProtoNode {
         &self.p.file_name
     }
 
-    fn get_parent_id(&self) -> i64 {
+    fn get_dir_id(&self) -> i64 {
         self.pid
     }
 
-    fn get_path(&self) -> &HashedPath {
-        self.p.get_path()
+    fn take_path(&mut self) -> HashedPath {
+        self.p.take_path()
     }
 }
 
@@ -286,6 +286,51 @@ fn send_children(
     Ok(())
 }
 
+fn create_node_at_path<S: AsRef<str>>(
+    dirid: i64,
+    file_name: S,
+    p: HashedPath,
+    mtime: i64,
+    rtype: RowType,
+) -> NodeAtPath {
+    let node = Node::new(0, dirid, mtime, file_name.to_string(), rtype);
+    NodeAtPath::new(node, p)
+}
+
+// prepare node for insertion into db
+pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
+    dirid: i64,
+    file_name: S,
+    p: HashedPath,
+    metadata: Option<Metadata>,
+) -> eyre::Result<Option<NodeAtPath>> {
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => {
+            eprintln!(
+                "cannot read metadata for directory entry: {:?}",
+                file_name.as_ref()
+            );
+            return Ok(None);
+        }
+    };
+    let mtime = time_since_unix_epoch(&metadata)
+        .ok()
+        .unwrap_or(Duration::from_secs(0))
+        .subsec_nanos() as i64;
+    let rtype = if metadata.is_file() {
+        if crate::is_tupfile(file_name.as_ref()) {
+            TupF
+        } else {
+            RowType::File
+        }
+    } else if metadata.is_dir() {
+        Dir
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(create_node_at_path(dirid, file_name, p, mtime, rtype)))
+}
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
     root: &Path,
@@ -368,8 +413,7 @@ fn insert_direntries(
                                 );
                             }
                             _ => {
-                                eprintln!("unknown index returned in select");
-                                break;
+                                unreachable!("unknown index returned in select");
                             }
                         }
                         if end_dirs || end_dir_children {
@@ -394,37 +438,15 @@ fn insert_direntries(
                 let ns = nodesender.clone();
                 let dire_receiver = dire_receiver.clone();
                 s.spawn(move |_| -> eyre::Result<()> {
-                    for p in dire_receiver.iter() {
-                        let f = p.get_dire();
-                        let pid = p.get_parent_id();
-                        let file_name = p.get_file_name();
-                        if f.file_type().is_file() {
-                            let metadata = f.metadata();
-                            if metadata.is_none() {
-                                eprintln!("cannot read metadata for: {:?}", file_name);
-                                continue;
-                            }
-                            if let Ok(mtime) = time_since_unix_epoch(metadata.unwrap()) {
-                                // for a node already in db, check the diffs in mtime
-                                // otherwise insert node in db
-                                let rtype = if crate::is_tupfile(f.file_name()) {
-                                    TupF
-                                } else {
-                                    RowType::File
-                                };
-                                let node = Node::new(
-                                    0,
-                                    pid,
-                                    mtime.subsec_nanos() as i64,
-                                    file_name.to_string_lossy().to_string(),
-                                    rtype,
-                                );
-                                ns.send(NodeAtPath::new(node, p.get_path().clone()))?;
-                            }
-                        } else if f.file_type().is_dir() {
-                            let node =
-                                Node::new(0, pid, 0, file_name.to_string_lossy().to_string(), Dir);
-                            ns.send(NodeAtPath::new(node, p.get_path().clone()))?;
+                    for mut p in dire_receiver.iter() {
+                        let dirid = p.get_dir_id();
+                        let file_name = p.get_file_name().to_string_lossy();
+                        let hashed_path = p.take_path();
+                        let metadata = p.get_dire().take_metadata();
+                        let node_at_path =
+                            prepare_node_at_path(dirid, file_name, hashed_path, metadata)?;
+                        if let Some(node_at_path) = node_at_path {
+                            ns.send(node_at_path)?;
                         }
                     }
                     drop(ns);
@@ -496,16 +518,13 @@ fn add_modify_nodes(
     {
         let mut node_statements = parse::NodeStatements::new(tx.deref())?;
         let mut add_ids_statements = parse::AddIdsStatements::new(tx.deref())?;
-        for tnode in nodereceiver.iter() {
-            let node = tnode.get_node();
+        for node_at_path in nodereceiver.iter() {
+            let node = node_at_path.get_node();
             log::debug!("recvd {}, {:?}", node.get_name(), node.get_type());
+            let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
             if node.get_type() == &Dir {
-                let id: i64 =
-                    find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?.get_id();
-
-                dirid_sender.send((tnode.get_hashed_path().clone(), id))?;
-            } else {
-                find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
+                let id = inserted.get_id();
+                dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;
             }
             progressbar.tick();
         }
