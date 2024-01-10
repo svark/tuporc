@@ -133,12 +133,13 @@ impl DbPathSearcher {
                 debug!("found:{} at {:?}", s, base_path);
                 if has_glob_pattern {
                     let full_path_pd = glob_path.get_base_desc().join(s.as_str());
+                    let full_path_pd_clone = full_path_pd.clone();
                     let full_path = full_path_pd.get_path();
                     if glob_path.is_match(full_path.as_path()) {
                         let grps = glob_path.group(full_path.as_path());
                         debug!("found match: {:?} for {:?}", grps, glob_path);
                         Some(MatchingPath::with_captures(
-                            full_path_pd,
+                            full_path_pd_clone,
                             glob_path.get_glob_desc(),
                             grps,
                         ))
@@ -828,9 +829,14 @@ fn insert_nodes(
                 } else {
                     let tuppath =
                         read_write_buf.get_tup_path(task_instance.get_tup_loc().get_tupfile_desc());
-                    let tuppathstr = tuppath.as_path().to_string_lossy();
+                    let tuppathstr = tuppath.as_path();
                     let line = task_instance.get_tup_loc().get_line();
-                    debug!(" task to insert: {} at  {}:{}", name, tuppathstr, line);
+                    debug!(
+                        " task to insert: {} at  {}:{}",
+                        name,
+                        tuppathstr.display(),
+                        line
+                    );
                     let prevline = unique_rule_check.insert(name.to_string(), line);
                     if prevline.is_none() {
                         rules_to_insert.push(Node::new_task(
@@ -845,7 +851,7 @@ fn insert_nodes(
                         bail!(
                             "Task at  {}:{} was previously defined at line {}. \
                         Ensure that rule definitions take the inputs as arguments.",
-                            tuppathstr.to_string().as_str(),
+                            tuppathstr.display(),
                             line,
                             prevline.unwrap()
                         );
@@ -905,8 +911,13 @@ fn insert_nodes(
                     if log::log_enabled!(log::Level::Debug) {
                         let tuppath = read_write_buf
                             .get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
-                        let tuppathstr = tuppath.as_path().to_string_lossy();
-                        debug!(" rule to insert: {} at  {}:{}", name, tuppathstr, line);
+                        let tuppathstr = tuppath.as_path();
+                        debug!(
+                            " rule to insert: {} at  {}:{}",
+                            name,
+                            tuppathstr.display(),
+                            line
+                        );
                     }
                     let prevline =
                         unique_rule_check.insert(dir.to_string() + "/" + name.as_str(), line);
