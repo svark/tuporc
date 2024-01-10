@@ -6,6 +6,7 @@ extern crate ctrlc;
 extern crate env_logger;
 extern crate execute as ex;
 extern crate eyre;
+extern crate fs2;
 extern crate incremental_topo;
 extern crate indicatif;
 extern crate num_cpus;
@@ -14,7 +15,7 @@ extern crate regex;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::env::current_dir;
+use std::env::{current_dir, set_current_dir};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 
 use db::{Node, RowType};
+use tupparser::locate_file;
 
 use crate::db::{init_db, is_initialized, LibSqlPrepare};
 use crate::parse::{gather_tupfiles, parse_tupfiles_in_db};
@@ -174,6 +176,11 @@ enum Action {
         #[arg(short = 'k', default_value = "false")]
         keep_going: bool,
     },
+    #[clap(about = "Monitor the filesystem for changes")]
+    Monitor {
+        #[clap(short = 's', default_value = "true")]
+        start: bool,
+    },
 }
 
 fn is_tupfile<S: AsRef<str>>(s: S) -> bool {
@@ -190,27 +197,24 @@ fn main() -> Result<()> {
                 init_db();
             }
             Action::Scan => {
-                {
-                    let mut conn = Connection::open(".tup/db")
-                        .expect("Connection to tup database in .tup/db could not be established");
-                    if !is_initialized(&conn, "Node") {
-                        return Err(eyre!(
-                            "Tup database is not initialized, use `tup init' to initialize",
-                        ));
-                    }
-                    let root = current_dir()?;
+                change_root()?;
+                let mut conn = Connection::open(".tup/db")
+                    .expect("Connection to tup database in .tup/db could not be established");
+                if !is_initialized(&conn, "Node") {
+                    return Err(eyre!(
+                        "Tup database is not initialized, use `tup init' to initialize",
+                    ));
+                }
+                let root = current_dir()?;
 
-                    let term_progress = TermProgress::new("Scanning for files");
-                    match scan::scan_root(root.as_path(), &mut conn, &term_progress) {
-                        Err(e) => eprintln!("{}", e),
-                        Ok(()) => println!("Scan was successful"),
-                    };
-                }
-                {
-                    monitor::monitor();
-                }
+                let term_progress = TermProgress::new("Scanning for files");
+                match scan::scan_root(root.as_path(), &mut conn, &term_progress) {
+                    Err(e) => eprintln!("{}", e),
+                    Ok(()) => println!("Scan was successful"),
+                };
             }
             Action::Parse => {
+                change_root()?;
                 let root = current_dir()?;
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
@@ -219,6 +223,7 @@ fn main() -> Result<()> {
                 parse_tupfiles_in_db(connection, tupfiles, root.as_path(), term_progress)?;
             }
             Action::Upd { target, keep_going } => {
+                change_root()?;
                 println!("Updating db {}", target.join(" "));
                 let root = current_dir()?;
                 let term_progress = TermProgress::new("Building ");
@@ -237,9 +242,34 @@ fn main() -> Result<()> {
                 // build a dag of rules and files from the ModifyList in the database
                 // and the tupfiles in the filesystem.
             }
+            Action::Monitor { start } => {
+                change_root()?;
+                if start {
+                    monitor::WatchObject::new(current_dir()?).start()?;
+                } else {
+                    println!("Stopping monitor");
+                    monitor::WatchObject::new(current_dir()?).stop()?;
+                }
+            }
         }
     }
     println!("Done");
+    Ok(())
+}
+
+fn change_root() -> Result<()> {
+    let tupfile_ini = locate_file(current_dir()?, "Tupfile.ini", "root");
+    if tupfile_ini.is_none() {
+        return Err(eyre!(
+            "Tupfile.ini not found in current directory or any parent directory"
+        ));
+    }
+    set_current_dir(
+        tupfile_ini
+            .unwrap()
+            .parent()
+            .expect("Tupfile.ini has no parent"),
+    )?;
     Ok(())
 }
 

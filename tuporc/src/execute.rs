@@ -118,7 +118,7 @@ pub(crate) fn execute_targets(
     let f = |node: &Node| -> std::result::Result<Node, AnyError> {
         let rule_id = node.get_id();
         let rule_ref = TupLoc::new(
-            &TupPathDescriptor::from(0),
+            &TupPathDescriptor::default(),
             &Loc::new(node.get_srcid() as _, 0, 0),
         );
         let rule_string = node.get_name();

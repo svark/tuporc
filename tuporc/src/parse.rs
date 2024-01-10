@@ -65,8 +65,7 @@ impl CrossRefMaps {
     }
 
     pub fn get_glob_db_id(&self, s: &GlobPathDescriptor) -> Option<(i64, i64)> {
-        let p = PathDescriptor::new((*s).into());
-        self.pbo.get_by_left(&p).copied()
+        self.pbo.get_by_left(&s).copied()
     }
 
     #[allow(dead_code)]
@@ -115,7 +114,7 @@ impl DbPathSearcher {
 
     fn fetch_glob_nodes(
         &self,
-        ph: &mut impl PathBuffers,
+        ph: &impl PathBuffers,
         glob_paths: &[GlobPath], // glob paths to search for (corresponding to search dirs that were specified before)
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
         for glob_path in glob_paths {
@@ -128,24 +127,18 @@ impl DbPathSearcher {
             }
 
             let base_path = glob_path.get_base_desc();
-            if base_path.is_dir() {
-                debug!("base path is dir: {:?}", base_path.get_path());
-            } else {
-                debug!("base path is not dir: {:?}", base_path.get_path());
-                continue;
-            }
+            debug!("base path is : {:?}", base_path.get_path());
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
             let fetch_row = |s: &String| -> Option<MatchingPath> {
                 debug!("found:{} at {:?}", s, base_path);
-                let pd = ph.add_path_from(base_path, Path::new(s.as_str()));
                 if has_glob_pattern {
-                    let full_path = glob_path.get_base_abs_path().join(s.as_str());
-
+                    let full_path_pd = glob_path.get_base_desc().join(s.as_str());
+                    let full_path = full_path_pd.get_path();
                     if glob_path.is_match(full_path.as_path()) {
                         let grps = glob_path.group(full_path.as_path());
                         debug!("found match: {:?} for {:?}", grps, glob_path);
                         Some(MatchingPath::with_captures(
-                            pd,
+                            full_path_pd,
                             glob_path.get_glob_desc(),
                             grps,
                         ))
@@ -153,6 +146,7 @@ impl DbPathSearcher {
                         None
                     }
                 } else {
+                    let pd = ph.add_path_from(base_path, Path::new(s.as_str()));
                     Some(MatchingPath::new(pd))
                 }
             };
@@ -162,7 +156,7 @@ impl DbPathSearcher {
             let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
 
             let mps = glob_query.fetch_glob_nodes(
-                base_path,
+                base_path.get_path().as_path(),
                 glob_pattern.as_path(),
                 recursive,
                 fetch_row,
@@ -186,7 +180,7 @@ impl DbPathSearcher {
 impl PathSearcher for DbPathSearcher {
     fn discover_paths(
         &self,
-        path_buffers: &mut impl PathBuffers,
+        path_buffers: &impl PathBuffers,
         glob_path: &[GlobPath],
     ) -> Result<Vec<MatchingPath>, Error> {
         let mps = self.fetch_glob_nodes(path_buffers, glob_path);
@@ -201,27 +195,46 @@ impl PathSearcher for DbPathSearcher {
         let c = |x: &MatchingPath, y: &MatchingPath| {
             let x = x.path_descriptor();
             let y = y.path_descriptor();
-            x.cmp(y)
+            x.cmp(&y)
         };
         mps.sort_by(c);
         mps.dedup();
         Ok(mps)
     }
 
-    fn discover_paths_with_pattern(
+    fn locate_tuprules(
         &self,
-        path_buffers: &mut impl PathBuffers,
-        glob: &[GlobPath],
-        pattern: &str,
-    ) -> std::result::Result<Vec<MatchingPath>, Error> {
-        let paths = self.discover_paths(path_buffers, glob)?;
-        PathSearcher::paths_with_pattern(&pattern, paths)
+        tup_cwd: &PathDescriptor,
+        path_buffers: &impl PathBuffers,
+    ) -> Vec<PathDescriptor> {
+        let conn = self.conn.lock();
+        let mut fetch_node_prepare = conn.deref().fetch_node_prepare().unwrap();
+        let mut fetch_node_id_prepare = conn.deref().fetch_node_by_id_prepare().unwrap();
+        let mut dirid = 1;
+        let mut tup_rules = Vec::new();
+        let tuprs = ["Tuprules.tup", "Tuprules.lua"];
+        let mut add_rules = |dirid| {
+            for tupr in tuprs {
+                if let Ok(node) = fetch_node_prepare.fetch_node(tupr, dirid) {
+                    tup_rules.push(path_buffers.add_path_from(tup_cwd, Path::new(node.get_name())));
+                    break;
+                }
+            }
+        };
+        add_rules(dirid);
+        for dir in tup_cwd.components() {
+            if let Ok(nodeid) =
+                fetch_node_id_prepare.fetch_node_id(dir.get().get_name().as_ref(), dirid)
+            {
+                dirid = nodeid;
+                add_rules(nodeid)
+            } else {
+                break;
+            }
+        }
+        tup_rules
     }
 
-    fn locate_tuprules(&self, tup_cwd: &PathDescriptor) -> Vec<PathDescriptor> {
-        //todo!()
-        vec![]
-    }
     fn get_outs(&self) -> &OutputHolder {
         &self.psx
     }
@@ -278,7 +291,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice(), &term_progress)?;
         let arts = parser.reresolve(arts)?;
         for tup_node in tupfiles.iter() {
-            let tupid = *parser
+            let tupid = parser
                 .read_write_buffers()
                 .add_tup_file(Path::new(tup_node.get_name()));
             crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
@@ -422,10 +435,8 @@ fn gather_rules_from_tupfiles(
         pb.set_message("Resolving statements..");
         new_arts.extend(p.receive_resolved_statements(receiver).map_err(|error| {
             let read_write_buffers = p.read_write_buffers();
-            let tup_node = read_write_buffers
-                .get_tup_path(error.get_tup_descriptor())
-                .to_string_lossy()
-                .to_string();
+            let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor());
+            let tup_node = tup_node.to_string();
             let display_str = read_write_buffers.display_str(error.get_error_ref());
             term_progress.abandon(&pb, format!("Error parsing {tup_node}"));
             eyre!(
@@ -472,7 +483,7 @@ fn check_uniqueness_of_parent_rule(
                 {
                     return Err(eyre!(
                         format!("File was previously marked as generated from a rule:{} but is now being generated in Tupfile {} line:{}",
-                                node.get_name(), tup_path.to_string_lossy(), parent_rule_ref.get_line()
+                                node.get_name(), tup_path.to_string(), parent_rule_ref.get_line()
                         )
                     ));
                 }
@@ -529,7 +540,7 @@ fn add_rule_links(
                         }
                         InputResolvedType::Deglob(mp) => {
                             let (pid, _) = crossref
-                                .get_path_db_id(mp.path_descriptor())
+                                .get_path_db_id(mp.path_descriptor_ref())
                                 .ok_or_else(|| {
                                     eyre!(
                                         "db path not found with descriptor {:?} => {:?}",
@@ -628,20 +639,18 @@ fn fetch_group_providers(
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
     let mut group_ids = Vec::new();
-    let fetch_db_ids = |group_desc: GroupPathDescriptor| -> Result<()> {
+    let fetch_db_ids = |group_desc: &GroupPathDescriptor| {
         let group_id = crossref
-            .get_group_db_id(&group_desc)
-            .unwrap_or_else(|| {
-                panic!(
-                    "could not fetch groupid from its internal id:{:?}",
-                    group_desc.get()
-                )
-            })
+            .get_group_db_id(group_desc)
+            .ok_or(tupparser::errors::Error::new_path_search_error(format!(
+                "could not fetch groupid from its internal id:{:?}",
+                group_desc.get()
+            )))?
             .0;
-        group_ids.push((group_desc, group_id));
+        group_ids.push((group_desc.clone(), group_id));
         Ok(())
     };
-    let vs = rwbuf.map_group_desc(fetch_db_ids);
+    rwbuf.for_each_group(fetch_db_ids)?;
 
     for (group_desc, groupid) in group_ids {
         conn.for_each_grp_node_provider(
@@ -657,111 +666,66 @@ fn fetch_group_providers(
         )?;
     }
 
-    for (group_desc, groupid) in vs {}
     Ok(())
 }
 
-struct NodeParent<'a> {
-    pub nodeid: i64,
-    pub dir: i64,
-    pub parid: i64,
-    pub name: Cow<'a, str>,
-    pub path: &'a Path,
-}
-
-impl<'a> NodeParent<'a> {
-    pub fn new(nodeid: i64, dir: i64, parid: i64, name: Cow<'a, str>, path: &'a Path) -> Self {
-        NodeParent {
-            nodeid,
-            dir,
-            parid,
-            name,
-            path,
-        }
-    }
-    pub fn get_id(&self) -> i64 {
-        self.nodeid
-    }
-    pub fn get_dir(&self) -> i64 {
-        self.dir
-    }
-    pub fn get_parid(&self) -> i64 {
-        self.parid
-    }
-    pub fn get_name(&self) -> &str {
-        self.name.as_ref()
-    }
-    pub fn get_path(&self) -> &Path {
-        self.path
-    }
-}
-
-fn find_by_path<'a>(
-    path: &'a Path,
-    node_statements: &mut NodeStatements,
-) -> Result<NodeParent<'a>> {
+fn find_by_path<'a>(path: &'a Path, node_statements: &mut NodeStatements) -> Result<(Node, i64)> {
     let (parent, name) = split_path(path)?;
     let (dir, parent_id) = node_statements.fetch_dirid_with_par(parent)?;
-    let i = node_statements
-        .fetch_node_id(name.as_ref(), dir)
-        .ok()
-        .unwrap_or(-1);
-    Ok(NodeParent::new(i, dir, parent_id, name, parent))
+    let i = node_statements.fetch_node(name.as_ref(), dir)?;
+    Ok((i, parent_id))
 }
 
 pub(crate) fn remove_path<P: AsRef<Path>>(
-    conn: &mut Connection,
     path: P,
     node_statements: &mut NodeStatements,
+    add_ids_statements: &mut AddIdsStatements,
 ) -> Result<()> {
     // if the path is a file, add it to the deletelist table
-    if let Ok(NodeParent { nodeid, .. }) = find_by_path(path.as_ref(), node_statements)? {
-        if nodeid != -1 {
-            let node = conn.fetch_node_by_id_prepare()?.fetch_node_by_id(nodeid);
-            conn.add_to_delete_prepare()?
-                .add_to_delete(nodeid, node.unwrap().get_type())?;
-        }
+    if let Ok((node, _)) = find_by_path(path.as_ref(), node_statements) {
+        let nodeid = node.get_id();
+        add_ids_statements.add_to_delete(nodeid, *node.get_type())?;
     }
     Ok(())
 }
 
 pub(crate) fn insert_path<P: AsRef<Path>>(
-    conn: &mut Connection,
     path: P,
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
 ) -> Result<i64> {
     let (parent, name) = split_path(path.as_ref())?;
-    if parent.is_empty() || parent.eq(".") {
+    if parent.as_os_str().is_empty() || parent.as_os_str().eq(".") {
         return Ok(0);
     }
 
-    return if let Ok(dir) = node_statements.fetch_dirid(parent) {
+    return if let Ok((dir, _)) = node_statements.fetch_dirid_with_par(parent) {
         let pbuf = path.as_ref().to_owned();
-        let hashed_path = crate::scan::HashedPath::from(Arc::new(pbuf));
-        let metadata = fs::metadata(path.as_path()).ok();
+        let hashed_path = crate::scan::HashedPath::from(pbuf);
+        let metadata = fs::metadata(path.as_ref()).ok();
         if let Some(node_at_path) =
             crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata)?
         {
             let node =
-                find_upsert_node(node_statements, add_ids_statements, node_at_path.get_path())?;
+                find_upsert_node(node_statements, add_ids_statements, node_at_path.get_node())?;
             Ok(node.get_id())
+        } else {
+            Ok(0)
         }
-        Ok(0)
     } else {
-        insert_path(conn, parent, node_statements, add_ids_statements)?;
-        insert_path(conn, path, node_statements, add_ids_statements)
+        insert_path(parent, node_statements, add_ids_statements)?;
+        insert_path(path, node_statements, add_ids_statements)
     };
 }
 
 fn split_path(path: &Path) -> eyre::Result<(&Path, Cow<'_, str>)> {
     let parent = path
         .parent()
-        .ok_or_else(|| eyre!("No parent folder found for file {:?}", path.as_path()))?;
+        .ok_or_else(|| eyre!("No parent folder found for file {:?}", path))?;
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy())
-        .ok_or_else(|| eyre!("missing name:{:?} for a path to insert", path.as_path()))?;
+        .ok_or_else(|| eyre!("missing name:{:?} for a path to insert", path))?;
     Ok((parent, name))
 }
 
@@ -784,31 +748,32 @@ fn insert_nodes(
     {
         let mut find_dirid = conn.fetch_dirid_prepare()?;
         let mut find_group_id = conn.fetch_groupid_prepare()?;
-        read_write_buf.for_each_group(|(grp_id)| {
+        read_write_buf.for_each_group(|grp_id| {
             let group_path = grp_id.get();
-            let parent = group_path.get_descriptor().as_ref().get_path();
+            let parent = group_path.get_dir_descriptor().get_path();
             if let Some(dir) = get_dir_id(&mut find_dirid, parent.as_path()) {
-                let grp_name = group_path.file_name();
-                let id = find_group_id.fetch_group_id(grp_name.as_str(), dir).ok();
+                let grp_name = group_path.get_name();
+                let id = find_group_id.fetch_group_id(grp_name, dir).ok();
                 if let Some(i) = id {
                     // grp_db_id.insert(grp_id, i);
                     crossref.add_group_xref(grp_id.clone(), i, dir);
                     nodeids.insert((i, RowType::Grp));
                 } else {
                     // gather groups that are not in the db yet.
-                    let isz: usize = (*grp_id).into();
-                    groups_to_insert.push(Node::new_grp(isz as i64, dir, grp_name));
+                    let isz = (grp_id).to_u64();
+                    groups_to_insert.push(Node::new_grp(isz as i64, dir, grp_name.to_string()));
                 }
             }
-        });
-        let mut find_nodeid = conn.fetch_nodeid_prepare()?;
-        let mut find_dir_id_with_parent = conn.fetch_dirid_with_par_prepare()?;
+            Ok(())
+        })?;
+        //let mut find_nodeid = conn.fetch_nodeid_prepare()?;
+        //let mut find_dir_id_with_parent = conn.fetch_dirid_with_par_prepare()?;
 
         let mut unique_rule_check = HashMap::new();
 
         let mut existing_nodeids = BTreeSet::new();
-        let mut find_dirid_with_par = conn.fetch_dirid_with_par_prepare()?;
-        let mut node_statements = NodeStatements::new(conn)?;
+        //let mut find_dirid_with_par = conn.fetch_dirid_with_par_prepare()?;
+        //let mut node_statements = NodeStatements::new(conn)?;
         let mut collect_nodes_to_insert = |p: &PathDescriptor,
                                            rtype: &RowType,
                                            mtime_ns: i64,
@@ -816,20 +781,20 @@ fn insert_nodes(
                                            crossref: &mut CrossRefMaps,
                                            node_statements: &mut NodeStatements|
          -> Result<()> {
-            let isz: usize = (*p).into();
+            let isz = p.to_u64();
             let path = read_write_buf.get_path(p);
             let dir_desc = read_write_buf.get_parent_id(p);
-            let nodeparent = find_by_path(path.as_path(), node_statements)?;
-            let dir = nodeparent.get_dir();
-            crossref.add_path_xref(dir_desc, dir, nodeparent.get_parid());
+            let (node, parid) = find_by_path(path.as_path(), node_statements)?;
+            let dir = node.get_dir();
+            crossref.add_path_xref(dir_desc, dir, parid);
 
-            if nodeparent.get_id() > 0 {
-                let nodeid = nodeparent.get_id();
+            if node.get_id() > 0 {
+                let nodeid = node.get_id();
                 debug!("path {:?} has id:{}", path.as_path(), nodeid);
                 crossref.add_path_xref(p.clone(), nodeid, dir);
                 existing_nodeids.insert((nodeid, *rtype));
             } else {
-                let node_name = nodeparent.get_name();
+                let node_name = node.get_name();
                 debug!("need to add {} in dir:{}", node_name, dir);
                 paths_to_insert.insert(Node::new_file_or_genf(
                     isz as i64,
@@ -851,7 +816,7 @@ fn insert_nodes(
                                                     crossref: &mut CrossRefMaps,
                                                     node_statements: &mut NodeStatements|
              -> Result<()> {
-                let isz: usize = (*task_desc).into();
+                let isz = (task_desc).to_u64();
                 let task_instance = read_write_buf.get_task(task_desc);
                 let name = task_instance.get_target();
                 let display_str = name.to_string();
@@ -863,7 +828,7 @@ fn insert_nodes(
                 } else {
                     let tuppath =
                         read_write_buf.get_tup_path(task_instance.get_tup_loc().get_tupfile_desc());
-                    let tuppathstr = tuppath.to_string_lossy();
+                    let tuppathstr = tuppath.as_path().to_string_lossy();
                     let line = task_instance.get_tup_loc().get_line();
                     debug!(" task to insert: {} at  {}:{}", name, tuppathstr, line);
                     let prevline = unique_rule_check.insert(name.to_string(), line);
@@ -902,8 +867,7 @@ fn insert_nodes(
                     collect_task_nodes_to_insert(rd, dir, crossref, &mut node_statements)?;
                     for s in rl.get_deps() {
                         if let Some(p) = s.get_glob_path_desc() {
-                            if processed_globs.insert(p) && s.is_glob_match() {
-                                let p = PathDescriptor::new(p.into());
+                            if processed_globs.insert(p.clone()) && s.is_glob_match() {
                                 collect_nodes_to_insert(
                                     &p,
                                     &Glob,
@@ -927,7 +891,7 @@ fn insert_nodes(
                                                     crossref: &mut CrossRefMaps,
                                                     node_statements: &mut NodeStatements|
              -> Result<()> {
-                let isz: usize = (*rule_desc).into();
+                let isz: u64 = (rule_desc).to_u64();
                 let rule_formula = read_write_buf.get_rule(rule_desc);
                 let name = rule_formula.get_rule_str();
                 let display_str = rule_formula.get_display_str();
@@ -937,11 +901,13 @@ fn insert_nodes(
                     crossref.add_rule_xref(rule_desc.clone(), nodeid, dir);
                     nodeids.insert((nodeid, Rule));
                 } else {
-                    let tuppath =
-                        read_write_buf.get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
-                    let tuppathstr = tuppath.to_string_lossy();
                     let line = rule_formula.get_rule_ref().get_line();
-                    debug!(" rule to insert: {} at  {}:{}", name, tuppathstr, line);
+                    if log::log_enabled!(log::Level::Debug) {
+                        let tuppath = read_write_buf
+                            .get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
+                        let tuppathstr = tuppath.as_path().to_string_lossy();
+                        debug!(" rule to insert: {} at  {}:{}", name, tuppathstr, line);
+                    }
                     let prevline =
                         unique_rule_check.insert(dir.to_string() + "/" + name.as_str(), line);
                     if prevline.is_none() {
@@ -954,10 +920,12 @@ fn insert_nodes(
                             srcid,
                         ));
                     } else {
+                        let tuppath = read_write_buf
+                            .get_tup_path(rule_formula.get_rule_ref().get_tupfile_desc());
                         bail!(
                             "Rule at  {}:{} was previously defined at line {}. \
                         Ensure that rule definitions take the inputs as arguments.",
-                            tuppathstr.to_string().as_str(),
+                            tuppath.to_string().as_str(),
                             line,
                             prevline.unwrap()
                         );
@@ -991,8 +959,7 @@ fn insert_nodes(
                     }
                     for s in rl.get_sources() {
                         if let Some(p) = s.get_glob_path_desc() {
-                            if processed_globs.insert(p) && s.is_glob_match() {
-                                let p = PathDescriptor::new(p.into());
+                            if processed_globs.insert(p.clone()) && s.is_glob_match() {
                                 collect_nodes_to_insert(
                                     &p,
                                     &Glob,
@@ -1054,10 +1021,10 @@ fn insert_nodes(
                 )
             })?;
             if processed.insert(p) {
-                let NodeParent {
-                    nodeid, dir, parid, ..
-                } = find_by_path(Path::new(inp.as_str()), &mut node_statements)
+                let (node, parid) = find_by_path(Path::new(inp.as_str()), &mut node_statements)
                     .map_err(|e| eyre!("failed to find path for {:?} due to {}", inp, e))?;
+                let nodeid = node.get_id();
+                let dir = node.get_dir();
                 if nodeid < 0 {
                     eyre::bail!("node nodeid found for :{:?}", p);
                 }
@@ -1078,16 +1045,25 @@ fn insert_nodes(
             .into_iter()
             .chain(rules_to_insert.into_iter())
         {
-            let desc = node.get_id() as usize;
-            let db_id =
-                find_upsert_node(&mut node_statements, &mut add_ids_statements, &node)?.get_id();
+            let desc = node.get_id() as u64;
+            let (db_id, db_par_id) = {
+                let upsnode =
+                    find_upsert_node(&mut node_statements, &mut add_ids_statements, &node)?;
+                (upsnode.get_id(), upsnode.get_dir())
+            };
             nodeids.insert((db_id, *node.get_type()));
             if RowType::Grp.eq(node.get_type()) {
-                crossref.add_group_xref(GroupPathDescriptor::new(desc), db_id, node.get_dir());
+                let gdesc = GroupPathDescriptor::from_u64(desc);
+                crossref.add_path_xref(
+                    gdesc.as_ref().get_dir_descriptor().clone(),
+                    db_par_id,
+                    node.get_dir(),
+                );
+                crossref.add_group_xref(gdesc, db_id, node.get_dir());
             } else if Rule.eq(node.get_type()) {
-                crossref.add_rule_xref(RuleDescriptor::new(desc), db_id, node.get_dir());
+                crossref.add_rule_xref(RuleDescriptor::from_u64(desc), db_id, node.get_dir());
             } else {
-                crossref.add_path_xref(PathDescriptor::new(desc), db_id, node.get_dir());
+                crossref.add_path_xref(PathDescriptor::from_u64(desc), db_id, node.get_dir());
             }
         }
         let mut inst_env_stmt = tx.insert_env_prepare()?;
@@ -1143,6 +1119,7 @@ impl NodeStatements<'_> {
         let update_srcid = conn.update_srcid_prepare()?;
         let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
         let find_nodeid = conn.fetch_nodeid_prepare()?;
+
         Ok(NodeStatements {
             insert_node,
             find_node,

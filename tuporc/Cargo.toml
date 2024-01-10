@@ -31,4 +31,5 @@ indicatif = "0.17.5"
 console = "0.15.1"
 notify = { version = "6.1.1", features = ["crossbeam-channel"] }
 lazy_static = { version = "1.4.0", features = [] }
+fs2 = "0.4.3"
 

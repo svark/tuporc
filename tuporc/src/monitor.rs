@@ -1,10 +1,12 @@
-use std::fs::File;
-use std::ops::Deref;
+use std::env::{current_dir, current_exe};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
-use crossbeam::channel::internal::SelectHandle;
+use eyre::Result;
+use fs2::FileExt;
 use notify::{event, Config, Event, EventKind, RecursiveMode, Watcher};
 use rusqlite::Connection;
 
@@ -13,63 +15,25 @@ use crate::parse::{AddIdsStatements, NodeStatements};
 use crate::scan::scan_root;
 use crate::TermProgress;
 
-pub fn init_db(db_name: &str) {
-    println!("Creating a new db.");
-    //use std::fs;
-    std::fs::create_dir_all(".tup").expect("Unable to access .tup dir");
-    let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
-    conn.execute_batch(include_str!("sql/node_table.sql"))
-        .expect("failed to create tables in tup database.");
-
-    let _ = File::create("Tupfile.ini").expect("could not open Tupfile.ini for write");
-    println!("Finished creating tables");
-}
-
-struct WatchObject {
+pub(crate) struct WatchObject {
     root: PathBuf,
-    subdir: PathBuf,
-    keyword: String,
-    extension: String,
-    watcher: Option<dyn notify::Watcher>,
 }
 
 impl WatchObject {
-    pub fn new_at_subdir_with_keyword(
-        root: PathBuf,
-        subdir: PathBuf,
-        keyword: String,
-        extension: String,
-    ) -> Self {
-        WatchObject {
-            root,
-            subdir,
-            keyword,
-            extension,
-            watcher: None,
-        }
-    }
     pub fn new(root: PathBuf) -> Self {
-        WatchObject {
-            root: root.clone(),
-            subdir: root,
-            keyword: String::new(),
-            extension: String::new(),
-            watcher: None,
-        }
+        WatchObject { root: root.clone() }
     }
-    pub fn start(&mut self) -> eyre::Result<()> {
-        self.watcher = monitor(&self.root)?;
+    pub fn start(&mut self) -> Result<()> {
+        monitor(&self.root)?;
         Ok(())
     }
-    pub fn stop(&mut self) -> eyre::Result<()> {
-        if let Some(watcher) = &mut self.watcher {
-            unwatch_subdir(watcher, &self.root, &self.subdir)?;
-        }
+    pub fn stop(&mut self) -> Result<()> {
+        stop_monitor()?;
         Ok(())
     }
 }
 
-fn latest_id(conn: &Connection, table: &str, id: &str) -> eyre::Result<i64> {
+fn fetch_latest_id(conn: &Connection, table: &str, id: &str) -> Result<i64> {
     let sql = format!("SELECT MAX({}) from {}", id, table);
     let mut stmt = conn.prepare(sql.as_str())?;
     let mut rows = stmt.query([])?;
@@ -78,18 +42,66 @@ fn latest_id(conn: &Connection, table: &str, id: &str) -> eyre::Result<i64> {
     Ok(id)
 }
 
-fn latest_message(conn: &Connection) -> eyre::Result<String> {
-    let message_id = latest_id(conn, "MESSAGE", "id")?;
+fn fetch_latest_message(conn: &Connection) -> Result<String> {
+    let message_id = fetch_latest_id(conn, "MESSAGE", "id")?;
     let message: String = conn.query_row(
         "SELECT message from Messages where id = ? ",
-        (message_id),
+        [message_id],
         |r| Ok(r.get(0)?),
     )?;
     Ok(message)
 }
 
-fn monitor(root: &Path) -> eyre::Result<dyn notify::Watcher> {
-    crossbeam::scope(|s| {
+fn monitor(root: &Path) -> Result<()> {
+    let config = Config::default().with_poll_interval(Duration::from_millis(1000));
+    let lock_file_path = root.join(".tup/mon_lock");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true) // Create the file if it doesn't exist
+        .open(lock_file_path)?;
+    // Apply an exclusive lock
+    file.try_lock_exclusive().map_err(|e| {
+        println!("Monitor was already started");
+        e
+    })?;
+    let (path_sender, path_receiver) = crossbeam::channel::bounded(8);
+    // Write to the file
+    writeln!(
+        file,
+        "Exclusive write access by process :{}",
+        current_exe().unwrap().display()
+    )?;
+    println!(
+        "Monitoring filesystem for changes at tup root: {}",
+        current_dir()?.display()
+    );
+
+    let watch_handler = move |event: notify::Result<Event>| {
+        if let Ok(event) = event {
+            match event.kind {
+                EventKind::Modify(event::ModifyKind::Data(_))
+                | EventKind::Create(event::CreateKind::File) => {
+                    for path in event.paths {
+                        {
+                            log::debug!("File added to list: {:?}", path);
+                            path_sender.send((path, 1)).unwrap();
+                        }
+                    }
+                }
+                EventKind::Remove(event::RemoveKind::File)
+                | EventKind::Remove(event::RemoveKind::Folder) => {
+                    for path in event.paths {
+                        log::debug!("File removed to list: {:?}", path);
+                        path_sender.send((path, -1)).unwrap();
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            log::warn!("error in event: {:?}", event.err().unwrap());
+        }
+    };
+    crossbeam::scope(|s| -> Result<()> {
         let (stop_sender, stop_receiver) = crossbeam::channel::bounded(0);
         let stop_sender_clone = stop_sender.clone();
         ctrlc::set_handler(move || {
@@ -97,53 +109,23 @@ fn monitor(root: &Path) -> eyre::Result<dyn notify::Watcher> {
                 .send(())
                 .expect("Error setting Ctrl-C handler")
         })?;
-        let config = Config::default().with_poll_interval(Duration::from_millis(1000));
         let mut conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
-        let mut generation_id = latest_id(&conn, "MONITORED_FILES", "generation_id")
+        let mut generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id")
             .expect("unable to query generation_id");
-        let mut ins_prepare = conn.insert_monitored_metadata_prepare()?;
-        let mut fetch_metadata_prepare = conn.fetch_monitored_metadata_prepare()?;
-        let current_time = std::time::SystemTime::now();
-        let time_since_epoch = current_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards");
 
-        let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
-        let mut remove_monitored_prepare = conn.remove_monitored_metadata_prepare()?;
-        let (path_sender, path_receiver) = crossbeam::channel::bounded(8);
-        let handler = |event: notify::Result<Event>| {
-            if let Ok(event) = event {
-                match event.kind {
-                    EventKind::Modify(event::ModifyKind::Data(_))
-                    | EventKind::Create(event::CreateKind::File) => {
-                        for path in event.paths {
-                            {
-                                log::debug!("File added to list: {:?}", path);
-                                path_sender.send((path, 1)).unwrap();
-                            }
-                        }
-                    }
-                    Event::Remove(event::RemoveKind::File()) => {
-                        for path in event.paths {
-                            log::debug!("File removed to list: {:?}", path);
-                            path_sender.send((path, -1)).unwrap();
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                log::warn!("error in event: {:?}", event.err().unwrap());
-            }
-        };
-        let mut watcher = notify::Watcher::new(handler, config).expect("Failed to create watcher");
-        watcher.watch(root, RecursiveMode::Recursive).unwrap();
-
-        s.spawn(move |_| -> eyre::Result<()> {
-            let mut currentId: i64 = 0;
+        let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
+            .expect("Failed to create watcher");
+        watcher.watch(root, RecursiveMode::Recursive)?;
+        let term_progress = TermProgress::new("Full scan underway..");
+        let pb_main = term_progress.get_main();
+        s.spawn(move |_| -> Result<()> {
+            let mut current_id: i64 = 0;
             let mut end_build = true;
-            scan_root(root, &mut conn, &TermProgress::new("Scanning.."))?;
-            let mut node_statements = NodeStatements::new(conn.deref())?;
-            let mut add_ids_statements = AddIdsStatements::new(conn.deref())?;
+            scan_root(root, &mut conn, &term_progress)?;
+            pb_main.println("Full scan complete");
+            let mut node_statements = NodeStatements::new(&conn)?;
+            let mut add_ids_statements = AddIdsStatements::new(&conn)?;
+            let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
 
             loop {
                 if end_build {
@@ -151,34 +133,43 @@ fn monitor(root: &Path) -> eyre::Result<dyn notify::Watcher> {
                 } else {
                     sleep(Duration::from_secs(5));
                 }
-                let latestId = latest_id(&conn, "MESSAGES", "id").unwrap_or(currentId);
-                if latestId != currentId {
-                    currentId = latestId;
-                    let latestMessage = latest_message(&conn)?;
-                    if latestMessage.eq("QUIT") {
-                        break;
+                let latest_id = fetch_latest_id(&conn, "MESSAGES", "id").unwrap_or(current_id);
+                let mut end_watch = false;
+                if latest_id != current_id {
+                    current_id = latest_id;
+                    let latest_message = fetch_latest_message(&conn)?;
+                    if latest_message.eq("QUIT") {
+                        end_watch = true;
+                        term_progress.abandon(&pb_main, "Quit message received");
                     }
-                    if latestMessage.eq("STARTBUILD") {
+                    if latest_message.eq("STARTBUILD") {
                         generation_id = generation_id + 1;
                         end_build = false;
                     }
-                    if latestMessage.eq("ENDBUILD") {
+                    if latest_message.eq("ENDBUILD") {
                         end_build = true;
                     }
+                }
+                if let Ok(()) = stop_receiver.try_recv() {
+                    term_progress.abandon(&pb_main, "Ctrl-c received");
+                    end_watch = true;
                 }
 
                 if end_build {
                     conn.execute("DELETE * from messages", ()).unwrap();
                     if let Ok((path, added)) = path_receiver.try_recv() {
-                        if (added) {
+                        if added == 1 {
                             crate::parse::insert_path(
-                                &mut conn,
                                 &path,
                                 &mut node_statements,
                                 &mut add_ids_statements,
                             )?;
                         } else {
-                            crate::parse::remove_path(&mut conn, &path, &mut node_statements)?;
+                            crate::parse::remove_path(
+                                &path,
+                                &mut node_statements,
+                                &mut add_ids_statements,
+                            )?;
                         }
                     }
                 } else if let Ok((path, added)) = path_receiver.try_recv() {
@@ -186,9 +177,22 @@ fn monitor(root: &Path) -> eyre::Result<dyn notify::Watcher> {
                         .insert_monitored(path, generation_id, added)
                         .expect("failed to add monitored file to db");
                 }
+
+                if end_watch {
+                    watcher.unwatch(root)?;
+                    break;
+                }
             }
             Ok(())
         });
-    })?;
-    Ok(watcher)
+        Ok(())
+    })
+    .expect("failed to spawn thread")?;
+    Ok(())
+}
+
+fn stop_monitor() -> Result<()> {
+    let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
+    conn.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
+    Ok(())
 }

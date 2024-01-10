@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{FileType, Metadata};
+use std::fs::Metadata;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Error as IOError;
 use std::ops::Deref;
@@ -52,7 +52,6 @@ fn time_since_unix_epoch(meta_data: &Metadata) -> eyre::Result<Duration, IOError
 /// `DirE` is our version of Walkdir's DirEntry. Keeping only the information we are interested in
 #[derive(Clone, Debug)]
 struct DirE {
-    file_type: FileType,
     file_name: OsString,
     metadata: Option<Metadata>,
     hashed_path: Option<HashedPath>, // this is an option to enable taking ownership of the path
@@ -61,7 +60,6 @@ struct DirE {
 impl DirE {
     fn new(de: DirEntry, hashed_path: HashedPath) -> DirE {
         DirE {
-            file_type: de.file_type(),
             file_name: de.file_name().to_owned(),
             metadata: de.metadata().ok(),
             hashed_path: Some(hashed_path),
@@ -72,21 +70,13 @@ impl DirE {
         self.hashed_path.take().unwrap()
     }
 
-    fn file_type(&self) -> &FileType {
-        &self.file_type
-    }
-
-    fn file_name(&self) -> &OsString {
-        &self.file_name
-    }
-
     fn take_metadata(&mut self) -> Option<Metadata> {
         self.metadata.take()
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct HashedPath {
+pub struct HashedPath {
     path: Arc<PathBuf>,
     hash: u64,
 }
@@ -187,10 +177,6 @@ impl ProtoNode {
         ProtoNode { p, pid }
     }
 
-    fn get_dire(&self) -> &DirE {
-        &self.p
-    }
-
     fn get_file_name(&self) -> &OsStr {
         &self.p.file_name
     }
@@ -202,15 +188,20 @@ impl ProtoNode {
     fn take_path(&mut self) -> HashedPath {
         self.p.take_path()
     }
+    pub(crate) fn take_metadata(&mut self) -> Option<Metadata> {
+        self.p.take_metadata()
+    }
 }
 
+/// Node and it hashed path
 #[derive(Clone, Debug)]
-struct NodeAtPath {
+pub struct NodeAtPath {
     node: Node,
     pbuf: HashedPath,
 }
 
 impl NodeAtPath {
+    /// create a new NodeAtPath
     pub fn new(node: Node, pbuf: HashedPath) -> NodeAtPath {
         NodeAtPath { node, pbuf }
     }
@@ -293,7 +284,7 @@ fn create_node_at_path<S: AsRef<str>>(
     mtime: i64,
     rtype: RowType,
 ) -> NodeAtPath {
-    let node = Node::new(0, dirid, mtime, file_name.to_string(), rtype);
+    let node = Node::new(0, dirid, mtime, file_name.as_ref().to_string(), rtype);
     NodeAtPath::new(node, p)
 }
 
@@ -440,9 +431,9 @@ fn insert_direntries(
                 s.spawn(move |_| -> eyre::Result<()> {
                     for mut p in dire_receiver.iter() {
                         let dirid = p.get_dir_id();
-                        let file_name = p.get_file_name().to_string_lossy();
                         let hashed_path = p.take_path();
-                        let metadata = p.get_dire().take_metadata();
+                        let metadata = p.take_metadata();
+                        let file_name = p.get_file_name().to_string_lossy();
                         let node_at_path =
                             prepare_node_at_path(dirid, file_name, hashed_path, metadata)?;
                         if let Some(node_at_path) = node_at_path {

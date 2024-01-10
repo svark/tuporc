@@ -1956,7 +1956,7 @@ FROM NodeChain;"
         Ok(())
     }
     fn write_message(&self, message: &str) -> Result<()> {
-        self.execute("INSERT INTO MESSAGE (message) VALUES (?1)", (message))?;
+        self.execute("INSERT INTO MESSAGE (message) VALUES (?1)", [message])?;
         Ok(())
     }
 
@@ -1966,12 +1966,12 @@ FROM NodeChain;"
 
         if let Some(message_row) = message_iter.next() {
             let (id, message): (i64, String) = message_row?;
-            if (id == last_id) {
-                return Err(rusqlite::Error::QueryReturnedNoRows).into();
+            if id == last_id {
+                return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows));
             }
             Ok(message)
         } else {
-            return Err(rusqlite::Error::QueryReturnedNoRows).into();
+            return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows)).into();
         }
     }
 }

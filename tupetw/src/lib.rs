@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 use dunce::canonicalize;
 use ferrisetw::parser::Parser;
-//use ferrisetw::provider::kernel_providers::{DISK_FILE_IO_PROVIDER, DISK_IO_INIT_PROVIDER, DISK_IO_PROVIDER, FILE_INIT_IO_PROVIDER, FILE_IO_PROVIDER, KernelProvider, PROCESS_PROVIDER};
 use ferrisetw::provider::kernel_providers::{FILE_INIT_IO_PROVIDER, PROCESS_PROVIDER};
 use ferrisetw::provider::Provider;
 use ferrisetw::trace;
