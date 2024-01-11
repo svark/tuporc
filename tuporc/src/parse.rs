@@ -23,7 +23,8 @@ use tupparser::{Artifacts, ReadWriteBufferObjects, TupParser};
 
 use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
-    create_path_buf_temptable, AnyError, ForEachClauses, LibSqlExec, MiscStatements, SqlStatement,
+    create_path_buf_temptable, AnyError, CallBackError, ForEachClauses, LibSqlExec, MiscStatements,
+    SqlStatement,
 };
 use crate::scan::{get_dir_id, MAX_THRS_DIRS};
 use crate::{LibSqlPrepare, Node, RowType, TermProgress};
@@ -127,14 +128,23 @@ impl DbPathSearcher {
             }
 
             let base_path = glob_path.get_base_desc();
-            debug!("base path is : {:?}", base_path.get_path());
+            debug!("base path is : {:?}", ph.get_path(base_path));
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
             let fetch_row = |s: &String| -> Option<MatchingPath> {
                 debug!("found:{} at {:?}", s, base_path);
+                let full_path_pd = base_path.join(s.as_str());
+                if full_path_pd.is_none() {
+                    eprintln!(
+                        "path {} is not relative to base: {}",
+                        s.as_str(),
+                        base_path.get_path_ref().display()
+                    );
+                    return None;
+                }
+                let full_path_pd = full_path_pd.unwrap();
                 if has_glob_pattern {
-                    let full_path_pd = glob_path.get_base_desc().join(s.as_str());
                     let full_path_pd_clone = full_path_pd.clone();
-                    let full_path = full_path_pd.get_path();
+                    let full_path = ph.get_path(&full_path_pd);
                     if glob_path.is_match(full_path.as_path()) {
                         let grps = glob_path.group(full_path.as_path());
                         debug!("found match: {:?} for {:?}", grps, glob_path);
@@ -146,9 +156,10 @@ impl DbPathSearcher {
                     } else {
                         None
                     }
+                } else if !has_glob_pattern {
+                    Some(MatchingPath::new(full_path_pd))
                 } else {
-                    let pd = ph.add_path_from(base_path, Path::new(s.as_str()));
-                    Some(MatchingPath::new(pd))
+                    None
                 }
             };
             let conn = self.conn.deref().lock();
@@ -217,7 +228,9 @@ impl PathSearcher for DbPathSearcher {
         let mut add_rules = |dirid| {
             for tupr in tuprs {
                 if let Ok(node) = fetch_node_prepare.fetch_node(tupr, dirid) {
-                    tup_rules.push(path_buffers.add_path_from(tup_cwd, Path::new(node.get_name())));
+                    path_buffers
+                        .add_path_from(tup_cwd, Path::new(node.get_name()))
+                        .map(|r| tup_rules.push(r));
                     break;
                 }
             }
@@ -660,7 +673,12 @@ fn fetch_group_providers(
             |node: Node| -> std::result::Result<(), AnyError> {
                 // name of node is actually its path
                 // merge providers of this group from all available in db
-                let pd = rwbuf.add_abs(Path::new(node.get_name()));
+                let pd = rwbuf.add_abs(Path::new(node.get_name())).ok_or(AnyError::CbErr(
+                    CallBackError::from(format!(
+                        "Failed to add path {} to path buffers. Make sure it is relative to the root directory",
+                        node.get_name()
+                    )),
+                ))?;
                 outs.add_group_entry(&group_desc, pd);
                 Ok(())
             },
