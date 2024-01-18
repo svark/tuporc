@@ -159,6 +159,8 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                 scan_root(root.as_path(), &mut conn, &term_progress)?;
                 let mut fetch_monitored_files = conn.fetch_monitored_prepare()?;
                 pb_main.println("Full scan complete");
+                let pb = term_progress.pb_main.clone();
+                let pb = pb.with_message("Monitoring filesystem for changes");
                 crate::db::create_path_buf_temptable(&conn)?;
                 let mut node_statements = NodeStatements::new(&conn)?;
                 let mut add_ids_statements = AddIdsStatements::new(&conn)?;
@@ -166,9 +168,10 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
 
                 loop {
                     sleep(Duration::from_secs(5));
+                    pb.tick();
                     let mut end_watch = false;
                     if let Ok(()) = stop_receiver.try_recv() {
-                        term_progress.abandon_main("Ctrl-c received");
+                        term_progress.abandon(&pb, "Ctrl-c received");
                         end_watch = true;
                     } else {
                         let latest_ids = fetch_latest_ids(&conn, "MESSAGES", "id", current_id)
@@ -178,7 +181,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                             let latest_message = fetch_message(&conn, current_id)?;
                             if latest_message.eq("QUIT") {
                                 end_watch = true;
-                                term_progress.abandon_main("Quit message received");
+                                term_progress.abandon(&pb, "Quit message received");
                                 break;
                             }
                         }

@@ -21,7 +21,7 @@ use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath};
 use tupparser::{Artifacts, ReadWriteBufferObjects, TupParser};
 
-use crate::db::RowType::{Env, Excluded, GenF, Glob, Rule};
+use crate::db::RowType::{Dir, Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
     create_path_buf_temptable, AnyError, CallBackError, ForEachClauses, LibSqlExec, MiscStatements,
     SqlStatement,
@@ -726,6 +726,13 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
         {
             let node =
                 find_upsert_node(node_statements, add_ids_statements, node_at_path.get_node())?;
+            if node.get_type() == &Dir {
+                add_to_dirpathbuf(
+                    node_statements,
+                    node.get_id(),
+                    node_at_path.get_hashed_path().as_ref(),
+                )?;
+            }
             Ok(node.get_id())
         } else {
             Ok(0)
@@ -1135,6 +1142,7 @@ pub struct NodeStatements<'a> {
     update_srcid: SqlStatement<'a>,
     find_dir_id_with_par: SqlStatement<'a>,
     find_nodeid: SqlStatement<'a>,
+    add_to_dirpathbuf: SqlStatement<'a>,
 }
 
 impl NodeStatements<'_> {
@@ -1147,6 +1155,7 @@ impl NodeStatements<'_> {
         let update_srcid = conn.update_srcid_prepare()?;
         let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
         let find_nodeid = conn.fetch_nodeid_prepare()?;
+        let add_to_dirpathbuf = conn.insert_dir_aux_prepare()?;
 
         Ok(NodeStatements {
             insert_node,
@@ -1157,6 +1166,7 @@ impl NodeStatements<'_> {
             update_srcid,
             find_dir_id_with_par,
             find_nodeid,
+            add_to_dirpathbuf,
         })
     }
     fn insert_node_exec(&mut self, n: &Node) -> crate::db::Result<i64> {
@@ -1184,6 +1194,10 @@ impl NodeStatements<'_> {
     }
     fn fetch_dirid_with_par(&mut self, parent: &Path) -> crate::db::Result<(i64, i64)> {
         self.find_dir_id_with_par.fetch_dirid_with_par(parent)
+    }
+
+    fn add_to_dirpathbuf(&mut self, nodeid: i64, dirp: &Path) -> crate::db::Result<()> {
+        self.add_to_dirpathbuf.insert_dir_aux_exec(nodeid, dirp)
     }
 }
 
@@ -1215,6 +1229,14 @@ impl AddIdsStatements<'_> {
     }
 }
 
+pub(crate) fn add_to_dirpathbuf(
+    node_statements: &mut NodeStatements,
+    node_id: i64,
+    path: &Path,
+) -> Result<()> {
+    node_statements.add_to_dirpathbuf(node_id, path)?;
+    Ok(())
+}
 /// [find_upsert_node] pretends to be the sqlite upsert operation
 /// it also adds the node to the present list, modify list and updates nodes mtime
 pub(crate) fn find_upsert_node(
