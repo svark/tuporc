@@ -267,10 +267,9 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     connection: Connection,
     tupfiles: Vec<Node>,
     root: P,
-    mut term_progress: TermProgress,
+    term_progress: &TermProgress,
 ) -> Result<()> {
     let mut crossref = CrossRefMaps::default();
-    term_progress = term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
     let (arts, mut rwbufs, mut outs) = {
         let conn = connection;
 

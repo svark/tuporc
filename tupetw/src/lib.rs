@@ -1,9 +1,10 @@
 extern crate crossbeam_channel;
 extern crate dunce;
 extern crate ferrisetw;
-extern crate hashbrown;
 extern crate windows;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use dunce::canonicalize;
@@ -12,7 +13,6 @@ use ferrisetw::provider::kernel_providers::{FILE_INIT_IO_PROVIDER, PROCESS_PROVI
 use ferrisetw::provider::Provider;
 use ferrisetw::trace;
 use ferrisetw::trace::*;
-use hashbrown::HashSet;
 use log::debug;
 use thiserror::Error;
 
@@ -119,11 +119,10 @@ impl DynDepTracker {
         const PROC_CREATION_OPCODE: u8 = 1;
         const PROC_DELETION_OPCODE: u8 = 2;
         log::info!("Tracing process id: {}", root_process_id);
-        //let mut immediate_parent = hashbrown::HashMap::new();
         let ctx_process = tracer.clone();
-        let mut proc_generation = hashbrown::HashMap::new();
-        let mut parents = hashbrown::HashMap::new();
-        let mut numchildren_and_self = hashbrown::HashMap::new();
+        let mut proc_generation = HashMap::new();
+        let mut parents = HashMap::new();
+        let mut numchildren_and_self = HashMap::new();
         let provider_process = provider_builder
             .add_callback(move |event, schema_locator| {
                 let op = event.opcode();
@@ -223,9 +222,9 @@ impl DynDepTracker {
 
         let provider_builder = Provider::kernel(kernel_provider_file_io);
         let ctx_io = tracer.clone();
-        let mut parent_ids = hashbrown::HashMap::new();
-        let mut proc_generations = hashbrown::HashMap::new();
-        let mut fileobject_to_file_path = hashbrown::HashMap::new();
+        let mut parent_ids = HashMap::new();
+        let mut proc_generations = HashMap::new();
+        let mut fileobject_to_file_path = HashMap::new();
         let provider_disc_io = provider_builder
             .add_callback(move |event, schema_locator| {
                 if let Some((id, op)) = rx.try_recv().ok() {
@@ -260,7 +259,6 @@ impl DynDepTracker {
                     return;
                 }
                 if processtreeids_disc_io.contains(&event.process_id()) {
-                    //println!("Event file io evtid {:} procid: {:?} opcode:{}", event.event_id(),  event.process_id(), event.opcode());
                     if let Ok(sch) = schema_locator.event_schema(event) {
                         let parser = Parser::create(event, &sch);
                         let opname = sch.opcode_name();
@@ -280,7 +278,6 @@ impl DynDepTracker {
                                     //debug!("Opcode: {} code:{}", opname, event.opcode());
                                     //print!("CreateOptions:{}", parser.try_parse::<u32>("CreateOptions").unwrap());
                                     let fo = parser.try_parse::<u64>("FileObject").unwrap_or(0);
-                                    //println!(" fileobj:{}", fo);
                                     let pid = gen_proc(event.process_id());
                                     ctx_io
                                         .send(EventHeader {

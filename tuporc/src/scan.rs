@@ -15,6 +15,7 @@ use std::vec::Drain;
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::WaitGroup;
 use eyre::eyre;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use rusqlite::Connection;
 use walkdir::{DirEntry, WalkDir};
@@ -358,6 +359,8 @@ fn insert_direntries(
         let root_hp = HashedPath::from(root.to_path_buf());
         let root_hash_path = root_hp.clone();
         dir_id_by_path.insert(root_hp, 1);
+        let ign = build_ignore(root)?;
+
         //println!("root:{:?}", root.to_path_buf());
         {
             s.spawn(move |_| -> eyre::Result<()> {
@@ -382,7 +385,7 @@ fn insert_direntries(
                             i if i == index_dir => {
                                 oper.recv(&dirid_receiver).map_or_else(
                                     |_| {
-                                        log::debug!("no more dirs  expected");
+                                        log::debug!("no more dirs expected");
                                         end_dirs = true;
                                     },
                                     |(p, id)| {
@@ -413,7 +416,12 @@ fn insert_direntries(
                     }
                     if !dir_children_set.is_empty() || !dir_id_by_path.is_empty() {
                         if changed {
-                            linkup_dbids(&dire_sender, &mut dir_children_set, &mut dir_id_by_path)?;
+                            linkup_dbids(
+                                &ign,
+                                &dire_sender,
+                                &mut dir_children_set,
+                                &mut dir_id_by_path,
+                            )?;
                         }
                     } else if end_dir_children {
                         break;
@@ -489,6 +497,23 @@ fn insert_direntries(
     Ok(())
 }
 
+pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
+    let mut binding = GitignoreBuilder::new(root);
+    let builder = binding
+        .add_line(None, ".tup/**")?
+        .add_line(None, ".git/**")?
+        .add_line(None, ".tupignore")?;
+    if root.join(".tupignore").is_file() {
+        let _ = builder
+            .add(".tupignore")
+            .ok_or(eyre!("unable to add .tupignore"))?;
+    }
+    let ign = builder
+        .build()
+        .map_err(|e| eyre!("unable to build tupignore: {:?}", e))?;
+    Ok(ign)
+}
+
 // dir with db ids are available now walk over their children (`DirChildren` and send them for upserts
 fn walk_recvd_dirs(hr: Receiver<DirSender>, ps: Sender<DirChildren>) -> eyre::Result<()> {
     for dir_sender in hr.iter() {
@@ -531,6 +556,7 @@ fn add_modify_nodes(
 
 /// This tracks the paths which have a available parent id, removes them from dir_children, and dir_id_by_path and sends them over to write/query to/from db
 fn linkup_dbids(
+    ign: &Gitignore,
     dire_sender: &Sender<ProtoNode>,
     dir_children_set: &mut HashSet<DirChildren>,
     dir_id_by_path: &mut HashMap<HashedPath, i64>,
@@ -539,7 +565,9 @@ fn linkup_dbids(
     dir_id_by_path.
         retain(|p, id|
             // warning this is a predicate with side effects.. :-(.
-            if let Some(dir_children) = dir_children_set.take(p) {
+            if ign.matched(p.as_ref(), true).is_ignore() {
+                false
+            } else if let Some(dir_children) = dir_children_set.take(p) {
                 send_children(dir_children, *id, dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
                 false
             } else {

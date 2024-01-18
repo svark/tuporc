@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use eyre::Result;
 use fs2::FileExt;
+use ignore::gitignore::Gitignore;
 use notify::{event, Config, Event, EventKind, RecursiveMode, Watcher};
 use rusqlite::Connection;
 
@@ -17,14 +18,18 @@ use crate::TermProgress;
 
 pub(crate) struct WatchObject {
     root: PathBuf,
+    ign: Gitignore,
 }
 
 impl WatchObject {
-    pub fn new(root: PathBuf) -> Self {
-        WatchObject { root: root.clone() }
+    pub fn new(root: PathBuf, ign: Gitignore) -> Self {
+        WatchObject {
+            root: root.clone(),
+            ign,
+        }
     }
     pub fn start(&mut self) -> Result<()> {
-        monitor(&self.root)?;
+        monitor(&self.root, self.ign.clone())?;
         Ok(())
     }
     pub fn stop(&mut self) -> Result<()> {
@@ -42,8 +47,20 @@ fn fetch_latest_id(conn: &Connection, table: &str, id: &str) -> Result<i64> {
     Ok(id)
 }
 
-fn fetch_latest_message(conn: &Connection) -> Result<String> {
-    let message_id = fetch_latest_id(conn, "MESSAGE", "id")?;
+fn fetch_latest_ids(conn: &Connection, table: &str, id: &str, current_id: i64) -> Result<Vec<i64>> {
+    let sql = format!("SELECT {id} from {table} where {id} > {current_id}");
+    let mut stmt = conn.prepare(sql.as_str())?;
+    let mut rows = stmt.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        ids.push(id);
+        //Ok(id)
+    }
+    Ok(ids)
+}
+
+fn fetch_message(conn: &Connection, message_id: i64) -> Result<String> {
     let message: String = conn.query_row(
         "SELECT message from Messages where id = ? ",
         [message_id],
@@ -52,7 +69,12 @@ fn fetch_latest_message(conn: &Connection) -> Result<String> {
     Ok(message)
 }
 
-fn monitor(root: &Path) -> Result<()> {
+fn is_file_locked_for_write<P: AsRef<Path>>(path: P) -> Result<bool> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    Ok(file.try_lock_exclusive().is_err())
+}
+
+fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
     let config = Config::default().with_poll_interval(Duration::from_millis(1000));
     let lock_file_path = root.join(".tup/mon_lock");
     let mut file = OpenOptions::new()
@@ -75,124 +97,167 @@ fn monitor(root: &Path) -> Result<()> {
         "Monitoring filesystem for changes at tup root: {}",
         current_dir()?.display()
     );
-
-    let watch_handler = move |event: notify::Result<Event>| {
-        if let Ok(event) = event {
+    let root = current_dir()?;
+    let root_sz = root.components().count();
+    let watch_handler = move |e: notify::Result<Event>| {
+        if let Ok(event) = e {
             match event.kind {
-                EventKind::Modify(event::ModifyKind::Data(_))
-                | EventKind::Create(event::CreateKind::File) => {
-                    for path in event.paths {
-                        {
+                EventKind::Modify(_) | EventKind::Create(event::CreateKind::File) => {
+                    for path in event.paths.into_iter() {
+                        if !is_ignorable(&path, &ign, false) {
                             log::debug!("File added to list: {:?}", path);
-                            path_sender.send((path, 1)).unwrap();
+                            path_sender
+                                .send((path.iter().skip(root_sz).collect(), 1))
+                                .unwrap();
                         }
                     }
                 }
-                EventKind::Remove(event::RemoveKind::File)
-                | EventKind::Remove(event::RemoveKind::Folder) => {
-                    for path in event.paths {
-                        log::debug!("File removed to list: {:?}", path);
-                        path_sender.send((path, -1)).unwrap();
+                EventKind::Remove(event::RemoveKind::File) => {
+                    for path in event.paths.into_iter() {
+                        if !is_ignorable(&path, &ign, false) {
+                            log::debug!("File removed to list: {:?}", path);
+                            path_sender.send((path.iter().skip(root_sz), 0)).unwrap();
+                        }
+                    }
+                }
+                EventKind::Remove(event::RemoveKind::Folder) => {
+                    for path in event.paths.into_iter() {
+                        if !is_ignorable(&path, &ign, true) {
+                            log::debug!("File removed to list: {:?}", path);
+                            path_sender.send((path.iter().skip(root_sz), 0)).unwrap();
+                        }
                     }
                 }
                 _ => {}
             }
         } else {
-            log::warn!("error in event: {:?}", event.err().unwrap());
+            log::warn!("error in event: {:?}", e.err().unwrap());
         }
     };
     crossbeam::scope(|s| -> Result<()> {
         let (stop_sender, stop_receiver) = crossbeam::channel::bounded(0);
         let stop_sender_clone = stop_sender.clone();
         ctrlc::set_handler(move || {
-            stop_sender_clone
-                .send(())
-                .expect("Error setting Ctrl-C handler")
+            let _ = stop_sender_clone.send(());
         })?;
         let mut conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
-        let mut generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id")
-            .expect("unable to query generation_id");
-
+        let mut generation_id =
+            fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
         let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
             .expect("Failed to create watcher");
-        watcher.watch(root, RecursiveMode::Recursive)?;
+        watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
         let term_progress = TermProgress::new("Full scan underway..");
         let pb_main = term_progress.get_main();
-        s.spawn(move |_| -> Result<()> {
-            let mut current_id: i64 = 0;
-            let mut end_build = true;
-            scan_root(root, &mut conn, &term_progress)?;
-            pb_main.println("Full scan complete");
-            let mut node_statements = NodeStatements::new(&conn)?;
-            let mut add_ids_statements = AddIdsStatements::new(&conn)?;
-            let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
+        let _ = s
+            .spawn(move |_| -> Result<()> {
+                let mut current_id: i64 = 0;
+                let mut build_in_progess = false;
+                scan_root(root.as_path(), &mut conn, &term_progress)?;
+                let mut fetch_monitored_files = conn.fetch_monitored_prepare()?;
+                pb_main.println("Full scan complete");
+                crate::db::create_path_buf_temptable(&conn)?;
+                let mut node_statements = NodeStatements::new(&conn)?;
+                let mut add_ids_statements = AddIdsStatements::new(&conn)?;
+                let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
 
-            loop {
-                if end_build {
-                    sleep(Duration::from_secs(10));
-                } else {
+                loop {
                     sleep(Duration::from_secs(5));
-                }
-                let latest_id = fetch_latest_id(&conn, "MESSAGES", "id").unwrap_or(current_id);
-                let mut end_watch = false;
-                if latest_id != current_id {
-                    current_id = latest_id;
-                    let latest_message = fetch_latest_message(&conn)?;
-                    if latest_message.eq("QUIT") {
+                    let mut end_watch = false;
+                    if let Ok(()) = stop_receiver.try_recv() {
+                        term_progress.abandon_main("Ctrl-c received");
                         end_watch = true;
-                        term_progress.abandon(&pb_main, "Quit message received");
+                    } else {
+                        let latest_ids = fetch_latest_ids(&conn, "MESSAGES", "id", current_id)
+                            .unwrap_or(Vec::new());
+                        for latest_id in latest_ids {
+                            current_id = latest_id;
+                            let latest_message = fetch_message(&conn, current_id)?;
+                            if latest_message.eq("QUIT") {
+                                end_watch = true;
+                                term_progress.abandon_main("Quit message received");
+                                break;
+                            }
+                        }
+                        conn.execute("DELETE from messages", ()).unwrap();
                     }
-                    if latest_message.eq("STARTBUILD") {
-                        generation_id = generation_id + 1;
-                        end_build = false;
+                    if end_watch {
+                        watcher.unwatch(root.as_path())?;
+                        break;
                     }
-                    if latest_message.eq("ENDBUILD") {
-                        end_build = true;
+                    let build_in_progess_new_stat =
+                        is_file_locked_for_write(".tup/build.lock").unwrap_or(false);
+                    if build_in_progess != build_in_progess_new_stat {
+                        if build_in_progess_new_stat {
+                            generation_id += 1;
+                        } else {
+                            // flush all monitored files to db
+                            // read all monitored and call crate::parse::insert_path or crate::parse::remove_path for each
+                            let monitored_files =
+                                fetch_monitored_files.fetch_monitored(generation_id)?;
+                            for (path, added) in monitored_files {
+                                add_remove_nodes(
+                                    &mut node_statements,
+                                    &mut add_ids_statements,
+                                    path.as_str(),
+                                    added,
+                                )?;
+                            }
+                            generation_id += 1;
+                            conn.execute("DELETE from MONITORED_FILES", ())?;
+                        }
+                        build_in_progess = build_in_progess_new_stat;
                     }
-                }
-                if let Ok(()) = stop_receiver.try_recv() {
-                    term_progress.abandon(&pb_main, "Ctrl-c received");
-                    end_watch = true;
-                }
-
-                if end_build {
-                    conn.execute("DELETE * from messages", ()).unwrap();
-                    if let Ok((path, added)) = path_receiver.try_recv() {
-                        if added == 1 {
-                            crate::parse::insert_path(
-                                &path,
+                    while let Ok((path, added)) = path_receiver.try_recv() {
+                        if !build_in_progess_new_stat {
+                            add_remove_nodes(
                                 &mut node_statements,
                                 &mut add_ids_statements,
+                                &path,
+                                added == 1,
                             )?;
                         } else {
-                            crate::parse::remove_path(
-                                &path,
-                                &mut node_statements,
-                                &mut add_ids_statements,
-                            )?;
+                            insert_monitored_prepare
+                                .insert_monitored(path, generation_id, added)
+                                .expect("failed to add monitored file to db");
                         }
                     }
-                } else if let Ok((path, added)) = path_receiver.try_recv() {
-                    insert_monitored_prepare
-                        .insert_monitored(path, generation_id, added)
-                        .expect("failed to add monitored file to db");
                 }
-
-                if end_watch {
-                    watcher.unwatch(root)?;
-                    break;
-                }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .join()
+            .expect("failed to join thread")?;
         Ok(())
     })
     .expect("failed to spawn thread")?;
     Ok(())
 }
 
+fn is_ignorable<P: AsRef<Path>>(path: P, ign: &ignore::gitignore::Gitignore, is_dir: bool) -> bool {
+    return ign.matched(path.as_ref(), is_dir).is_ignore();
+}
+
+fn add_remove_nodes<P: AsRef<Path>>(
+    node_statements: &mut NodeStatements,
+    add_ids_statements: &mut AddIdsStatements,
+    path: P,
+    added: bool,
+) -> Result<()> {
+    if added {
+        crate::parse::insert_path(&path, node_statements, add_ids_statements)?;
+    } else {
+        crate::parse::remove_path(&path, node_statements, add_ids_statements)?;
+    }
+    Ok(())
+}
+
 fn stop_monitor() -> Result<()> {
-    let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
+    let conn =
+        Connection::open(".tup/db").expect("Failed to connect to .tup/db. Are you in a tup root?");
     conn.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())
+}
+
+pub(crate) fn is_monitor_running() -> bool {
+    let lock_file_path = current_dir().unwrap().join(".tup/mon_lock");
+    is_file_locked_for_write(lock_file_path).unwrap_or(false)
 }

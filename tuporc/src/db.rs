@@ -518,6 +518,7 @@ pub(crate) trait LibSqlExec {
 
     fn insert_monitored<P: AsRef<Path>>(&mut self, p: P, keyword_id: i64, event: i32)
         -> Result<()>;
+    fn fetch_monitored(&mut self, generation_id: i64) -> Result<Vec<(String, bool)>>;
     fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, generation_id: i64) -> Result<()>;
     fn remove_monitored_by_generation_id(&mut self, generation_id: i64) -> Result<()>;
 }
@@ -1027,7 +1028,7 @@ SELECT DISTINCT x FROM dependants));",
 
     fn insert_monitored_prepare(&self) -> Result<SqlStatement> {
         let stmt = self
-            .prepare("INSERT INTO MONITORED_FILES (path, generation_id, event) VALUES (?, ?, ?)")?;
+            .prepare("INSERT INTO MONITORED_FILES (name, generation_id, event) VALUES (?, ?, ?)")?;
         Ok(SqlStatement {
             stmt,
             tok: InsertMonitored,
@@ -1058,7 +1059,7 @@ SELECT DISTINCT x FROM dependants));",
     }
 
     fn fetch_monitored_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT path from MONITORED_FILES where generation_id = ?")?;
+        let stmt = self.prepare("SELECT name from MONITORED_FILES where generation_id = ?")?;
         Ok(SqlStatement {
             stmt,
             tok: FetchMonitored,
@@ -1496,6 +1497,17 @@ impl LibSqlExec for SqlStatement<'_> {
         let path = db_path_str(p);
         self.stmt.insert((path, generation_id, event)).unwrap();
         Ok(())
+    }
+    fn fetch_monitored(&mut self, generation_id: i64) -> Result<Vec<(String, bool)>> {
+        assert_eq!(self.tok, FetchMonitored, "wrong token for fetch monitored");
+        let mut rows = self.stmt.query([generation_id]).unwrap();
+        let mut vs = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            let p: String = row.get(0).unwrap();
+            let added: i32 = row.get(1).unwrap();
+            vs.push((p, added == 1));
+        }
+        Ok(vs)
     }
     fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, id: i64) -> Result<()> {
         assert_eq!(

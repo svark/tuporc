@@ -7,6 +7,7 @@ extern crate env_logger;
 extern crate execute as ex;
 extern crate eyre;
 extern crate fs2;
+extern crate ignore;
 extern crate incremental_topo;
 extern crate indicatif;
 extern crate num_cpus;
@@ -16,6 +17,7 @@ extern crate regex;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::env::{current_dir, set_current_dir};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -137,6 +139,9 @@ impl TermProgress {
             pb.abandon_with_message(msg);
         }
     }
+    pub fn abandon_main(&self, msg: impl Into<Cow<'static, str>>) {
+        self.abandon(&self.pb_main, msg);
+    }
 
     pub fn set_message(&self, msg: &str) {
         self.mb.println(msg).expect("Failed to print message");
@@ -178,8 +183,8 @@ enum Action {
     },
     #[clap(about = "Monitor the filesystem for changes")]
     Monitor {
-        #[clap(short = 's', default_value = "true")]
-        start: bool,
+        #[clap(short = 's', long = "stop", default_value = "false")]
+        stop: bool,
     },
 }
 
@@ -190,6 +195,7 @@ fn is_tupfile<S: AsRef<str>>(s: S) -> bool {
 fn main() -> Result<()> {
     let args = Args::parse();
     env_logger::init();
+    use tap::tap::TapFallible;
     log::info!("Sqlite version: {}\n", rusqlite::version());
     if let Some(act) = args.command {
         match act {
@@ -219,8 +225,18 @@ fn main() -> Result<()> {
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
-                let tupfiles = scan_and_get_tupfiles(&root, &mut connection, &term_progress)?;
-                parse_tupfiles_in_db(connection, tupfiles, root.as_path(), term_progress)?;
+                let tupfiles = scan_and_get_tupfiles(&root, &mut connection, &term_progress)
+                    .tap_err(|e| {
+                        term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                    })?;
+
+                let term_progress =
+                    term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
+                parse_tupfiles_in_db(connection, tupfiles, root.as_path(), &term_progress).tap_err(
+                    |e| {
+                        term_progress.abandon_main(format!("Parsing failed with error: {}", e));
+                    },
+                )?
             }
             Action::Upd { target, keep_going } => {
                 change_root()?;
@@ -231,24 +247,28 @@ fn main() -> Result<()> {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
                     let tupfiles = scan_and_get_tupfiles(&root, &mut conn, &term_progress)?;
-                    parse_tupfiles_in_db(conn, tupfiles, root.as_path(), term_progress.clone())?;
+                    let term_progress = term_progress
+                        .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
+                    parse_tupfiles_in_db(conn, tupfiles, root.as_path(), &term_progress)?;
                     term_progress.clear();
+                    execute::execute_targets(&target, keep_going, root, &term_progress)?;
                 }
 
-                execute::execute_targets(&target, keep_going, root, &term_progress)?;
                 // receive events from subprocesses.
                 //conn.remove_modified_list()?;
 
                 // build a dag of rules and files from the ModifyList in the database
                 // and the tupfiles in the filesystem.
             }
-            Action::Monitor { start } => {
+            Action::Monitor { stop } => {
                 change_root()?;
-                if start {
-                    monitor::WatchObject::new(current_dir()?).start()?;
+                let cwd = current_dir()?;
+                let ign = scan::build_ignore(cwd.as_path())?;
+                if !stop {
+                    monitor::WatchObject::new(cwd, ign).start()?;
                 } else {
                     println!("Stopping monitor");
-                    monitor::WatchObject::new(current_dir()?).stop()?;
+                    monitor::WatchObject::new(cwd, ign).stop()?;
                 }
             }
         }
@@ -284,7 +304,21 @@ fn scan_and_get_tupfiles(
             "Tup database is not initialized, use `tup init' to initialize",
         ));
     }
-    scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
+    use fs2::FileExt;
+
+    let lock_file_path = root.join(".tup/build_lock");
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true) // Create the file if it doesn't exist
+        .open(lock_file_path)?;
+    // Apply an exclusive lock
+    file.try_lock_exclusive()
+        .map_err(|_| eyre!("Build was already started!"))?;
+
+    // if the monitor is running avoid scanning
+    if !monitor::is_monitor_running() {
+        scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
+    }
     term_progress.clear();
     gather_tupfiles(&mut conn)
 }
