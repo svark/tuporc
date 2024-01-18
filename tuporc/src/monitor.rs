@@ -107,7 +107,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                         if !is_ignorable(&path, &ign, false) {
                             log::debug!("File added to list: {:?}", path);
                             path_sender
-                                .send((path.iter().skip(root_sz).collect(), 1))
+                                .send((path.into_iter().skip(root_sz).collect::<PathBuf>(), 1))
                                 .unwrap();
                         }
                     }
@@ -116,7 +116,9 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                     for path in event.paths.into_iter() {
                         if !is_ignorable(&path, &ign, false) {
                             log::debug!("File removed to list: {:?}", path);
-                            path_sender.send((path.iter().skip(root_sz), 0)).unwrap();
+                            path_sender
+                                .send((path.into_iter().skip(root_sz).collect::<PathBuf>(), 0))
+                                .unwrap();
                         }
                     }
                 }
@@ -124,7 +126,9 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                     for path in event.paths.into_iter() {
                         if !is_ignorable(&path, &ign, true) {
                             log::debug!("File removed to list: {:?}", path);
-                            path_sender.send((path.iter().skip(root_sz), 0)).unwrap();
+                            path_sender
+                                .send((path.into_iter().skip(root_sz).collect::<PathBuf>(), 0))
+                                .unwrap();
                         }
                     }
                 }
