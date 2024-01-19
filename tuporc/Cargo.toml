@@ -3,6 +3,7 @@ name = "tuporc"
 version = "0.1.0"
 edition = "2021"
 authors = ["Arun Sivaramakrishnan <arun.sivaramakrishnan@gmail.com>"]
+license = "Apache 2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [profile.release-with-debug]
@@ -33,5 +34,5 @@ notify = { version = "6.1.1", features = ["crossbeam-channel"] }
 lazy_static = { version = "1.4.0", features = [] }
 fs2 = "0.4.3"
 tap = "1.0.1"
-ignore = "0.4.17"
+ignore = "0.4.22"
 

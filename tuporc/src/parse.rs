@@ -727,11 +727,8 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
             let node =
                 find_upsert_node(node_statements, add_ids_statements, node_at_path.get_node())?;
             if node.get_type() == &Dir {
-                add_to_dirpathbuf(
-                    node_statements,
-                    node.get_id(),
-                    node_at_path.get_hashed_path().as_ref(),
-                )?;
+                node_statements
+                    .add_to_dirpathbuf(node.get_id(), node_at_path.get_hashed_path().as_ref())?;
             }
             Ok(node.get_id())
         } else {
@@ -884,10 +881,10 @@ fn insert_nodes(
                 Ok(())
             };
 
-            for r in arts.tasks_by_tup().iter() {
-                for rl in r.iter() {
-                    let rd = rl.get_task_descriptor();
-                    let tup_desc = rl.get_tup_loc().get_tupfile_desc();
+            for resolvedtasks in arts.tasks_by_tup().iter() {
+                for resolvedtask in resolvedtasks.iter() {
+                    let rd = resolvedtask.get_task_descriptor();
+                    let tup_desc = resolvedtask.get_tup_loc().get_tupfile_desc();
                     let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
                         eyre::Error::msg(format!(
                             "No tup directory found in db for tup descriptor:{:?}",
@@ -895,7 +892,7 @@ fn insert_nodes(
                         ))
                     })?;
                     collect_task_nodes_to_insert(rd, dir, crossref, &mut node_statements)?;
-                    for s in rl.get_deps() {
+                    for s in resolvedtask.get_deps() {
                         if let Some(p) = s.get_glob_path_desc() {
                             if processed_globs.insert(p.clone()) && s.is_glob_match() {
                                 collect_nodes_to_insert(
@@ -909,7 +906,7 @@ fn insert_nodes(
                             }
                         }
                     }
-                    let env_desc = rl.get_env_desc();
+                    let env_desc = resolvedtask.get_env_desc();
                     let environs = read_write_buf.get_envs(&env_desc);
                     envs_to_insert.extend(environs.getenv());
                 }
@@ -968,8 +965,8 @@ fn insert_nodes(
                 }
                 Ok(())
             };
-            for r in arts.rules_by_tup().iter() {
-                for rl in r.iter() {
+            for resolvedlinks in arts.rules_by_tup().iter() {
+                for rl in resolvedlinks.iter() {
                     let rd = rl.get_rule_desc();
                     let rule_ref = rl.get_tup_loc();
                     let tup_desc = rule_ref.get_tupfile_desc();
@@ -1229,14 +1226,6 @@ impl AddIdsStatements<'_> {
     }
 }
 
-pub(crate) fn add_to_dirpathbuf(
-    node_statements: &mut NodeStatements,
-    node_id: i64,
-    path: &Path,
-) -> Result<()> {
-    node_statements.add_to_dirpathbuf(node_id, path)?;
-    Ok(())
-}
 /// [find_upsert_node] pretends to be the sqlite upsert operation
 /// it also adds the node to the present list, modify list and updates nodes mtime
 pub(crate) fn find_upsert_node(
