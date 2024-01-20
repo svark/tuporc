@@ -1,12 +1,6 @@
 [submodule "tuprs"]
 	path = tuprs
 	url = https://github.com/svark/tuprs
-[submodule "tupinject"]
-	path = tupinject
-	url = https://github.com/svark/tupinject
-[submodule "tupsetuphook"]
-	path = tupsetuphook
-	url = https://github.com/svark/tupsetuphook
 [submodule "tuplua"]
-   path = tuplua
-   url = https://github.com/svark/lua-src-rs
+	path = tuplua
+	url = https://github.com/svark/lua-src-rs
