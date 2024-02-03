@@ -18,6 +18,7 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use rusqlite::Connection;
+use tap::TapFallible;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::db::RowType::{Dir, TupF};
@@ -59,16 +60,24 @@ struct DirE {
 }
 
 impl DirE {
-    fn new(de: DirEntry, hashed_path: HashedPath) -> DirE {
+    fn from(de: DirEntry) -> DirE {
         DirE {
             file_name: de.file_name().to_owned(),
             metadata: de.metadata().ok(),
-            hashed_path: Some(hashed_path),
+            hashed_path: Some(HashedPath::from(de.into_path())),
         }
     }
 
     fn take_path(&mut self) -> HashedPath {
         self.hashed_path.take().unwrap()
+    }
+
+    fn get_hashed_path(&self) -> HashedPath {
+        self.hashed_path.clone().unwrap()
+    }
+
+    fn is_dir(&self) -> bool {
+        self.metadata.as_ref().map_or(false, |m| m.is_dir())
     }
 
     fn take_metadata(&mut self) -> Option<Metadata> {
@@ -244,26 +253,45 @@ impl Borrow<HashedPath> for DirChildren {
 
 fn walkdir_from(
     root: HashedPath,
-    hs: &Sender<DirSender>,
-    ps: Sender<DirChildren>,
+    dir_sender: &Sender<DirSender>,
+    dir_entry_sender: Sender<DirChildren>,
+    ign: &Gitignore,
 ) -> eyre::Result<()> {
     let mut children = Vec::new();
-    for e in WalkDir::new(root.as_ref())
+    WalkDir::new(root.as_ref())
         .follow_links(true)
         .min_depth(1)
         .max_depth(1)
         .into_iter()
         .filter_map(Result::ok)
-    {
-        let pp = HashedPath::from(e.path().to_path_buf());
-        let cur_path = pp.clone();
-        let pdir = DirSender::new(pp, hs.clone());
-        if e.file_type().is_dir() {
-            hs.send(pdir)?;
-        }
-        children.push(DirE::new(e, cur_path))
-    }
-    ps.send(DirChildren::new(root, children))?;
+        .try_for_each(|e| {
+            let dir_entry = DirE::from(e);
+            if dir_entry.is_dir() {
+                let pp = dir_entry.get_hashed_path();
+                if !ign.matched(pp.get_path().as_path(), true).is_ignore() {
+                    let pdir = DirSender::new(pp, dir_sender.clone());
+                    dir_sender.send(pdir)?;
+                }
+            }
+            children.push(dir_entry);
+            eyre::Ok(())
+        })
+        .tap_err(|e| {
+            log::error!(
+                "Walkdir failed on folder:{} due to: {}",
+                root.get_path().as_path().display(),
+                e
+            );
+        })?;
+    dir_entry_sender
+        .send(DirChildren::new(root.clone(), children))
+        .tap_err(|e| {
+            log::error!(
+                "Failed to send children of root:{} due to {}",
+                root.get_path().as_path().display(),
+                e
+            );
+        })?;
     Ok(())
 }
 
@@ -363,6 +391,7 @@ fn insert_direntries(
 
         //println!("root:{:?}", root.to_path_buf());
         {
+            let ign = ign.clone();
             s.spawn(move |_| -> eyre::Result<()> {
                 let mut end_dirs = false;
                 let mut end_dir_children = false;
@@ -432,7 +461,7 @@ fn insert_direntries(
             });
         }
         {
-            // threads below convert DirEntries to Node's ready for sql queries/inserts
+            // threads below convert DirEntries to Nodes ready for sql queries/inserts
             for _ in 0..MAX_THRS_NODES {
                 let ns = nodesender.clone();
                 let dire_receiver = dire_receiver.clone();
@@ -455,7 +484,7 @@ fn insert_direntries(
             drop(nodesender);
         }
         {
-            // hidden in a corner is this thread below that works with sqlite db to upsert nodes
+            // hidden in a corner is this thread below that works with sqlite db to upsert nodes.
             // Nodes are expected to have parent dir ids.
             // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
             let pb = pb.clone();
@@ -472,19 +501,19 @@ fn insert_direntries(
             });
         }
         let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
-        let pl = DirSender::new(root_hash_path, dirs_sender.clone());
-        dirs_sender.send(pl)?;
+        dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
         drop(dirs_sender);
         let wg = WaitGroup::new();
         for _ in 0..MAX_THRS_DIRS {
             // This loop spreads the task for walking over children among threads.
             // walkdir is only run for immediate children. When  we encounder dirs, they are packaged in `dir_sender` thereby queuing them until
             // they are popped for running walkdir on them.
-            let hr = dirs_receiver.clone();
-            let ps = dir_children_sender.clone();
+            let dir_receiver = dirs_receiver.clone();
+            let dir_children_sender = dir_children_sender.clone();
             let wg = wg.clone();
+            let ign = ign.clone();
             s.spawn(move |_| -> eyre::Result<()> {
-                let res = walk_recvd_dirs(hr, ps);
+                let res = walk_recvd_dirs(dir_receiver.clone(), dir_children_sender.clone(), &ign);
                 drop(wg);
                 res
             });
@@ -515,14 +544,25 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
 }
 
 // dir with db ids are available now walk over their children (`DirChildren` and send them for upserts
-fn walk_recvd_dirs(hr: Receiver<DirSender>, ps: Sender<DirChildren>) -> eyre::Result<()> {
-    for dir_sender in hr.iter() {
-        walkdir_from(dir_sender.parent_path(), dir_sender.sender(), ps.clone())?;
+fn walk_recvd_dirs(
+    dir_receiver: Receiver<DirSender>,
+    dir_child_sender: Sender<DirChildren>,
+    ign: &Gitignore,
+) -> eyre::Result<()> {
+    for dir_sender in dir_receiver.iter() {
+        walkdir_from(
+            dir_sender.parent_path(),
+            dir_sender.sender(),
+            dir_child_sender.clone(),
+            ign,
+        )?;
     }
+    drop(dir_receiver);
+    drop(dir_child_sender);
     Ok(())
 }
 
-/// For the received nodes which are are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
+/// For the received nodes which are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
 /// Those not in database will be inserted.
 fn add_modify_nodes(
     conn: &mut Connection,
