@@ -18,6 +18,7 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use rusqlite::Connection;
+use tap::TapFallible;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::db::RowType::{Dir, TupF};
@@ -254,9 +255,9 @@ fn walkdir_from(
     root: HashedPath,
     dir_sender: &Sender<DirSender>,
     dir_entry_sender: Sender<DirChildren>,
-) -> eyre::Result<bool> {
+    ign: &Gitignore,
+) -> eyre::Result<()> {
     let mut children = Vec::new();
-    let mut sent = false;
     WalkDir::new(root.as_ref())
         .follow_links(true)
         .min_depth(1)
@@ -267,15 +268,31 @@ fn walkdir_from(
             let dir_entry = DirE::from(e);
             if dir_entry.is_dir() {
                 let pp = dir_entry.get_hashed_path();
-                let pdir = DirSender::new(pp, dir_sender.clone());
-                dir_sender.send(pdir)?;
-                sent = true;
+                if !ign.matched(pp.get_path().as_path(), true).is_ignore() {
+                    let pdir = DirSender::new(pp, dir_sender.clone());
+                    dir_sender.send(pdir)?;
+                }
             }
             children.push(dir_entry);
             eyre::Ok(())
+        })
+        .tap_err(|e| {
+            log::error!(
+                "Walkdir failed on folder:{} due to: {}",
+                root.get_path().as_path().display(),
+                e
+            );
         })?;
-    dir_entry_sender.send(DirChildren::new(root, children))?;
-    Ok(sent)
+    dir_entry_sender
+        .send(DirChildren::new(root.clone(), children))
+        .tap_err(|e| {
+            log::error!(
+                "Failed to send children of root:{} due to {}",
+                root.get_path().as_path().display(),
+                e
+            );
+        })?;
+    Ok(())
 }
 
 fn send_children(
@@ -374,6 +391,7 @@ fn insert_direntries(
 
         //println!("root:{:?}", root.to_path_buf());
         {
+            let ign = ign.clone();
             s.spawn(move |_| -> eyre::Result<()> {
                 let mut end_dirs = false;
                 let mut end_dir_children = false;
@@ -486,7 +504,6 @@ fn insert_direntries(
         dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
         drop(dirs_sender);
         let wg = WaitGroup::new();
-        let mut more_dirs_left = Arc::new(true);
         for _ in 0..MAX_THRS_DIRS {
             // This loop spreads the task for walking over children among threads.
             // walkdir is only run for immediate children. When  we encounder dirs, they are packaged in `dir_sender` thereby queuing them until
@@ -494,13 +511,9 @@ fn insert_direntries(
             let dir_receiver = dirs_receiver.clone();
             let dir_children_sender = dir_children_sender.clone();
             let wg = wg.clone();
-            let more_di = more_dirs_left.clone();
-            s.spawn(move |_| -> eyre::Result<bool> {
-                let mut res = walk_recvd_dirs(dir_receiver, dir_children_sender);
-                yield_now();
-                if res.unwrap_or(false) {
-                    res = walk_recvd_dirs(dir_receiver, dir_children_sender);
-                }
+            let ign = ign.clone();
+            s.spawn(move |_| -> eyre::Result<()> {
+                let res = walk_recvd_dirs(dir_receiver.clone(), dir_children_sender.clone(), &ign);
                 drop(wg);
                 res
             });
@@ -534,20 +547,19 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
 fn walk_recvd_dirs(
     dir_receiver: Receiver<DirSender>,
     dir_child_sender: Sender<DirChildren>,
-) -> eyre::Result<bool> {
-    let mut sent = false;
+    ign: &Gitignore,
+) -> eyre::Result<()> {
     for dir_sender in dir_receiver.iter() {
-        if walkdir_from(
+        walkdir_from(
             dir_sender.parent_path(),
             dir_sender.sender(),
             dir_child_sender.clone(),
-        )? {
-            sent = true;
-        }
+            ign,
+        )?;
     }
     drop(dir_receiver);
     drop(dir_child_sender);
-    Ok(sent)
+    Ok(())
 }
 
 /// For the received nodes which are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
