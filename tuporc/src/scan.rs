@@ -179,12 +179,13 @@ impl DirSender {
 #[derive(Clone, Debug)]
 struct ProtoNode {
     p: DirE,
-    pid: i64,
+    // directory entry to be inserted into db
+    dir_id: i64, // parent dir id
 }
 
 impl ProtoNode {
     pub fn new(p: DirE, pid: i64) -> ProtoNode {
-        ProtoNode { p, pid }
+        ProtoNode { p, dir_id: pid }
     }
 
     fn get_file_name(&self) -> &OsStr {
@@ -192,7 +193,7 @@ impl ProtoNode {
     }
 
     fn get_dir_id(&self) -> i64 {
-        self.pid
+        self.dir_id
     }
 
     fn take_path(&mut self) -> HashedPath {
@@ -506,8 +507,9 @@ fn insert_direntries(
         let wg = WaitGroup::new();
         for _ in 0..MAX_THRS_DIRS {
             // This loop spreads the task for walking over children among threads.
-            // walkdir is only run for immediate children. When  we encounder dirs, they are packaged in `dir_sender` thereby queuing them until
-            // they are popped for running walkdir on them.
+            // walkdir is only run for immediate children. When  we encounter dirs during a walkdir operation,
+            // they are packaged in `dir_sender` queuing them until
+            // they are popped for running walkdir on them with `dirs_receiver`.
             let dir_receiver = dirs_receiver.clone();
             let dir_children_sender = dir_children_sender.clone();
             let wg = wg.clone();
@@ -543,7 +545,10 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
     Ok(ign)
 }
 
-// dir with db ids are available now walk over their children (`DirChildren` and send them for upserts
+// walkdir over the children and send the children for insertion into db using the sender for DirChildren.
+// This is a sort of recursive function, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
+// Eventually, each such  `DirSender` will be received by some thread which calls `walk_recvd_dirs` again on them
+// to send the children of the subdirectory.
 fn walk_recvd_dirs(
     dir_receiver: Receiver<DirSender>,
     dir_child_sender: Sender<DirChildren>,
