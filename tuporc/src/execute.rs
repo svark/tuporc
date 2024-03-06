@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::iter::FromIterator;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::slice::Iter;
@@ -276,7 +275,7 @@ impl ProcReceivers {
     ) -> bool {
         let r = &self.spawned_child_id_receiver;
         let mut end = false;
-        if let Ok(child_id) = oper.recv(r.deref()).map_err(|_| {
+        if let Ok(child_id) = oper.recv(r).map_err(|_| {
             debug!("no more spawned children expected");
             end = true;
         }) {
