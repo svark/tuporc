@@ -544,7 +544,10 @@ pub(crate) trait ForEachClauses {
     fn for_changed_or_created_tup_node_with_path<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>;
-
+    // all the tupfiles in the db
+    fn for_tup_node_with_path<F>(&self, f: F) -> Result<()>
+    where
+        F: FnMut(Node) -> Result<()>;
     fn for_each_grp_nodeid_provider<F>(
         &self,
         group_id: i64,
@@ -1654,6 +1657,14 @@ impl ForEachClauses for Connection {
             "SELECT id,dir,name from TUPPATHBUF where id in \
         (SELECT id from ModifyList where type = {tuptype})"
         ))?;
+        Self::for_tupid_and_path([], f, &mut stmt)?;
+        Ok(())
+    }
+    fn for_tup_node_with_path<F>(&self, f: F) -> Result<()>
+    where
+        F: FnMut(Node) -> Result<()>,
+    {
+        let mut stmt = self.prepare("SELECT id,dir,name from TUPPATHBUF")?;
         Self::for_tupid_and_path([], f, &mut stmt)?;
         Ok(())
     }

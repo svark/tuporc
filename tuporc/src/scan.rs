@@ -18,7 +18,6 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use rusqlite::Connection;
-use tap::TapFallible;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::db::RowType::{Dir, TupF};
@@ -277,7 +276,7 @@ fn walkdir_from(
             children.push(dir_entry);
             eyre::Ok(())
         })
-        .tap_err(|e| {
+        .inspect_err(|e| {
             log::error!(
                 "Walkdir failed on folder:{} due to: {}",
                 root.get_path().as_path().display(),
@@ -286,7 +285,7 @@ fn walkdir_from(
         })?;
     dir_entry_sender
         .send(DirChildren::new(root.clone(), children))
-        .tap_err(|e| {
+        .inspect_err(|e| {
             log::error!(
                 "Failed to send children of root:{} due to {}",
                 root.get_path().as_path().display(),
@@ -485,9 +484,9 @@ fn insert_direntries(
             drop(nodesender);
         }
         {
-            // hidden in a corner is this thread below that works with sqlite db to upsert nodes.
-            // Nodes are expected to have parent dir ids.
-            // Once a dir is upserted this also sends database ids of dirs so that new  children of those dirs can be inserted with parent dir id.
+            // hidden in a corner is this thread below that works to upsert nodes into sqlite db
+            // Nodes are expected to have parent dir ids at this stage.
+            // Once a dir is upserted this also sends database ids of dirs so that children inserted dirs can also be inserted
             let pb = pb.clone();
             s.spawn(move |_| -> eyre::Result<()> {
                 let res = add_modify_nodes(conn, nodereceiver, dirid_sender, &pb);

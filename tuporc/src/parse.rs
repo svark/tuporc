@@ -19,7 +19,7 @@ use tupparser::buffers::{
 use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath};
-use tupparser::{Artifacts, ReadWriteBufferObjects, TupParser};
+use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 
 use crate::db::RowType::{Dir, Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
@@ -221,7 +221,7 @@ impl PathSearcher for DbPathSearcher {
     ) -> Vec<PathDescriptor> {
         let conn = self.conn.lock();
         let mut fetch_node_prepare = conn.deref().fetch_node_prepare().unwrap();
-        let mut fetch_node_id_prepare = conn.deref().fetch_node_by_id_prepare().unwrap();
+        let mut fetch_node_id_prepare = conn.deref().fetch_nodeid_prepare().unwrap();
         let mut dirid = 1;
         let mut tup_rules = Vec::new();
         let tuprs = ["Tuprules.tup", "Tuprules.lua"];
@@ -262,6 +262,38 @@ impl PathSearcher for DbPathSearcher {
     }
 }
 
+pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
+    connection: Connection,
+    tupfiles: Vec<Node>,
+    root: P,
+    term_progress: &TermProgress,
+    var: &String,
+) -> Result<Vec<(TupPathDescriptor, String)>> {
+    {
+        let conn = connection;
+
+        let db = DbPathSearcher::new(conn, root.as_ref());
+        let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
+        let pb = term_progress.make_progress_bar("_");
+        let mut states_after_parse = Vec::new();
+        {
+            for tupfile in tupfiles
+                .iter()
+                .filter(|x| !x.get_name().ends_with(".lua"))
+                .cloned()
+            {
+                pb.set_message(format!("Parsing :{}", tupfile.get_name()));
+                let statements_to_resolve = parser.parse_tupfile_immediate(tupfile.get_name())?;
+                if let Some(val) = statements_to_resolve.fetch_var(var) {
+                    states_after_parse.push((statements_to_resolve.get_tup_desc().clone(), val));
+                }
+                pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+                term_progress.tick(&pb);
+            }
+        }
+        Ok(states_after_parse)
+    }
+}
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
 pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     connection: Connection,
@@ -270,7 +302,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     term_progress: &TermProgress,
 ) -> Result<()> {
     let mut crossref = CrossRefMaps::default();
-    let (arts, mut rwbufs, mut outs) = {
+    let (resolved_rules, mut rwbufs, mut outs) = {
         let conn = connection;
 
         let db = DbPathSearcher::new(conn, root.as_ref());
@@ -301,28 +333,33 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             tx.commit()?;
         }
         let tupfiles: Vec<_> = visited.into_iter().collect();
-        let arts = gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice(), &term_progress)?;
-        let arts = parser.reresolve(arts)?;
+        let resolved_rules =
+            gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice(), &term_progress)?;
+        let resolved_rules = parser.reresolve(resolved_rules)?;
         for tup_node in tupfiles.iter() {
             let tupid = parser
                 .read_write_buffers()
                 .add_tup_file(Path::new(tup_node.get_name()));
             crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
         }
-        (arts, parser.read_write_buffers(), parser.get_outs().clone())
+        (
+            resolved_rules,
+            parser.read_write_buffers(),
+            parser.get_outs().clone(),
+        )
     };
     let mut conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");
 
-    let _ = insert_nodes(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    let _ = insert_nodes(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
 
     check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
 
-    add_links_to_groups(&mut conn, &arts, &crossref)?;
+    add_links_to_groups(&mut conn, &resolved_rules, &crossref)?;
     fetch_group_providers(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
-    add_rule_links(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    add_rule_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
     // add links from glob inputs to tupfiles's directory
-    add_link_glob_dir_to_rules(&mut conn, &rwbufs, &arts, &mut crossref)?;
+    add_link_glob_dir_to_rules(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
     Ok(())
 }
 
@@ -332,13 +369,13 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 fn add_link_glob_dir_to_rules(
     conn: &mut Connection,
     rw_buf: &ReadWriteBufferObjects,
-    arts: &Artifacts,
+    resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
 ) -> Result<(), Report> {
     let tx = conn.transaction()?;
     {
         let mut insert_link = tx.insert_link_prepare()?;
-        for rlink in arts.get_resolved_links() {
+        for rlink in resolved_rules.get_resolved_links() {
             let tupfile_desc = rlink.get_tup_loc().get_tupfile_desc();
             let (tupfile_db_id, _) = crossref.get_tup_db_id(tupfile_desc).ok_or_else(|| {
                 eyre!(
@@ -368,7 +405,7 @@ fn add_link_glob_dir_to_rules(
     Ok(())
 }
 
-pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
+pub fn gather_modified_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
     create_path_buf_temptable(conn)?;
 
@@ -380,16 +417,28 @@ pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
     Ok(tupfiles)
 }
 
+pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
+    let mut tupfiles = Vec::new();
+    create_path_buf_temptable(conn)?;
+
+    conn.for_tup_node_with_path(|n: Node| {
+        // name stores full path here
+        tupfiles.push(n);
+        Ok(())
+    })?;
+    Ok(tupfiles)
+}
+
 fn gather_rules_from_tupfiles(
     p: &mut TupParser<DbPathSearcher>,
     tupfiles: &[Node],
     term_progress: &TermProgress,
-) -> Result<Artifacts> {
+) -> Result<ResolvedRules> {
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
-    let mut new_arts = Artifacts::new();
+    let mut new_resolved_rules = ResolvedRules::new();
     let (sender, receiver) = crossbeam::channel::unbounded();
     term_progress.set_message("Parsing Tupfiles");
-    crossbeam::thread::scope(|s| -> Result<Artifacts> {
+    crossbeam::thread::scope(|s| -> Result<ResolvedRules> {
         let wg = WaitGroup::new();
         for ithread in 0..MAX_THRS_DIRS {
             let mut p = p.clone();
@@ -437,16 +486,16 @@ fn gather_rules_from_tupfiles(
         {
             let path = tupfile_lua.get_name();
             pb.set_message(format!("Parsing :{}", path));
-            let arts = p.parse(path).map_err(|ref e| {
+            let resolved_rules = p.parse(path).map_err(|ref e| {
                 term_progress.abandon(&pb, format!("Error parsing {path}"));
                 eyre!("Error: {}", p.read_write_buffers().display_str(e))
             })?;
-            new_arts.extend(arts);
+            new_resolved_rules.extend(resolved_rules);
             term_progress.tick(&pb);
             pb.set_message(format!("Done parsing {}", path));
         }
         pb.set_message("Resolving statements..");
-        new_arts.extend(p.receive_resolved_statements(receiver).map_err(|error| {
+        new_resolved_rules.extend(p.receive_resolved_statements(receiver).map_err(|error| {
             let read_write_buffers = p.read_write_buffers();
             let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor());
             let tup_node = tup_node.to_string();
@@ -461,9 +510,9 @@ fn gather_rules_from_tupfiles(
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
         wg.wait();
-        Ok(new_arts)
+        Ok(new_resolved_rules)
     })
-    .expect("Threading error while fetching artifacts from tupfiles")
+    .expect("Threading error while fetching resolved rules from tupfiles")
 }
 
 /// checks that in  parsed tup files, no two rules produce the same output
@@ -510,10 +559,10 @@ fn check_uniqueness_of_parent_rule(
 fn add_rule_links(
     conn: &mut Connection,
     rbuf: &ReadWriteBufferObjects,
-    arts: &Artifacts,
+    resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
-    let rules_in_tup_file = arts.rules_by_tup();
+    let rules_in_tup_file = resolved_rules.rules_by_tup();
     let tconn = conn.transaction()?;
     {
         let mut inp_linker = tconn.insert_link_prepare()?;
@@ -754,10 +803,10 @@ fn split_path(path: &Path) -> eyre::Result<(&Path, Cow<'_, str>)> {
 fn insert_nodes(
     conn: &mut Connection,
     read_write_buf: &ReadWriteBufferObjects,
-    arts: &Artifacts,
+    resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
 ) -> Result<BTreeSet<(i64, RowType)>> {
-    //let rules_in_tup_file = arts.rules_by_tup();
+    //let rules_in_tup_file = resolved_rules.rules_by_tup();
 
     let mut groups_to_insert: Vec<_> = Vec::new();
     let mut paths_to_insert = BTreeSet::new();
@@ -881,7 +930,7 @@ fn insert_nodes(
                 Ok(())
             };
 
-            for resolvedtasks in arts.tasks_by_tup().iter() {
+            for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
                 for resolvedtask in resolvedtasks.iter() {
                     let rd = resolvedtask.get_task_descriptor();
                     let tup_desc = resolvedtask.get_tup_loc().get_tupfile_desc();
@@ -965,7 +1014,7 @@ fn insert_nodes(
                 }
                 Ok(())
             };
-            for resolvedlinks in arts.rules_by_tup().iter() {
+            for resolvedlinks in resolved_rules.rules_by_tup().iter() {
                 for rl in resolvedlinks.iter() {
                     let rd = rl.get_rule_desc();
                     let rule_ref = rl.get_tup_loc();
@@ -1021,8 +1070,8 @@ fn insert_nodes(
                 }
             }
         }
-        let rules = arts.rules_by_tup();
-        let tasks = arts.tasks_by_tup();
+        let rules = resolved_rules.rules_by_tup();
+        let tasks = resolved_rules.tasks_by_tup();
         let srcs_from_links = {
             log::info!(
                 "Cross referencing rule inputs to insert with the db ids with same name and directory"
@@ -1326,14 +1375,14 @@ pub(crate) fn find_upsert_node(
 /// add links from targets that contribute to a group to the group id
 fn add_links_to_groups(
     conn: &mut Connection,
-    arts: &Artifacts,
+    resolved_rules: &ResolvedRules,
     crossref: &CrossRefMaps,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     {
         let mut inp_linker = tx.insert_link_prepare()?;
 
-        for (group_id, targets) in arts
+        for (group_id, targets) in resolved_rules
             .get_resolved_links()
             .iter()
             .filter_map(|rl| rl.get_group_desc().as_ref().map(|g| (*g, rl.get_targets())))
