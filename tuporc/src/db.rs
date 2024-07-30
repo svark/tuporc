@@ -306,7 +306,7 @@ impl Node {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StatementType {
+pub(crate) enum StatementType {
     DoNothing,
     AddToMod,
     AddToDel,
@@ -1802,7 +1802,7 @@ impl ForEachClauses for Connection {
             let rty: RowType = RowType::try_from(rtype).map_err(|e| {
                 AnyError::from(CallBackError::from(format!(
                     "unknown row type returned \
-                 in foreach node query :{}",
+                 in  node query :{}",
                     e
                 )))
             })?;
@@ -1979,12 +1979,14 @@ FROM NodeChain;"
         Ok(())
     }
     fn write_message(&self, message: &str) -> Result<()> {
-        self.execute("INSERT INTO MESSAGE (message) VALUES (?1)", [message])?;
+        let mut stmt = self.prepare_cached("INSERT INTO MESSAGE (message) VALUES (?)")?;
+        stmt.execute([message])?;
         Ok(())
     }
 
     fn read_message(&self, last_id: i64) -> Result<String> {
-        let mut stmt = self.prepare("SELECT id, message FROM MESSAGE ORDER BY id DESC LIMIT 1")?;
+        let mut stmt =
+            self.prepare_cached("SELECT id, message FROM MESSAGE ORDER BY id DESC LIMIT 1")?;
         let mut message_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         if let Some(message_row) = message_iter.next() {

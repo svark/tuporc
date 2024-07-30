@@ -191,6 +191,8 @@ enum Action {
     DumpVars {
         #[clap(short = 'v', long = "var", default_value = "")]
         var: String,
+        #[clap(short = 's', long = "skip-scan", default_value = "false")]
+        skip_scan: bool,
     },
 }
 
@@ -230,10 +232,12 @@ fn main() -> Result<()> {
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
-                let tupfiles = scan_and_get_tupfiles(&root, &mut connection, &term_progress)
-                    .inspect_err(|e| {
-                        term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                    })?;
+                let skip_scan = monitor::is_monitor_running();
+                let tupfiles =
+                    scan_and_get_tupfiles(&root, &mut connection, &term_progress, skip_scan)
+                        .inspect_err(|e| {
+                            term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                        })?;
 
                 let term_progress =
                     term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
@@ -250,7 +254,9 @@ fn main() -> Result<()> {
                 {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
-                    let tupfiles = scan_and_get_tupfiles(&root, &mut conn, &term_progress)?;
+                    let skip_scan = monitor::is_monitor_running();
+                    let tupfiles =
+                        scan_and_get_tupfiles(&root, &mut conn, &term_progress, skip_scan)?;
                     let term_progress = term_progress
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
                     parse_tupfiles_in_db(conn, tupfiles, root.as_path(), &term_progress)?;
@@ -275,16 +281,17 @@ fn main() -> Result<()> {
                     monitor::WatchObject::new(cwd, ign).stop()?;
                 }
             }
-            Action::DumpVars { var } => {
+            Action::DumpVars { var, skip_scan, .. } => {
                 change_root()?;
                 let root = current_dir()?;
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
-                let tupfiles = scan_and_get_all_tupfiles(&root, &mut connection, &term_progress)
-                    .inspect_err(|e| {
-                        term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                    })?;
+                let tupfiles =
+                    scan_and_get_all_tupfiles(&root, &mut connection, &term_progress, skip_scan)
+                        .inspect_err(|e| {
+                            term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                        })?;
 
                 let tupfiles_with_vars = {
                     let term_progress = term_progress
@@ -338,6 +345,7 @@ fn scan_and_get_tupfiles(
     root: &PathBuf,
     connection: &mut Connection,
     term_progress: &TermProgress,
+    skip_scan: bool,
 ) -> Result<Vec<Node>> {
     let mut conn = connection;
     if !is_initialized(&conn, "Node") {
@@ -357,7 +365,7 @@ fn scan_and_get_tupfiles(
         .map_err(|_| eyre!("Build was already started!"))?;
 
     // if the monitor is running avoid scanning
-    if !monitor::is_monitor_running() {
+    if !skip_scan {
         scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
     }
     term_progress.clear();
@@ -368,6 +376,7 @@ fn scan_and_get_all_tupfiles(
     root: &PathBuf,
     connection: &mut Connection,
     term_progress: &TermProgress,
+    skip_scan: bool,
 ) -> Result<Vec<Node>> {
     let mut conn = connection;
     if !is_initialized(&conn, "Node") {
@@ -387,7 +396,7 @@ fn scan_and_get_all_tupfiles(
         .map_err(|_| eyre!("Build was already started!"))?;
 
     // if the monitor is running avoid scanning
-    if !monitor::is_monitor_running() {
+    if !skip_scan {
         scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
     }
     term_progress.clear();
