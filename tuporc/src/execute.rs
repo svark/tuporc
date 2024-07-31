@@ -16,6 +16,7 @@ use incremental_topo::IncrementalTopo;
 use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
+use regex::Regex;
 use rusqlite::Connection;
 
 use tupetw::{DynDepTracker, EventHeader, EventType};
@@ -905,47 +906,18 @@ fn verify_rule_io(
         .fetch_flags(rule_id as _)?
         .unwrap_or(String::new());
     let mut processed_io = std::collections::BTreeSet::new();
-    'outer: for (fnode, ty) in io_vec.iter() {
+    for (fnode, ty) in io_vec.iter() {
         if !processed_io.insert((fnode.clone(), *ty)) {
             continue;
         }
         if *ty == EventType::Read as _ || *ty == EventType::Open as _ {
-            for inp in inps.iter().chain(outs.iter()) {
-                if *inp.get_type() == RowType::Dir
-                    || *inp.get_type() == RowType::Grp
-                    || *inp.get_type() == RowType::Env
-                    || *inp.get_type() == RowType::DirGen
-                {
-                    continue;
-                }
-                if inp.get_name() == fnode {
-                    continue 'outer;
-                }
+            if input_matches_declared(&inps, &outs, fnode) {
+                continue;
             }
-
-            if let Ok(dirid) = process_checker.fetch_dirid(fnode) {
-                let p = Path::new(fnode);
-                if let Some(name) = p.file_name() {
-                    if let Ok(from_id) =
-                        process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
-                    {
-                        process_checker.insert_link(from_id, rule_id as _)?;
-                    }
-                }
-            }
+            link_input_to_rule(rule_id, process_checker, fnode)?;
         } else if *ty == EventType::Write as u8 {
-            for out in outs.iter() {
-                if out.get_type().eq(&Excluded) {
-                    let exclude_pattern = out.get_name().to_string();
-                    use regex::Regex;
-                    let re = Regex::new(&*exclude_pattern).unwrap();
-                    if re.is_match(fnode) {
-                        continue 'outer;
-                    }
-                }
-                if out.get_name() == fnode {
-                    continue 'outer;
-                }
+            if output_matches_declared(&outs, fnode) {
+                continue;
             }
             return Err(eyre!(
                 "File {} being written was not an output to rule {}",
@@ -954,12 +926,10 @@ fn verify_rule_io(
             ));
         }
     }
-    'outer2: for inp in inps.iter() {
+    for inp in inps.iter() {
         let fname = inp.get_name();
-        for (fnode, ty) in io_vec.iter() {
-            if ty == &(EventType::Read as u8) || ty == &(EventType::Open as u8) && fnode == fname {
-                continue 'outer2;
-            }
+        if declared_matches_input(&io_vec, fname) {
+            continue;
         }
         if flags.contains('*') {
             eprintln!(
@@ -969,13 +939,11 @@ fn verify_rule_io(
         }
         //return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
     }
-    'outer3: for out in outs.iter() {
-        let fname = out.get_name();
-        for (fnode, ty) in io_vec.iter() {
-            if ty == &(EventType::Write as u8) && fnode == fname {
-                continue 'outer3;
-            }
-        }
+    for out in outs.iter() {
+        let fname = match declared_matches_output(&io_vec, out) {
+            Some(value) => value,
+            None => continue,
+        };
         eprintln!(
             "Proc:{} File {} was not written by rule {}",
             ch_id, fname, rule_name
@@ -983,4 +951,76 @@ fn verify_rule_io(
         //return Err(eyre!("File {} was not written by rule {}",fname,rule_name));
     }
     Ok(())
+}
+
+fn declared_matches_output<'a, 'b>(
+    io_vec: &'a Vec<(String, u8)>,
+    out: &'b Node,
+) -> Option<&'b str> {
+    let fname = out.get_name();
+    for (fnode, ty) in io_vec.iter() {
+        if ty == &(EventType::Write as u8) && fnode == fname {
+            return None;
+        }
+    }
+    Some(fname)
+}
+
+fn declared_matches_input(io_vec: &Vec<(String, u8)>, fname: &str) -> bool {
+    for (fnode, ty) in io_vec.iter() {
+        if ty == &(EventType::Read as u8) || ty == &(EventType::Open as u8) && fnode == fname {
+            return true;
+        }
+    }
+    false
+}
+
+fn output_matches_declared(outs: &Vec<Node>, fnode: &String) -> bool {
+    for out in outs.iter() {
+        if out.get_type().eq(&Excluded) {
+            let exclude_pattern = out.get_name().to_string();
+            let re = Regex::new(&*exclude_pattern).unwrap();
+            if re.is_match(fnode) {
+                return true;
+            }
+        }
+        if out.get_name() == fnode {
+            return true;
+        }
+    }
+    false
+}
+
+fn link_input_to_rule(
+    rule_id: i32,
+    process_checker: &mut ProcessIOChecker,
+    fnode: &str,
+) -> Result<()> {
+    if let Ok(dirid) = process_checker.fetch_dirid(fnode) {
+        let p = Path::new(fnode);
+        if let Some(name) = p.file_name() {
+            if let Ok(from_id) =
+                process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
+            {
+                process_checker.insert_link(from_id, rule_id as _)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, fnode: &String) -> bool {
+    for inp in inps.iter().chain(outs.iter()) {
+        if *inp.get_type() == RowType::Dir
+            || *inp.get_type() == RowType::Grp
+            || *inp.get_type() == RowType::Env
+            || *inp.get_type() == RowType::DirGen
+        {
+            continue;
+        }
+        if inp.get_name() == fnode {
+            return true;
+        }
+    }
+    false
 }
