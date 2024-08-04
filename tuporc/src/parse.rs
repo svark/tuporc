@@ -1343,7 +1343,7 @@ pub(crate) fn find_upsert_node(
                 if !modify {
                     add_ids_statements
                         .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
-                    modify = true;
+                    //modify = true;
                 }
             }
             add_ids_statements.add_to_present(existing_node.get_id(), *existing_node.get_type())?;

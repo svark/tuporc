@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::yield_now;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use std::vec::Drain;
 
 use crossbeam::channel::{never, tick, Receiver, Sender};
@@ -390,7 +390,7 @@ fn insert_direntries(
         let root_hp = HashedPath::from(root.to_path_buf());
 
         let root_hash_path = root_hp.clone();
-        let (stop_sender, stop_receiver) = crossbeam::channel::bounded::<()>(1);
+        let (stop_sender, _) = crossbeam::channel::bounded::<()>(1);
         let running = Arc::new(AtomicBool::new(true));
         // Set up the ctrlc handler
         {
@@ -415,50 +415,60 @@ fn insert_direntries(
                 let mut dir_children_receiver = Some(dir_children_receiver);
                 let n1 = never();
                 let n2 = never();
-                let mut recver_cnt = 2;
+                let mut receiver_cnt = 2;
                 let running = running.clone();
-                while recver_cnt != 0 {
-                    let mut ticked = false;
+                let send_children = move |dir_children: DirChildren, id| {
+                    let pp = dir_children.parent_path().clone();
+                    send_children(dir_children, id, &dire_sender).unwrap_or_else(|_| {
+                        panic!("unable to send directory:{:?}", pp)
+                    });
+                };
+                while receiver_cnt != 0 {
                     select! {
                         recv(ticker) -> _ =>  {
                             if !running.load(Ordering::SeqCst) {
                                 log::debug!("recvd user interrupt");
                                 break;
                             }
-                            ticked = true;
+                            continue;
                         }
                         recv(dirid_receiver.as_ref().unwrap_or(&n1)) -> dirid_res =>
                             match dirid_res {
                                 Ok((p, id)) => {
-                                    dir_id_by_path.insert(p, id);
+                                    if ign.matched(p.get_path().as_path(), true).is_ignore() {
+                                       log::debug!("ignoring path:{}", p.get_path().as_path().display());
+                                    }
+                                    else if let Some(dir_children) = dir_children_set.take(&p) {
+                                        send_children(dir_children, id)
+                                    } else {
+                                        dir_id_by_path.insert(p, id);
+                                    }
                                 }
                                 _=> {
                                     dirid_receiver = None;
-                                    recver_cnt -= 1;
+                                    receiver_cnt -= 1;
                                     log::debug!("dirid_receiver closed");
                                 }
                             },
                         recv(dir_children_receiver.as_ref().unwrap_or(&n2)) -> res =>
                             match res {
-                                Ok(p) => {
-                                   dir_children_set.insert(p);
+                                Ok(dir_children) => {
+                                   if let Some((_,id)) = dir_id_by_path.remove_entry(dir_children.parent_path()) {
+                                       send_children(dir_children, id)
+                                    }else {
+                                        dir_children_set.insert(dir_children);
+                                    }
                                 }
                                 _ => {
                                     dir_children_receiver = None;
-                                    recver_cnt -= 1;
+                                    receiver_cnt -= 1;
                                     log::debug!("dir_children_receiver closed");
                                 }
                             }
                     }
                     yield_now();
 
-                    linkup_dbids(
-                        &ign,
-                        &dire_sender,
-                        &mut dir_children_set,
-                        &mut dir_id_by_path,
-                    )?;
-                    if recver_cnt == 1 && dir_children_set.len() == 0 && dir_id_by_path.len() == 0 {
+                    if receiver_cnt == 1 && dir_children_set.len() == 0 && dir_id_by_path.len() == 0 {
                         // this is a way to break the chain of dependencies among receivers
                         break;
                     }
@@ -625,29 +635,5 @@ fn add_modify_nodes(
     tx.prune_modified_list()?;
     tx.commit()?;
 
-    Ok(())
-}
-
-/// This tracks the paths which have a valid parent id, removes them from dir_children, and dir_id_by_path and sends them over to write/query to/from db
-fn linkup_dbids(
-    ign: &Gitignore,
-    dire_sender: &Sender<ProtoNode>,
-    dir_children_set: &mut HashSet<DirChildren>,
-    dir_id_by_path: &mut HashMap<HashedPath, i64>,
-) -> eyre::Result<()> {
-    // retains only dir ids for which its children were not found in `dir_children`.
-    dir_id_by_path.
-        retain(|p, id|
-            // warning this is a predicate with side effects.. :-(.
-            if ign.matched(p.as_ref(), true).is_ignore() {
-                false
-            } else if let Some(dir_children) = dir_children_set.take(p) {
-                send_children(dir_children, *id, dire_sender).unwrap_or_else(|_| panic!("unable to send directory:{:?}", p));
-                false
-            } else {
-                true
-            }
-        );
-    //  log::debug!("dir_id_by_path:{}, dir_child_set:{}", dir_id_by_path.len(), dir_children_set.len());
     Ok(())
 }
