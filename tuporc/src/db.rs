@@ -1217,7 +1217,7 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node> {
         assert_eq!(self.tok, FindNode, "wrong token for fetch node");
-        log::info!("query for node:{:?}, {:?}", node_name, dir);
+        //log::info!("query for node:{:?}, {:?}", node_name, dir);
 
         let node = self.stmt.query_row((dir, node_name), make_node)?;
         Ok(node)

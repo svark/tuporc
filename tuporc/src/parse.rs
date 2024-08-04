@@ -1282,11 +1282,11 @@ pub(crate) fn find_upsert_node(
     add_ids_statements: &mut AddIdsStatements,
     node: &Node,
 ) -> Result<Node> {
-    debug!(
+    /*debug!(
         "find_upsert_node:{} in dir:{}",
         node.get_name(),
         node.get_dir()
-    );
+    );*/
     let db_node = node_statements
         .fetch_node(node.get_name(), node.get_dir())
         .and_then(|existing_node| {
@@ -1345,14 +1345,6 @@ pub(crate) fn find_upsert_node(
                         .add_to_modify(existing_node.get_id(), *existing_node.get_type())?;
                     modify = true;
                 }
-            }
-            if !modify {
-                debug!(
-                    "no change for:{}, {} -> {}",
-                    existing_node.get_name(),
-                    existing_node.get_mtime(),
-                    node.get_mtime()
-                );
             }
             add_ids_statements.add_to_present(existing_node.get_id(), *existing_node.get_type())?;
             Ok(existing_node)

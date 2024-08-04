@@ -958,17 +958,17 @@ fn declared_matches_output<'a, 'b>(
     out: &'b Node,
 ) -> Option<&'b str> {
     let fname = out.get_name();
-    for (fnode, ty) in io_vec.iter() {
-        if ty == &(EventType::Write as u8) && fnode == fname {
+    for (node, ty) in io_vec.iter() {
+        if ty == &(EventType::Write as u8) && node == fname {
             return None;
         }
     }
     Some(fname)
 }
 
-fn declared_matches_input(io_vec: &Vec<(String, u8)>, fname: &str) -> bool {
-    for (fnode, ty) in io_vec.iter() {
-        if ty == &(EventType::Read as u8) || ty == &(EventType::Open as u8) && fnode == fname {
+fn declared_matches_input(io_vec: &Vec<(String, u8)>, name: &str) -> bool {
+    for (node, ty) in io_vec.iter() {
+        if ty == &(EventType::Read as u8) || ty == &(EventType::Open as u8) && node == name {
             return true;
         }
     }
