@@ -35,8 +35,9 @@ pub(crate) fn scan_root(
     root: &Path,
     conn: &mut Connection,
     term_progress: &TermProgress,
+    running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
-    insert_direntries(root, conn, term_progress)
+    insert_direntries(root, conn, term_progress, running)
 }
 
 /// return dir id either from db stored value in readstate or from newly created list in created dirs
@@ -153,11 +154,11 @@ impl DirChildren {
         }
     }
 
+    fn get(self) -> (HashedPath, Vec<DirE>) {
+        (self.parent_path, self.children)
+    }
     fn parent_path(&self) -> &HashedPath {
         &self.parent_path
-    }
-    fn get_children(&mut self) -> Drain<'_, DirE> {
-        self.children.drain(..)
     }
 }
 
@@ -297,17 +298,6 @@ fn walkdir_from(
     Ok(())
 }
 
-fn send_children(
-    mut dir_children: DirChildren,
-    pid: i64,
-    ds: &Sender<ProtoNode>,
-) -> eyre::Result<()> {
-    for p in dir_children.get_children() {
-        ds.send(ProtoNode::new(p, pid))?;
-    }
-    Ok(())
-}
-
 fn create_node_at_path<S: AsRef<str>>(
     dirid: i64,
     file_name: S,
@@ -358,6 +348,7 @@ fn insert_direntries(
     root: &Path,
     conn: &mut Connection,
     term_progress: &TermProgress,
+    running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
     log::debug!("Inserting/updatng directory entries to db");
     db::create_temptables(conn)?;
@@ -391,16 +382,17 @@ fn insert_direntries(
 
         let root_hash_path = root_hp.clone();
         let (stop_sender, _) = crossbeam::channel::bounded::<()>(1);
-        let running = Arc::new(AtomicBool::new(true));
         // Set up the ctrlc handler
         {
             let stop_sender = stop_sender.clone();
             let running = running.clone();
-            ctrlc::set_handler(move || {
+            ctrlc::try_set_handler(move || {
                 let _ = stop_sender.send(());
                 running.store(false, Ordering::SeqCst);
             })
-            .expect("Error setting Ctrl-C handler");
+                .unwrap_or_else(
+                    |e| log::warn!("unable to set ctrlc handler:{}", e)
+                );
         }
 
         dir_id_by_path.insert(root_hp, 1);
@@ -417,11 +409,13 @@ fn insert_direntries(
                 let n2 = never();
                 let mut receiver_cnt = 2;
                 let running = running.clone();
-                let send_children = move |dir_children: DirChildren, id| {
-                    let pp = dir_children.parent_path().clone();
-                    send_children(dir_children, id, &dire_sender).unwrap_or_else(|_| {
-                        panic!("unable to send directory:{:?}", pp)
-                    });
+                let send_children = move |mut dir_children: DirChildren, id| {
+                    let (pp, children) = dir_children.get();
+                    for p in children {
+                        dire_sender.send(ProtoNode::new(p, id)).unwrap_or_else(|_| {
+                            panic!("unable to send directory entry under:{:?}", pp)
+                        })
+                    }
                 };
                 while receiver_cnt != 0 {
                     select! {
@@ -562,8 +556,9 @@ fn insert_direntries(
 pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
     let mut binding = GitignoreBuilder::new(root);
     let builder = binding
-        .add_line(None, ".tup/")?
-        .add_line(None, ".git/")?
+        .add_line(None, ".tup")?
+        .add_line(None, ".tup/*")?
+        .add_line(None, ".git/*")?
         .add_line(None, ".tupignore")?;
     if root.join(".tupignore").is_file() {
         let _ = builder

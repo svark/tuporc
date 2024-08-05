@@ -20,6 +20,7 @@ use std::env::{current_dir, set_current_dir};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clap::Parser;
@@ -221,7 +222,8 @@ fn main() -> Result<()> {
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
-                match scan::scan_root(root.as_path(), &mut conn, &term_progress) {
+                let running = std::sync::Arc::new(AtomicBool::new(true));
+                match scan::scan_root(root.as_path(), &mut conn, &term_progress, running) {
                     Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
@@ -348,6 +350,7 @@ fn scan_and_get_tupfiles(
     skip_scan: bool,
 ) -> Result<Vec<Node>> {
     let mut conn = connection;
+    let running = std::sync::Arc::new(AtomicBool::new(true));
     if !is_initialized(&conn, "Node") {
         return Err(eyre!(
             "Tup database is not initialized, use `tup init' to initialize",
@@ -366,7 +369,7 @@ fn scan_and_get_tupfiles(
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
+        scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
     }
     term_progress.clear();
     gather_modified_tupfiles(&mut conn)
@@ -395,9 +398,10 @@ fn scan_and_get_all_tupfiles(
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
 
+    let running = std::sync::Arc::new(AtomicBool::new(true));
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), &mut conn, &term_progress)?;
+        scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
     }
     term_progress.clear();
     crate::parse::gather_tupfiles(&mut conn)

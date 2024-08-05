@@ -2,6 +2,8 @@ use std::env::{current_dir, current_exe};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -104,6 +106,14 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
             match event.kind {
                 EventKind::Modify(_) | EventKind::Create(event::CreateKind::File) => {
                     for path in event.paths.into_iter() {
+                        if path
+                            .file_name()
+                            .iter()
+                            .find(|&&item| item.eq(std::ffi::OsStr::new("db-wal")))
+                            .is_some()
+                        {
+                            continue;
+                        }
                         if !is_ignorable(&path, &ign, false) {
                             log::debug!("File added to list: {:?}", path);
                             path_sender
@@ -152,11 +162,12 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
         watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
         let term_progress = TermProgress::new("Full scan underway..");
         let pb_main = term_progress.get_main();
+        let running = Arc::new(AtomicBool::new(true));
         let _ = s
             .spawn(move |_| -> Result<()> {
                 let mut current_id: i64 = 0;
                 let mut build_in_progess = false;
-                scan_root(root.as_path(), &mut conn, &term_progress)?;
+                scan_root(root.as_path(), &mut conn, &term_progress, running.clone())?;
                 let mut fetch_monitored_files = conn.fetch_monitored_prepare()?;
                 pb_main.println("Full scan complete");
                 let pb = term_progress.pb_main.clone();
@@ -176,8 +187,8 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                     } else {
                         let latest_ids = fetch_latest_ids(&conn, "MESSAGES", "id", current_id)
                             .unwrap_or(Vec::new());
-                        for latest_id in latest_ids {
-                            current_id = latest_id;
+                        for latest_id in latest_ids.iter() {
+                            current_id = *latest_id;
                             let latest_message = fetch_message(&conn, current_id)?;
                             if latest_message.eq("QUIT") {
                                 end_watch = true;
@@ -185,7 +196,9 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
                                 break;
                             }
                         }
-                        conn.execute("DELETE from messages", ()).unwrap();
+                        if !latest_ids.is_empty() {
+                            conn.execute("DELETE from messages", ()).unwrap();
+                        }
                     }
                     if end_watch {
                         watcher.unwatch(root.as_path())?;
