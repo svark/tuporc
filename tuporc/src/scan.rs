@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
-use std::vec::Drain;
 
 use crossbeam::channel::{never, tick, Receiver, Sender};
 use crossbeam::select;
@@ -409,7 +408,7 @@ fn insert_direntries(
                 let n2 = never();
                 let mut receiver_cnt = 2;
                 let running = running.clone();
-                let send_children = move |mut dir_children: DirChildren, id| {
+                let send_children = move |dir_children: DirChildren, id| {
                     let (pp, children) = dir_children.get();
                     for p in children {
                         dire_sender.send(ProtoNode::new(p, id)).unwrap_or_else(|_| {
