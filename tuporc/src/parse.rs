@@ -18,13 +18,13 @@ use tupparser::buffers::{
 };
 use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath};
+use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 
 use crate::db::RowType::{Dir, Env, Excluded, GenF, Glob, Rule};
 use crate::db::{
-    create_path_buf_temptable, AnyError, CallBackError, ForEachClauses, LibSqlExec, MiscStatements,
-    SqlStatement,
+    create_path_buf_temptable, db_path_str, AnyError, CallBackError, ForEachClauses, LibSqlExec,
+    MiscStatements, SqlStatement,
 };
 use crate::scan::{get_dir_id, MAX_THRS_DIRS};
 use crate::{LibSqlPrepare, Node, RowType, TermProgress};
@@ -220,32 +220,36 @@ impl PathSearcher for DbPathSearcher {
         path_buffers: &impl PathBuffers,
     ) -> Vec<PathDescriptor> {
         let conn = self.conn.lock();
-        let mut fetch_node_prepare = conn.deref().fetch_node_prepare().unwrap();
-        let mut fetch_node_id_prepare = conn.deref().fetch_nodeid_prepare().unwrap();
-        let mut dirid = 1;
+        let mut node_by_id_stmt = conn.deref().fetch_node_by_id_prepare().unwrap();
+        let tup_path = tup_cwd.get_path();
+        log::debug!(
+            "tup path is : {} in which (or its parents) we look for TupRules.tup or Tuprules.lua",
+            tup_path.as_path().display()
+        );
+        let dirid = conn
+            .deref()
+            .fetch_dirid_prepare()
+            .and_then(|mut stmt| stmt.fetch_dirid(tup_path.as_path()))
+            .unwrap_or(1i64);
+        log::debug!("dirid: {}", dirid);
         let mut tup_rules = Vec::new();
-        let tuprs = ["Tuprules.tup", "Tuprules.lua"];
+        let tuprs = ["tuprules.tup", "tuprules.lua"];
         let mut add_rules = |dirid| {
             for tupr in tuprs {
-                if let Ok(node) = fetch_node_prepare.fetch_node(tupr, dirid) {
+                if let Ok(i) = conn
+                    .first_containing(tupr, dirid)
+                    .inspect_err(|e| eprintln!("Error while looking for tuprules: {}", e))
+                {
+                    log::debug!("tup rules node id : {}", i);
+                    let node = node_by_id_stmt.fetch_node_by_id(i).unwrap();
                     path_buffers
-                        .add_path_from(tup_cwd, Path::new(node.get_name()))
-                        .map(|r| tup_rules.push(r));
+                        .add_abs(node.get_name())
+                        .map(|pd| tup_rules.push(pd));
                     break;
                 }
             }
         };
         add_rules(dirid);
-        for dir in tup_cwd.components() {
-            if let Ok(nodeid) =
-                fetch_node_id_prepare.fetch_node_id(dir.get().get_name().as_ref(), dirid)
-            {
-                dirid = nodeid;
-                add_rules(nodeid)
-            } else {
-                break;
-            }
-        }
         tup_rules
     }
 
@@ -405,13 +409,30 @@ fn add_link_glob_dir_to_rules(
     Ok(())
 }
 
-pub fn gather_modified_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
+pub fn gather_modified_tupfiles(conn: &mut Connection, targets: &Vec<String>) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
     create_path_buf_temptable(conn)?;
 
+    let mut target_dirs_and_names = Vec::new();
+    if !targets.is_empty() {
+        //let find_dir_id = conn.fetch_dirid_prepare()?;
+        for target in targets.iter() {
+            if target.trim().is_empty() {
+                continue;
+            }
+            let dir_path = NormalPath::new_from_cow_str(Cow::from(target.as_str()));
+            target_dirs_and_names.push(db_path_str(dir_path.as_path()));
+        }
+    }
     conn.for_changed_or_created_tup_node_with_path(|n: Node| {
         // name stores full path here
-        tupfiles.push(n);
+        if target_dirs_and_names.is_empty()
+            || target_dirs_and_names
+                .iter()
+                .any(|x| n.get_name().eq(x.as_str()))
+        {
+            tupfiles.push(n);
+        }
         Ok(())
     })?;
     Ok(tupfiles)

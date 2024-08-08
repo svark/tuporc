@@ -357,6 +357,7 @@ pub(crate) enum StatementType {
     RemoveMonitoredByPath,
     RemoveMonitoredById,
     FetchMessage,
+    FindFirstParentContaining,
 }
 
 pub struct SqlStatement<'conn> {
@@ -380,6 +381,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_dirid_with_par_prepare(&self) -> Result<SqlStatement>;
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_node_insensitive_prepare(&self) -> Result<SqlStatement>;
     fn do_nothing_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
@@ -524,6 +526,7 @@ pub(crate) trait LibSqlExec {
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
+    fn first_containing(&self, name: &str, dir: i64) -> Result<i64>;
     fn enrich_modified_list_with_outside_mods(&self) -> Result<()>;
     fn enrich_modified_list(&self) -> Result<()>;
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
@@ -768,6 +771,16 @@ impl LibSqlPrepare for Connection {
             tok: FindNode,
         })
     }
+    fn fetch_node_insensitive_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare(
+            "SELECT id, dir, type, name, mtime_ns FROM Node where dir=? and LOWER(name)=?",
+        )?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FindNode,
+        })
+    }
+
     fn do_nothing_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("SELECT 1")?;
         Ok(SqlStatement {
@@ -784,7 +797,7 @@ impl LibSqlPrepare for Connection {
     }
 
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement> {
-        let stmt = self.prepare("SELECT id,dir, mtime_ns, name, type FROM Node where id=?")?;
+        let stmt = self.prepare("SELECT id, dir, type, name, mtime_ns  FROM Node where id=?")?;
         Ok(SqlStatement {
             stmt,
             tok: FindNodeById,
@@ -815,11 +828,12 @@ impl LibSqlPrepare for Connection {
 
     fn fetch_glob_nodes_prepare(&self, is_recursive: bool) -> Result<SqlStatement> {
         let ftype = RowType::File as u8;
-        //let gen_ftype = RowType::GenF as u8;
+        let dirtype = RowType::Dir as u8;
+        let gen_ftype = RowType::GenF as u8;
         let op = if is_recursive { "glob" } else { "=" };
         let statement = format!(
             "SELECT name from Node where name glob ? and dir in (SELECT id FROM DirPathBuf where name {op} ?) \
-         and type = {ftype}"
+         and (type = {ftype} or type = {dirtype} or type = {gen_ftype})"
         );
         let stmt = self.prepare(statement.as_str())?;
         Ok(SqlStatement {
@@ -1225,7 +1239,7 @@ impl LibSqlExec for SqlStatement<'_> {
 
     fn fetch_node_by_id(&mut self, i: i64) -> Result<Node> {
         assert_eq!(self.tok, FindNodeById, "wrong token for fetch node by id");
-        let node = self.stmt.query_row([i], make_node)?;
+        let node = self.stmt.query_row((i,), make_node)?;
         Ok(node)
     }
 
@@ -1532,7 +1546,7 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 }
 
-fn db_path_str<P: AsRef<Path>>(p: P) -> String {
+pub(crate) fn db_path_str<P: AsRef<Path>>(p: P) -> String {
     let input_path_str = p.as_ref().to_string_lossy();
     static UNIX_SEP: char = '/';
     static UNIX_SEP_STR: &str = "/";
@@ -1866,6 +1880,37 @@ impl MiscStatements for Connection {
         stmt.execute([])?;
 
         Ok(())
+    }
+
+    fn first_containing(&self, name: &str, dir: i64) -> Result<i64> {
+        let mut stmt = self.prepare(&*format!(
+            "\
+           WITH RECURSIVE DirectoryHierarchy AS (
+    -- Anchor member: start with the current directory entry
+    SELECT id, name, dir
+    FROM Node
+    WHERE id = {dir}
+
+    UNION ALL
+
+    -- Recursive member: continue with parent directories until dir = 0
+    SELECT n.id, n.name, n.dir
+    FROM Node n
+    INNER JOIN DirectoryHierarchy dh ON n.id = dh.dir
+    WHERE dh.dir != 0
+)
+SELECT f.id
+FROM DirectoryHierarchy dh
+JOIN Node f ON f.dir = dh.id AND LOWER(f.name) = '{name}'
+LIMIT 1;
+     "
+        ))?;
+
+        let nodeid = stmt.query_row([], |r| {
+            let nodeid: i64 = r.get(0)?;
+            Ok(nodeid)
+        })?;
+        Ok(nodeid)
     }
 
     // mark rules as Modified if any of its outputs are in the deletelist

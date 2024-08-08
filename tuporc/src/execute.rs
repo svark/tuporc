@@ -360,7 +360,7 @@ fn get_target_ids(conn: &Connection, root: &Path, targets: &Vec<String>) -> Resu
         dirc.as_path()
     )))?;
     let mut fd = conn.fetch_dirid_prepare()?;
-    let mut fnode_stmt = conn.fetch_node_by_id_prepare()?;
+    let mut fnode_stmt = conn.fetch_nodeid_prepare()?;
     let mut dirids = Vec::new();
     for t in targets {
         let path = dir.join(t.as_str());

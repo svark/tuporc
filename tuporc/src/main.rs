@@ -173,7 +173,13 @@ enum Action {
     Scan,
 
     #[clap(about = "Parses the tup files in a tup database")]
-    Parse,
+    Parse {
+        /// Space separated targets to parse
+        target: Vec<String>,
+        /// keep_going when set, allows builds to continue on error
+        #[arg(short = 'k', default_value = "false")]
+        keep_going: bool,
+    },
 
     #[clap(about = "Build specified targets")]
     Upd {
@@ -228,18 +234,25 @@ fn main() -> Result<()> {
                     Ok(()) => println!("Scan was successful"),
                 };
             }
-            Action::Parse => {
-                change_root()?;
-                let root = current_dir()?;
+            Action::Parse {
+                mut target,
+                keep_going,
+            } => {
+                let root = change_root_update_targets(&mut target)?;
                 let mut connection = Connection::open(".tup/db")
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = monitor::is_monitor_running();
-                let tupfiles =
-                    scan_and_get_tupfiles(&root, &mut connection, &term_progress, skip_scan)
-                        .inspect_err(|e| {
-                            term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                        })?;
+                let tupfiles = scan_and_get_tupfiles(
+                    &root,
+                    &mut connection,
+                    &term_progress,
+                    skip_scan,
+                    &target,
+                )
+                .inspect_err(|e| {
+                    term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                })?;
 
                 let term_progress =
                     term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
@@ -248,17 +261,24 @@ fn main() -> Result<()> {
                         term_progress.abandon_main(format!("Parsing failed with error: {}", e));
                     })?
             }
-            Action::Upd { target, keep_going } => {
-                change_root()?;
+            Action::Upd {
+                mut target,
+                keep_going,
+            } => {
+                let root = change_root_update_targets(&mut target)?;
                 println!("Updating db {}", target.join(" "));
-                let root = current_dir()?;
                 let term_progress = TermProgress::new("Building ");
                 {
                     let mut conn = Connection::open(".tup/db")
                         .expect("Connection to tup database in .tup/db could not be established");
                     let skip_scan = monitor::is_monitor_running();
-                    let tupfiles =
-                        scan_and_get_tupfiles(&root, &mut conn, &term_progress, skip_scan)?;
+                    let tupfiles = scan_and_get_tupfiles(
+                        &root,
+                        &mut conn,
+                        &term_progress,
+                        skip_scan,
+                        &target,
+                    )?;
                     let term_progress = term_progress
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
                     parse_tupfiles_in_db(conn, tupfiles, root.as_path(), &term_progress)?;
@@ -327,6 +347,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
+    let curdir = current_dir()?;
+    change_root()?;
+    let root = current_dir()?;
+    if !root.eq(&curdir) {
+        println!("Changed root to {}", root.display());
+        // adjust the target paths to be relative to the new root
+        let mut new_targets = Vec::new();
+        for t in target.iter() {
+            let mut p = PathBuf::new();
+            p.push(root.as_path());
+            p.push(t);
+            new_targets.push(p.to_string_lossy().to_string());
+        }
+        *target = new_targets;
+    }
+    Ok(root)
+}
+
 fn change_root() -> Result<()> {
     let tupfile_ini = locate_file(current_dir()?, "Tupfile.ini", "root");
     if tupfile_ini.is_none() {
@@ -348,6 +387,7 @@ fn scan_and_get_tupfiles(
     connection: &mut Connection,
     term_progress: &TermProgress,
     skip_scan: bool,
+    targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
     let mut conn = connection;
     let running = std::sync::Arc::new(AtomicBool::new(true));
@@ -372,7 +412,7 @@ fn scan_and_get_tupfiles(
         scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
     }
     term_progress.clear();
-    gather_modified_tupfiles(&mut conn)
+    gather_modified_tupfiles(&mut conn, targets)
 }
 
 fn scan_and_get_all_tupfiles(
