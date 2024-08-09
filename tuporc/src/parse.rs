@@ -781,6 +781,7 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
     path: P,
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
+    recurse: bool,
 ) -> Result<i64> {
     let (parent, name) = split_path(path.as_ref())?;
     if parent.as_os_str().is_empty() || parent.as_os_str().eq(".") {
@@ -802,11 +803,13 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
             }
             Ok(node.get_id())
         } else {
-            Ok(0)
+            Ok(-1)
         }
+    } else if recurse {
+        insert_path(parent, node_statements, add_ids_statements, recurse)?;
+        insert_path(path, node_statements, add_ids_statements, false)
     } else {
-        insert_path(parent, node_statements, add_ids_statements)?;
-        insert_path(path, node_statements, add_ids_statements)
+        Ok(-1)
     };
 }
 
