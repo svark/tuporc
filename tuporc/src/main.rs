@@ -236,7 +236,7 @@ fn main() -> Result<()> {
             }
             Action::Parse {
                 mut target,
-                keep_going,
+                keep_going: _keep_going,
             } => {
                 let root = change_root_update_targets(&mut target)?;
                 let mut connection = Connection::open(".tup/db")

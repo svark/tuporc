@@ -185,6 +185,11 @@ impl Ord for Node {
         self.id.cmp(&other.get_id())
     }
 }
+impl Default for Node {
+    fn default() -> Self {
+        Node::new(-1, -1, -1, String::default(), RowType::File)
+    }
+}
 impl Node {
     pub fn new(id: i64, dirid: i64, mtime: i64, name: String, rtype: RowType) -> Node {
         Node {
@@ -193,6 +198,18 @@ impl Node {
             mtime,
             name,
             rtype,
+            display_str: "".to_string(),
+            flags: "".to_string(),
+            srcid: -1,
+        }
+    }
+    pub fn unknown_with_dir(dirid: i64, name: &str, rtype: &RowType) -> Node {
+        Node {
+            id: -1,
+            dirid,
+            mtime: -1,
+            name: name.to_string(),
+            rtype: *rtype,
             display_str: "".to_string(),
             flags: "".to_string(),
             srcid: -1,
@@ -279,6 +296,18 @@ impl Node {
             srcid: -1,
         }
     }
+    pub fn new_env(id: i64, dirid: i64, name: String) -> Node {
+        Node {
+            id,
+            dirid,
+            mtime: 0,
+            name,
+            rtype: RowType::Env,
+            display_str: "".to_string(),
+            flags: "".to_string(),
+            srcid: -1,
+        }
+    }
     pub fn get_id(&self) -> i64 {
         self.id
     }
@@ -314,6 +343,9 @@ pub(crate) enum StatementType {
     AddToTempIds,
     InsertDir,
     InsertDirAux,
+    RemoveDirAux,
+    InsertTupAux,
+    RemoveTupAux,
     InsertFile,
     InsertEnv,
     InsertLink,
@@ -331,12 +363,13 @@ pub(crate) enum StatementType {
     FindNodeByPath,
     FindParentRule,
     //FindIo,
-    UpdMTime,
+    UpdateMTime,
+    UpdateType,
     UpdDisplayStr,
-    UpdFlags,
-    UpdSrcId,
-    UpdDirId,
-    UpdEnv,
+    UpdateFlags,
+    UpdateSrcId,
+    UpdateDirId,
+    UpdateEnv,
     DeleteId,
     DeleteNormalRuleLinks,
     ImmediateDeps,
@@ -374,6 +407,9 @@ pub(crate) trait LibSqlPrepare {
     fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
+    fn remove_dir_aux_prepare(&self) -> Result<SqlStatement>;
+    fn insert_tup_aux_prepare(&self) -> Result<SqlStatement>;
+    fn remove_tup_aux_prepare(&self) -> Result<SqlStatement>;
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_node_prepare(&self) -> Result<SqlStatement>;
     fn insert_env_prepare(&self) -> Result<SqlStatement>;
@@ -392,6 +428,7 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
+    fn update_type_prepare(&self) -> Result<SqlStatement>;
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn update_display_str_prepare(&self) -> Result<SqlStatement>;
     fn update_flags_prepare(&self) -> Result<SqlStatement>;
@@ -433,6 +470,10 @@ pub(crate) trait LibSqlExec {
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
     /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxiliary table
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
+    fn insert_tup_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
+    fn remove_tup_aux_exec(&mut self, id: i64) -> Result<()>;
+    fn remove_dir_aux_exec(&mut self, id: i64) -> Result<()>;
+
     /// Insert a link between two nodes into the database. This is used to keep track of the dependencies between nodes and build a graph
     fn insert_link(
         &mut self,
@@ -481,20 +522,21 @@ pub(crate) trait LibSqlExec {
     fn fetch_node_dir_path(&mut self, dirid: i64) -> Result<PathBuf>;
     /// update modified time for a node with the given id
     fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()>;
+    fn update_type_exec(&mut self, id: i64, row_type: RowType) -> Result<()>;
     fn update_display_str(&mut self, id: i64, display_str: &str) -> Result<()>;
     fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()>;
     fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()>;
     /// update directory id for a node with the given id
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     /// update env value  for an env node with the given id
-    fn update_env_exec(&mut self, id: i64, val: String) -> Result<()>;
+    fn update_env_exec(&mut self, id: i64, val: &String) -> Result<()>;
     /// delete a node with the given id
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     /// deleted nodes that are outputs of a rule with the given rule id
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
     fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()>;
     /// fetch all tupfiles that depend on the given rule (usually via a group output)
-    fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
+    fn fetch_dependent_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
     /// delete normal links between nodes that are inputs and outputs of a rule with the given rule id
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()>;
     /// find node by path
@@ -526,7 +568,7 @@ pub(crate) trait LibSqlExec {
 }
 pub(crate) trait MiscStatements {
     fn populate_delete_list(&self) -> Result<()>;
-    fn first_containing(&self, name: &str, dir: i64) -> Result<i64>;
+    fn first_containing(&self, name: &str, dir: i64) -> Result<(String, i64)>;
     fn enrich_modified_list_with_outside_mods(&self) -> Result<()>;
     fn enrich_modified_list(&self) -> Result<()>;
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
@@ -712,6 +754,28 @@ impl LibSqlPrepare for Connection {
             tok: InsertDirAux,
         })
     }
+    fn remove_dir_aux_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE from DirPathBuf where id=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RemoveDirAux,
+        })
+    }
+
+    fn insert_tup_aux_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("INSERT into TupPathBuf (id, name) Values (?,?);")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: InsertTupAux,
+        })
+    }
+    fn remove_tup_aux_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("DELETE from TupPathBuf where id=?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: RemoveTupAux,
+        })
+    }
 
     fn insert_link_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT OR IGNORE into NormalLink (from_id, to_id, issticky, to_type) Values (?,?,?, ?)")?;
@@ -877,7 +941,14 @@ impl LibSqlPrepare for Connection {
         let stmt = self.prepare("UPDATE Node Set mtime_ns = ? where id = ?")?;
         Ok(SqlStatement {
             stmt,
-            tok: UpdMTime,
+            tok: UpdateMTime,
+        })
+    }
+    fn update_type_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("UPDATE Node Set type = ? where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdateType,
         })
     }
 
@@ -885,7 +956,7 @@ impl LibSqlPrepare for Connection {
         let stmt = self.prepare("UPDATE Node Set dir = ? where id = ?")?;
         Ok(SqlStatement {
             stmt,
-            tok: UpdDirId,
+            tok: UpdateDirId,
         })
     }
     fn update_display_str_prepare(&self) -> Result<SqlStatement> {
@@ -899,19 +970,22 @@ impl LibSqlPrepare for Connection {
         let stmt = self.prepare("UPDATE Node Set flags = ? where id = ?")?;
         Ok(SqlStatement {
             stmt,
-            tok: UpdFlags,
+            tok: UpdateFlags,
         })
     }
     fn update_srcid_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("UPDATE Node Set srcid = ? where id = ?")?;
         Ok(SqlStatement {
             stmt,
-            tok: UpdSrcId,
+            tok: UpdateSrcId,
         })
     }
     fn update_env_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("Update Node Set display_str = ? where id=?")?;
-        Ok(SqlStatement { stmt, tok: UpdEnv })
+        Ok(SqlStatement {
+            stmt,
+            tok: UpdateEnv,
+        })
     }
 
     fn delete_prepare(&self) -> Result<SqlStatement> {
@@ -954,12 +1028,12 @@ impl LibSqlPrepare for Connection {
         let stmt = self.prepare(&*format!(
             "SELECT id, dir, name from TUPPATHBUF where dir in
              (SELECT dir from Node where type = {rtype} and id in
-            (WITH RECURSIVE dependants(x) AS (
+            (WITH RECURSIVE dependents(x) AS (
    SELECT ?
    UNION
-  SELECT to_id FROM NormalLink JOIN dependants ON NormalLink.from_id=x
+  SELECT to_id FROM NormalLink JOIN dependents ON NormalLink.from_id=x
 )
-SELECT DISTINCT x FROM dependants));",
+SELECT DISTINCT x FROM dependents));",
         ))?;
 
         // placeholder ? here is the rule_id which initiates the search (base case in recursive query)
@@ -1162,6 +1236,33 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
+    fn insert_tup_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()> {
+        assert_eq!(
+            self.tok, InsertTupAux,
+            "wrong token for Insert Tup Into TupPathBuf"
+        );
+        let path_str = db_path_str(path);
+        self.stmt.insert((id, path_str))?;
+        Ok(())
+    }
+
+    fn remove_tup_aux_exec(&mut self, p0: i64) -> Result<()> {
+        assert_eq!(
+            self.tok, RemoveTupAux,
+            "wrong token for remove Tupfile from TupPathBuf"
+        );
+        self.stmt.execute([p0])?;
+        Ok(())
+    }
+    fn remove_dir_aux_exec(&mut self, id: i64) -> Result<()> {
+        assert_eq!(
+            self.tok, RemoveDirAux,
+            "wrong token for remove dir from DirPathBuf"
+        );
+        self.stmt.execute([id])?;
+        Ok(())
+    }
+
     fn insert_link(
         &mut self,
         from_id: i64,
@@ -1327,8 +1428,13 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn update_mtime_exec(&mut self, id: i64, mtime_ns: i64) -> Result<()> {
-        assert_eq!(self.tok, UpdMTime, "wrong token for update mtime");
+        assert_eq!(self.tok, UpdateMTime, "wrong token for update mtime");
         self.stmt.execute([mtime_ns, id])?;
+        Ok(())
+    }
+    fn update_type_exec(&mut self, id: i64, row_type: RowType) -> Result<()> {
+        assert_eq!(self.tok, UpdateType, "wrong token for update mtime");
+        self.stmt.execute((row_type as u8, id))?;
         Ok(())
     }
 
@@ -1342,22 +1448,25 @@ impl LibSqlExec for SqlStatement<'_> {
     }
 
     fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()> {
-        assert_eq!(self.tok, UpdFlags, "wrong token for update flags");
+        assert_eq!(self.tok, UpdateFlags, "wrong token for update flags");
         self.stmt.execute((flags, id))?;
         Ok(())
     }
     fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()> {
-        assert_eq!(self.tok, UpdSrcId, "wrong token for srcid update");
+        assert_eq!(self.tok, UpdateSrcId, "wrong token for srcid update");
         self.stmt.execute([srcid, id])?;
         Ok(())
     }
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()> {
-        assert_eq!(self.tok, UpdDirId, "wrong token for dirid update");
+        assert_eq!(self.tok, UpdateDirId, "wrong token for dirid update");
         self.stmt.execute([dirid, id])?;
         Ok(())
     }
-    fn update_env_exec(&mut self, id: i64, val: String) -> Result<()> {
-        assert_eq!(self.tok, UpdEnv, "wrong token for env display_str update");
+    fn update_env_exec(&mut self, id: i64, val: &String) -> Result<()> {
+        assert_eq!(
+            self.tok, UpdateEnv,
+            "wrong token for env display_str update"
+        );
         self.stmt.execute((id, val.as_str()))?;
         Ok(())
     }
@@ -1384,7 +1493,7 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute([rule_id, rule_id])?;
         Ok(())
     }
-    fn fetch_dependant_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
+    fn fetch_dependent_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>> {
         assert_eq!(self.tok, RuleDepRules, "wrong token for delete rule links");
         let mut rows = self.stmt.query([rule_id])?;
         let mut vs = Vec::new();
@@ -1882,7 +1991,7 @@ impl MiscStatements for Connection {
         Ok(())
     }
 
-    fn first_containing(&self, name: &str, dir: i64) -> Result<i64> {
+    fn first_containing(&self, name: &str, dir: i64) -> Result<(String, i64)> {
         let mut stmt = self.prepare(&*format!(
             "\
            WITH RECURSIVE DirectoryHierarchy AS (
@@ -1899,18 +2008,19 @@ impl MiscStatements for Connection {
     INNER JOIN DirectoryHierarchy dh ON n.id = dh.dir
     WHERE dh.dir != 0
 )
-SELECT f.id
+SELECT f.name, f.dir
 FROM DirectoryHierarchy dh
 JOIN Node f ON f.dir = dh.id AND LOWER(f.name) = '{name}'
 LIMIT 1;
      "
         ))?;
 
-        let nodeid = stmt.query_row([], |r| {
-            let nodeid: i64 = r.get(0)?;
-            Ok(nodeid)
+        let node = stmt.query_row([], |r| {
+            let nodeid: String = r.get(0)?;
+            let dirid = r.get(1)?;
+            Ok((nodeid, dirid))
         })?;
-        Ok(nodeid)
+        Ok(node)
     }
 
     // mark rules as Modified if any of its outputs are in the deletelist

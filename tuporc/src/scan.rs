@@ -22,7 +22,7 @@ use rusqlite::Connection;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::db::RowType::{Dir, TupF};
-use crate::db::{LibSqlExec, LibSqlPrepare, MiscStatements, Node, RowType, SqlStatement};
+use crate::db::{LibSqlExec, LibSqlPrepare, MiscStatements, Node, RowType};
 use crate::parse::find_upsert_node;
 use crate::{db, parse, TermProgress};
 
@@ -37,11 +37,6 @@ pub(crate) fn scan_root(
     running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
     insert_direntries(root, conn, term_progress, running)
-}
-
-/// return dir id either from db stored value in readstate or from newly created list in created dirs
-pub(crate) fn get_dir_id<P: AsRef<Path>>(dirs_in_db: &mut SqlStatement, path: P) -> Option<i64> {
-    dirs_in_db.fetch_dirid(path).ok() // check if in db already
 }
 
 /// mtime stored wrt 1-1-1970
@@ -349,7 +344,7 @@ fn insert_direntries(
     term_progress: &TermProgress,
     running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
-    log::debug!("Inserting/updatng directory entries to db");
+    log::debug!("Inserting/updating directory entries to db");
     db::create_temptables(conn)?;
     {
         let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
@@ -560,9 +555,10 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
         .add_line(None, ".git/*")?
         .add_line(None, ".tupignore")?;
     if root.join(".tupignore").is_file() {
-        let _ = builder
-            .add(".tupignore")
-            .ok_or(eyre!("unable to add .tupignore"))?;
+        let err = builder.add(".tupignore");
+        if let Some(err) = err {
+            return Err(eyre!("unable to add .tupignore: {:?}", err));
+        }
     }
     let ign = builder
         .build()

@@ -1,7 +1,6 @@
 use std::env::{current_dir, current_exe};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use notify::{
 };
 use rusqlite::Connection;
 
-use crate::db::{LibSqlExec, LibSqlPrepare, SqlStatement};
+use crate::db::{LibSqlExec, LibSqlPrepare};
 use crate::parse::{AddIdsStatements, NodeStatements};
 use crate::scan::scan_root;
 use crate::TermProgress;
@@ -170,8 +169,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
     let term_progress = TermProgress::new("Full scan underway..");
     scan_root(root.as_path(), &mut conn, &term_progress, running.clone())?;
     crossbeam::scope(|s| -> Result<()> {
-        let mut generation_id =
-            fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
+        let generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
         let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
             .expect("Failed to create watcher");
         watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
