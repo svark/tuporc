@@ -320,6 +320,7 @@ impl DbPathSearcher {
             }
 
             let base_path = glob_path.get_base_desc();
+            let tup_cwd = glob_path.get_tup_dir_desc();
             debug!("base path is : {:?}", ph.get_path(base_path));
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
             let fetch_row = |s: &String| -> Option<MatchingPath> {
@@ -335,12 +336,13 @@ impl DbPathSearcher {
                             full_path_pd_clone,
                             glob_path.get_glob_desc(),
                             grps,
+                            tup_cwd.clone(),
                         ))
                     } else {
                         None
                     }
                 } else if !has_glob_pattern {
-                    Some(MatchingPath::new(full_path_pd))
+                    Some(MatchingPath::new(full_path_pd, tup_cwd.clone()))
                 } else {
                     None
                 }
@@ -368,7 +370,7 @@ impl DbPathSearcher {
                 Err(e) => return Err(e),
             }
         }
-        return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows));
+        Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows))
     }
 }
 
