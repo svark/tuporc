@@ -353,7 +353,7 @@ impl DbPathSearcher {
             let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
 
             let mps = glob_query.fetch_glob_nodes(
-                base_path.get_path().as_path(),
+                base_path.get_path_ref().as_path(),
                 glob_pattern.as_path(),
                 recursive,
                 fetch_row,
@@ -406,7 +406,7 @@ impl PathSearcher for DbPathSearcher {
     ) -> Vec<PathDescriptor> {
         let conn = self.conn.lock();
         let mut node_path_stmt = conn.deref().fetch_node_path_prepare().unwrap();
-        let tup_path = tup_cwd.get_path();
+        let tup_path = tup_cwd.get_path_ref();
         debug!(
             "tup path is : {} in which (or its parents) we look for TupRules.tup or Tuprules.lua",
             tup_path.as_path().display()

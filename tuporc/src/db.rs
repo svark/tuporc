@@ -1740,6 +1740,10 @@ impl<'a> tupparser::decode::GroupInputs for ConnWrapper<'a> {
             Some(path)
         })
     }
+
+    fn get_bin_paths(&self, _bin_name: &str, _rule_id: i64, _rule_dir: i64) -> Option<String> {
+        None
+    }
 }
 
 impl ForEachClauses for Connection {
