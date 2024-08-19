@@ -43,7 +43,7 @@ pub struct CrossRefMaps {
     // rule id and the corresponding db id, parent id
     dbo: BiMap<TupPathDescriptor, (i64, i64)>,
     // tup id and the corresponding db id, parent id
-    ebo: BiMap<String, i64>, // env id and the corresponding db id
+    ebo: BiMap<EnvDescriptor, i64>, // env id and the corresponding db id
     // task id and the corresponding db id, parent id
     tbo: BiMap<TaskDescriptor, (i64, i64)>,
 }
@@ -221,7 +221,7 @@ impl NodeToInsert {
                 crossref.add_path_xref(p.clone(), id, parid);
             }
             NodeToInsert::Env(e) => {
-                crossref.add_env_xref(e.to_string(), id);
+                crossref.add_env_xref(e.clone(), id);
             }
             NodeToInsert::Task(t) => {
                 crossref.add_task_xref(t.clone(), id, parid);
@@ -253,7 +253,7 @@ impl CrossRefMaps {
         self.dbo.get_by_left(r).copied()
     }
 
-    pub fn get_env_db_id(&self, e: &String) -> Option<i64> {
+    pub fn get_env_db_id(&self, e: &EnvDescriptor) -> Option<i64> {
         self.ebo.get_by_left(e).copied()
     }
 
@@ -269,7 +269,7 @@ impl CrossRefMaps {
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64, par_db_id: i64) {
         self.gbo.insert(g, (db_id, par_db_id));
     }
-    pub fn add_env_xref(&mut self, e: String, db_id: i64) {
+    pub fn add_env_xref(&mut self, e: EnvDescriptor, db_id: i64) {
         self.ebo.insert(e, db_id);
     }
 
@@ -782,13 +782,12 @@ fn add_rule_links(
                 let mut processed = HashSet::new();
                 let mut processed_group = HashSet::new();
                 let env_desc = rl.get_env_list();
-                let environs = rbuf.get_envs(env_desc);
                 log::info!(
                     "adding links from envs  {:?} to rule: {:?}",
                     env_desc,
                     rule_node_id
                 );
-                for env_var in environs.keys() {
+                for env_var in env_desc.iter() {
                     let env_id = crossref.get_env_db_id(&env_var).ok_or_else(|| {
                         eyre!("database env id not found for env var: {}", env_var)
                     })?;
@@ -799,6 +798,14 @@ fn add_rule_links(
                     rl.get_sources(),
                     rule_node_id
                 );
+                let tup_files_read = rl.get_tup_files_read();
+                for tupfile in tup_files_read {
+                    let (tup_id, _) = crossref
+                        .get_tup_db_id(tupfile)
+                        .or_else(|| crossref.get_path_db_id(tupfile))
+                        .ok_or_else(|| eyre!("tupfile not found in db:{:?}", tupfile))?;
+                    inp_linker.insert_link(tup_id, rule_node_id, false, Rule)?;
+                }
                 for i in rl.get_sources() {
                     match i {
                         InputResolvedType::UnResolvedGroupEntry(g) => {
@@ -1207,7 +1214,7 @@ fn insert_nodes(
 
     let mut nodeids = BTreeSet::new();
     //let mut paths_to_update: HashMap<i64, i64> = HashMap::new();  we dont update nodes until rules are executed.
-    let mut envs_to_insert = HashMap::new();
+    let mut envs_to_insert = HashSet::new();
 
     let get_dir = |tup_desc: &TupPathDescriptor, crossref: &CrossRefMaps| -> Result<i64> {
         let (_, dir) = crossref.get_tup_db_id(tup_desc).ok_or_else(|| {
@@ -1230,8 +1237,7 @@ fn insert_nodes(
                 }
                 collector.add_task_node(rd)?;
                 let env_desc = resolvedtask.get_env_list();
-                let environs = read_write_buf.get_envs(env_desc);
-                envs_to_insert.extend(environs.into_iter());
+                envs_to_insert.extend(env_desc.iter());
             }
         }
 
@@ -1293,16 +1299,18 @@ fn insert_nodes(
         let mut fetch_env_stmt = tx.fetch_env_id_prepare()?;
         let mut update_env_stmt = tx.update_env_prepare()?;
         let mut add_to_modify_env_stmt = tx.add_to_modify_prepare()?;
-        for (env_var, env_val) in envs_to_insert {
-            if let Ok((env_id, env_val_db)) = fetch_env_stmt.fetch_env_id(env_var.as_str()) {
-                if !env_val_db.eq(&env_val) {
-                    update_env_stmt.update_env_exec(env_id, &env_val)?;
+        for env_var in envs_to_insert.iter() {
+            let env_val = env_var.get().get_val_str();
+            let key = env_var.get().get_key_str();
+            if let Ok((env_id, env_val_db)) = fetch_env_stmt.fetch_env_id(key) {
+                if !env_val_db.as_str().eq(env_val) {
+                    update_env_stmt.update_env_exec(env_id, env_val)?;
                     add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
                 }
                 crossref.add_env_xref(env_var.clone(), env_id);
                 nodeids.insert((env_id, Env));
             } else {
-                let env_id = inst_env_stmt.insert_env_exec(env_var.as_str(), env_val.as_str())?;
+                let env_id = inst_env_stmt.insert_env_exec(key, env_val)?;
                 crossref.add_env_xref(env_var.clone(), env_id);
                 nodeids.insert((env_id, Env));
                 add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;

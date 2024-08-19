@@ -529,7 +529,7 @@ pub(crate) trait LibSqlExec {
     /// update directory id for a node with the given id
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     /// update env value  for an env node with the given id
-    fn update_env_exec(&mut self, id: i64, val: &String) -> Result<()>;
+    fn update_env_exec(&mut self, id: i64, val: &str) -> Result<()>;
     /// delete a node with the given id
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     /// deleted nodes that are outputs of a rule with the given rule id
@@ -1462,12 +1462,12 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute([dirid, id])?;
         Ok(())
     }
-    fn update_env_exec(&mut self, id: i64, val: &String) -> Result<()> {
+    fn update_env_exec(&mut self, id: i64, val: &str) -> Result<()> {
         assert_eq!(
             self.tok, UpdateEnv,
             "wrong token for env display_str update"
         );
-        self.stmt.execute((id, val.as_str()))?;
+        self.stmt.execute((id, val))?;
         Ok(())
     }
 
