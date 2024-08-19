@@ -798,10 +798,10 @@ fn add_rule_links(
                     rl.get_sources(),
                     rule_node_id
                 );
-                let tup_files_read = rl.get_tup_files_read();
+                let tup_files_read = rl.get_tupfiles_read();
                 for tupfile in tup_files_read {
                     let (tup_id, _) = crossref
-                        .get_tup_db_id(tupfile)
+                        .get_tup_db_id(&tupfile)
                         .or_else(|| crossref.get_path_db_id(tupfile))
                         .ok_or_else(|| eyre!("tupfile not found in db:{:?}", tupfile))?;
                     inp_linker.insert_link(tup_id, rule_node_id, false, Rule)?;
