@@ -1,17 +1,17 @@
-use std::borrow::Cow;
-// use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
-use std::ops::Deref;
-use std::path::Path;
-use std::sync::Arc;
-
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, OptionExt, Report, Result};
 use log::debug;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::borrow::Cow;
+// use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs;
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tupparser::buffers::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
@@ -649,7 +649,7 @@ pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
     create_path_buf_temptable(conn)?;
 
     conn.for_tup_node_with_path(|n: Node| {
-        // name stores full path here
+        // the field `name` in n stores full path here
         tupfiles.push(n);
         Ok(())
     })?;
@@ -667,33 +667,48 @@ fn gather_rules_from_tupfiles(
     term_progress.set_message("Parsing Tupfiles");
     crossbeam::thread::scope(|s| -> Result<ResolvedRules> {
         let wg = WaitGroup::new();
-        for ithread in 0..MAX_THRS_DIRS {
+        let mut poisoned = Arc::new(AtomicBool::new(false));
+        let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
+        let mut handles = Vec::new();
+        for ithread in 0..num_threads {
             let mut p = p.clone();
             let sender = sender.clone();
             let wg = wg.clone();
             let pb = term_progress.make_progress_bar("_");
-            s.spawn(move |_| -> Result<()> {
+            let poisoned = poisoned.clone();
+            let join_handle = s.spawn(move |_| -> Result<()> {
                 for tupfile in tupfiles
                     .iter()
                     .filter(|x| !x.get_name().ends_with(".lua"))
                     .cloned()
                     .skip(ithread as usize)
-                    .step_by(MAX_THRS_DIRS as usize)
+                    .step_by(num_threads as usize)
                 {
-                    pb.set_message(format!("Parsing :{}", tupfile.get_name()));
-                    p.parse_tupfile(tupfile.get_name(), sender.clone())
-                        .map_err(|error| {
-                            let rwbuf = p.read_write_buffers();
-                            let display_str = rwbuf.display_str(&error);
-                            let tupfile_name = tupfile.get_name();
-                            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-                            eyre!(
-                                "Error while parsing tupfile: {}:\n {} due to \n{}",
-                                tupfile.get_name(),
-                                display_str,
-                                error
-                            )
-                        })?;
+                    if poisoned.load(Ordering::SeqCst) {
+                        drop(wg);
+                        return Ok(());
+                    }
+                    let tupfile_name = tupfile.get_name();
+                    pb.set_message(format!("Parsing :{tupfile_name}"));
+                    let res =
+                        p.parse_tupfile(tupfile.get_name(), sender.clone())
+                            .map_err(|error| {
+                                let rwbuf = p.read_write_buffers();
+                                let display_str = rwbuf.display_str(&error);
+                                term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
+                                poisoned.store(true, Ordering::SeqCst);
+                                // drop(wg);
+                                eyre!(
+                                    "Error while parsing tupfile: {}:\n {} due to \n{}",
+                                    tupfile.get_name(),
+                                    display_str,
+                                    error
+                                )
+                            });
+                    if let Err(e) = res {
+                        drop(wg);
+                        return Err(e);
+                    }
                     pb.set_message(format!("Done parsing {}", tupfile.get_name()));
                     term_progress.tick(&pb);
                 }
@@ -701,6 +716,7 @@ fn gather_rules_from_tupfiles(
                 pb.set_message("Done");
                 Ok(())
             });
+            handles.push(join_handle);
         }
         drop(sender);
 
@@ -722,7 +738,7 @@ fn gather_rules_from_tupfiles(
             pb.set_message(format!("Done parsing {}", path));
         }
         pb.set_message("Resolving statements..");
-        new_resolved_rules.extend(p.receive_resolved_statements(receiver).map_err(|error| {
+        let resolved_rules = p.receive_resolved_statements(receiver).map_err(|error| {
             let read_write_buffers = p.read_write_buffers();
             let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor());
             let tup_node = tup_node.to_string();
@@ -733,13 +749,17 @@ fn gather_rules_from_tupfiles(
                 tup_node.as_str(),
                 display_str,
             )
-        })?);
+        })?;
+        new_resolved_rules.extend(resolved_rules);
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
         wg.wait();
+        for join_handle in handles {
+            join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
+        }
         Ok(new_resolved_rules)
     })
-    .expect("Threading error while fetching resolved rules from tupfiles")
+    .expect("Thread error while fetching resolved rules from tupfiles")
 }
 
 /// checks that in  parsed tup files, no two rules produce the same output
@@ -1044,7 +1064,7 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
         let hashed_path = crate::scan::HashedPath::from(pbuf);
         let metadata = fs::metadata(path).ok();
         if let Some(node_at_path) =
-            crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata)?
+            crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata)
         {
             let in_node = node_at_path.get_prepared_node();
             let node = find_upsert_node(node_statements, add_ids_statements, in_node)?;

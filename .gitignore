@@ -9,10 +9,10 @@ Tupfile.ini
 Cargo.lock
 tuporc/.vscode/*
 .vs/VSWorkspaceState.json
-.fleet/settings.json
 out.txt
 ptrace*.txt
 /History.md
 /AUTHORS
 /.vscode/
 /.vs/
+/.fleet/

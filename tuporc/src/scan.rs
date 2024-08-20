@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -27,7 +28,7 @@ use crate::parse::find_upsert_node;
 use crate::{db, parse, TermProgress};
 
 const MAX_THRS_NODES: u8 = 4;
-pub const MAX_THRS_DIRS: u8 = 10;
+pub const MAX_THRS_DIRS: usize = 10;
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
 pub(crate) fn scan_root(
@@ -253,7 +254,7 @@ fn walkdir_from(
     dir_sender: &Sender<DirSender>,
     dir_entry_sender: Sender<DirChildren>,
     ign: &Gitignore,
-) -> eyre::Result<()> {
+) {
     let mut children = Vec::new();
     WalkDir::new(root.as_ref())
         .follow_links(true)
@@ -261,35 +262,21 @@ fn walkdir_from(
         .max_depth(1)
         .into_iter()
         .filter_map(Result::ok)
-        .try_for_each(|e| {
+        .for_each(|e| {
             let dir_entry = DirE::from(e);
             if dir_entry.is_dir() {
                 let pp = dir_entry.get_hashed_path();
                 if !ign.matched(pp.get_path().as_path(), true).is_ignore() {
                     let pdir = DirSender::new(pp, dir_sender.clone());
-                    dir_sender.send(pdir)?;
+                    dir_sender.send(pdir).unwrap(); // unwrap is safe here as we are not expecting the receiver to be closed within scope
                 }
             }
             children.push(dir_entry);
-            eyre::Ok(())
-        })
-        .inspect_err(|e| {
-            log::error!(
-                "Walkdir failed on folder:{} due to: {}",
-                root.get_path().as_path().display(),
-                e
-            );
-        })?;
+        });
+
     dir_entry_sender
         .send(DirChildren::new(root.clone(), children))
-        .inspect_err(|e| {
-            log::error!(
-                "Failed to send children of root:{} due to {}",
-                root.get_path().as_path().display(),
-                e
-            );
-        })?;
-    Ok(())
+        .unwrap();
 }
 
 fn create_node_at_path<S: AsRef<str>>(
@@ -309,7 +296,7 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     file_name: S,
     p: HashedPath,
     metadata: Option<Metadata>,
-) -> eyre::Result<Option<NodeAtPath>> {
+) -> Option<NodeAtPath> {
     let metadata = match metadata {
         Some(metadata) => metadata,
         None => {
@@ -317,7 +304,7 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
                 "cannot read metadata for directory entry: {:?}",
                 file_name.as_ref()
             );
-            return Ok(None);
+            return None;
         }
     };
     let mtime = time_since_unix_epoch(&metadata)
@@ -333,9 +320,9 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     } else if metadata.is_dir() {
         Dir
     } else {
-        return Ok(None);
+        return (None);
     };
-    Ok(Some(create_node_at_path(dirid, file_name, p, mtime, rtype)))
+    Some(create_node_at_path(dirid, file_name, p, mtime, rtype))
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
@@ -361,190 +348,193 @@ fn insert_direntries(
     let pb = term_progress.pb_main.clone();
     // Begin processessing
     crossbeam::scope(|s| -> eyre::Result<()> {
-        let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
-        let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
-        // Map of children of  directories as returned by walkdir. `DirChildren`
-        let mut dir_children_set = HashSet::new();
-        // map of database ids of directories
-        let mut dir_id_by_path = HashMap::new();
-        // channel for  tracking children of a directory `DirChildren`.
-        let (dir_child_sender, dir_children_receiver) =
-            crossbeam::channel::unbounded::<DirChildren>();
-        // channel for tracking db ids of directories. This is an essential pre-step for inserting files into db.
-        let (dirid_sender, dirid_receiver) = crossbeam::channel::unbounded::<(HashedPath, i64)>();
-        let root_hp = HashedPath::from(root.to_path_buf());
-
-        let root_hash_path = root_hp.clone();
-        let (stop_sender, _) = crossbeam::channel::bounded::<()>(1);
-        // Set up the ctrlc handler
+        let mut handle = Vec::new();
+        let wg = WaitGroup::new();
         {
-            let stop_sender = stop_sender.clone();
-            let running = running.clone();
-            ctrlc::try_set_handler(move || {
-                let _ = stop_sender.send(());
-                running.store(false, Ordering::SeqCst);
-            })
-                .unwrap_or_else(
-                    |e| log::warn!("unable to set ctrlc handler:{}", e)
-                );
-        }
+            let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
+            let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
+            // Map of children of  directories as returned by walkdir. `DirChildren`
+            let mut dir_children_set = HashSet::new();
+            // map of database ids of directories
+            let mut dir_id_by_path = HashMap::new();
+            // channel for  tracking children of a directory `DirChildren`.
+            let (dir_child_sender, dir_children_receiver) =
+                crossbeam::channel::unbounded::<DirChildren>();
+            // channel for tracking db ids of directories. This is an essential pre-step for inserting files into db.
+            let (dirid_sender, dirid_receiver) = crossbeam::channel::unbounded::<(HashedPath, i64)>();
+            let root_hp = HashedPath::from(root.to_path_buf());
 
-        dir_id_by_path.insert(root_hp, 1);
-        let ign = build_ignore(root)?;
-
-        //println!("root:{:?}", root.to_path_buf());
-        {
-            let ign = ign.clone();
-            s.spawn(move |_| -> eyre::Result<()> {
-                let ticker = tick(Duration::from_millis(100));
-                let mut dirid_receiver = Some(dirid_receiver);
-                let mut dir_children_receiver = Some(dir_children_receiver);
-                let n1 = never();
-                let n2 = never();
-                let mut receiver_cnt = 2;
+            let root_hash_path = root_hp.clone();
+            let (stop_sender, _) = crossbeam::channel::bounded::<()>(1);
+            // Set up the ctrlc handler
+            {
+                let stop_sender = stop_sender.clone();
                 let running = running.clone();
-                let send_children = move |dir_children: DirChildren, id| {
-                    let (pp, children) = dir_children.get();
-                    for p in children {
-                        dire_sender.send(ProtoNode::new(p, id)).unwrap_or_else(|_| {
-                            panic!("unable to send directory entry under:{:?}", pp)
-                        })
-                    }
-                };
-                while receiver_cnt != 0 {
-                    select! {
-                        recv(ticker) -> _ =>  {
-                            if !running.load(Ordering::SeqCst) {
-                                log::debug!("recvd user interrupt");
-                                break;
-                            }
-                            continue;
-                        }
-                        recv(dirid_receiver.as_ref().unwrap_or(&n1)) -> dirid_res =>
-                            match dirid_res {
-                                Ok((p, id)) => {
-                                    if ign.matched(p.get_path().as_path(), true).is_ignore() {
-                                       log::debug!("ignoring path:{}", p.get_path().as_path().display());
-                                    }
-                                    else if let Some(dir_children) = dir_children_set.take(&p) {
-                                        send_children(dir_children, id)
-                                    } else {
-                                        dir_id_by_path.insert(p, id);
-                                    }
-                                }
-                                _=> {
-                                    dirid_receiver = None;
-                                    receiver_cnt -= 1;
-                                    log::debug!("dirid_receiver closed");
-                                }
-                            },
-                        recv(dir_children_receiver.as_ref().unwrap_or(&n2)) -> res =>
-                            match res {
-                                Ok(dir_children) => {
-                                   if let Some((_,id)) = dir_id_by_path.remove_entry(dir_children.parent_path()) {
-                                       send_children(dir_children, id)
-                                    }else {
-                                        dir_children_set.insert(dir_children);
-                                    }
-                                }
-                                _ => {
-                                    dir_children_receiver = None;
-                                    receiver_cnt -= 1;
-                                    log::debug!("dir_children_receiver closed");
-                                }
-                            }
-                    }
-                    yield_now();
+                ctrlc::try_set_handler(move || {
+                    let _ = stop_sender.send(());
+                    running.store(false, Ordering::SeqCst);
+                })
+                    .unwrap_or_else(
+                        |e| log::warn!("unable to set ctrlc handler:{}", e)
+                    );
+            }
 
-                    if receiver_cnt == 1 && dir_children_set.len() == 0 && dir_id_by_path.len() == 0 {
-                        // this is a way to break the chain of dependencies among receivers
-                        break;
-                    }
-                }
-                Ok(())
-            });
-        }
-        {
-            // threads below convert DirEntries to Nodes ready for sql queries/inserts
-            for _ in 0..MAX_THRS_NODES {
-                let ns = nodesender.clone();
-                let dire_receiver = dire_receiver.clone();
-                s.spawn(move |_| -> eyre::Result<()> {
-                    for mut p in dire_receiver.iter() {
-                        let dirid = p.get_dir_id();
-                        let hashed_path = p.take_path();
-                        let metadata = p.take_metadata();
-                        let file_name = p.get_file_name().to_string_lossy();
-                        let node_at_path =
-                            prepare_node_at_path(dirid, file_name, hashed_path, metadata)?;
-                        if let Some(node_at_path) = node_at_path {
-                            ns.send(node_at_path)?;
+            dir_id_by_path.insert(root_hp, 1);
+            let ign = build_ignore(root)?;
+
+            //println!("root:{:?}", root.to_path_buf());
+            {
+                let ign = ign.clone();
+                s.spawn(move |_| {
+                    let ticker = tick(Duration::from_millis(100));
+                    let mut dirid_receiver = Some(dirid_receiver);
+                    let mut dir_children_receiver = Some(dir_children_receiver);
+                    let n1 = never();
+                    let n2 = never();
+                    let mut receiver_cnt = 2;
+                    let running = running.clone();
+                    let send_children = move |dir_children: DirChildren, id| {
+                        let (pp, children) = dir_children.get();
+                        for p in children {
+                            dire_sender.send(ProtoNode::new(p, id)).unwrap_or_else(|_| {
+                                panic!("unable to send directory entry under:{:?}", pp)
+                            })
+                        }
+                    };
+                    while receiver_cnt != 0 {
+                        select! {
+                            recv(ticker) -> _ =>  {
+                                if !running.load(Ordering::SeqCst) {
+                                    log::debug!("recvd user interrupt");
+                                    break;
+                                }
+                                continue;
+                            }
+                            recv(dirid_receiver.as_ref().unwrap_or(&n1)) -> dirid_res =>
+                                match dirid_res {
+                                    Ok((p, id)) => {
+                                        if ign.matched(p.get_path().as_path(), true).is_ignore() {
+                                           log::debug!("ignoring path:{}", p.get_path().as_path().display());
+                                        }
+                                        else if let Some(dir_children) = dir_children_set.take(&p) {
+                                            send_children(dir_children, id)
+                                        } else {
+                                            dir_id_by_path.insert(p, id);
+                                        }
+                                    }
+                                    _=> {
+                                        dirid_receiver = None;
+                                        receiver_cnt -= 1;
+                                        log::debug!("dirid_receiver closed");
+                                    }
+                                },
+                            recv(dir_children_receiver.as_ref().unwrap_or(&n2)) -> res =>
+                                match res {
+                                    Ok(dir_children) => {
+                                       if let Some((_,id)) = dir_id_by_path.remove_entry(dir_children.parent_path()) {
+                                           send_children(dir_children, id)
+                                        }else {
+                                            dir_children_set.insert(dir_children);
+                                        }
+                                    }
+                                    _ => {
+                                        dir_children_receiver = None;
+                                        receiver_cnt -= 1;
+                                        log::debug!("dir_children_receiver closed");
+                                    }
+                                }
+                        }
+                        yield_now();
+
+                        if receiver_cnt == 1 && dir_children_set.len() == 0 && dir_id_by_path.len() == 0 {
+                            // this is a way to break the chain of dependencies among receivers
+                            break;
                         }
                     }
-                    drop(ns);
-                    Ok(())
                 });
             }
-            drop(nodesender);
-        }
-        {
-            // hidden in a corner is this thread below that works to upsert nodes into sqlite db
-            // Nodes are expected to have parent dir ids at this stage.
-            // Once a dir is upserted this also sends database ids of dirs so that children of inserted dirs can also be inserted
-            let pb = pb.clone();
-            s.spawn(move |_| -> eyre::Result<()> {
-                let res = add_modify_nodes(conn, nodereceiver, dirid_sender, &pb);
-                log::debug!("finished adding nodes");
-                if res.is_err() {
-                    log::error!("Error:{:?}", res);
-                    term_progress.abandon(&pb, " Errors encountered during scanning.")
-                } else {
-                    term_progress.finish(&pb, "✔ Finished scanning");
+            {
+                // threads below convert DirEntries to Nodes ready for sql queries/inserts
+                for _ in 0..MAX_THRS_NODES {
+                    let ns = nodesender.clone();
+                    let dire_receiver = dire_receiver.clone();
+                    s.spawn(move |_| {
+                        for mut p in dire_receiver.iter() {
+                            let dirid = p.get_dir_id();
+                            let hashed_path = p.take_path();
+                            let metadata = p.take_metadata();
+                            let file_name = p.get_file_name().to_string_lossy();
+                            let node_at_path =
+                                prepare_node_at_path(dirid, file_name, hashed_path, metadata);
+                            if let Some(node_at_path) = node_at_path {
+                                ns.send(node_at_path).expect("Failed to send prepared node");
+                            }
+                        }
+                        drop(ns);
+                    });
                 }
-                res
-            });
-        }
-        let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
-        dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
-        drop(dirs_sender);
-        let wg = WaitGroup::new();
-        for _ in 0..MAX_THRS_DIRS {
-            // This loop spreads the task for walking over children among threads.
-            // walkdir is only run for immediate children. When  we encounter dirs during a walkdir operation,
-            // they are packaged in `dir_sender` queuing them until
-            // they are popped for running walkdir on them with `dirs_receiver`.
-            let dir_receiver = dirs_receiver.clone();
-            let dir_child_sender = dir_child_sender.clone();
-            let wg = wg.clone();
-            let ign = ign.clone();
-            //let running = running.clone();
-            s.spawn(move |_| -> eyre::Result<()> {
-                // walkdir over the children and send the children for insertion into db using the sender for DirChildren.
-                // This is a sort of recursive, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
-                // Eventually, each such  `DirSender` will be received by some sister thread which calls `walk_recvd_dirs` again on them
-                // to send the children of the subdirectory.
+                drop(nodesender);
+            }
+            {
+                // Thread below adds nodes to database for the nodes prepared so far.
+                // Nodes are expected to have parent dir ids at this stage.
+                // Once a dir is upserted this also sends database ids of dirs so that children of inserted dirs can also be inserted
+                let pb = pb.clone();
+                let wg = wg.clone();
+                handle.push(s.spawn(move |_| -> eyre::Result<()> {
+                    let res = add_modify_nodes(conn, nodereceiver, dirid_sender, &pb);
+                    log::debug!("finished adding nodes");
+                    if res.is_err() {
+                        log::error!("Error:{:?}", res);
+                        term_progress.abandon(&pb, " Errors encountered during scanning.");
+                    } else {
+                        term_progress.finish(&pb, "✔ Finished scanning");
+                    }
+                    drop(wg);
+                    res
+                }));
+            }
+            let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
+            dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
+            drop(dirs_sender);
+            for i in 0..MAX_THRS_DIRS {
+                // This loop spreads the task for walking over children among threads.
+                // walkdir is only run for immediate children. When  we encounter dirs during a walkdir operation,
+                // they are packaged in `dir_sender` queuing them until
+                // they are popped for running walkdir on them with `dirs_receiver`.
+                let dir_receiver = dirs_receiver.clone();
+                let dir_child_sender = dir_child_sender.clone();
+                let wg = wg.clone();
+                let ign = ign.clone();
+                //let running = running.clone();
+                s.spawn(move |_| {
+                    // walkdir over the children and send the children for insertion into db using the sender for DirChildren.
+                    // This is a sort of recursive, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
+                    // Eventually, each such  `DirSender` will be received by some sister thread which calls `walk_recvd_dirs` again on them
+                    // to send the children of the subdirectory.
 
-                for dir_sender in dir_receiver.iter() {
-                    walkdir_from(
-                        dir_sender.parent_path(),
-                        dir_sender.sender(),
-                        dir_child_sender.clone(),
-                        &ign,
-                    )?;
-                }
-                drop(dir_receiver);
-                drop(dir_child_sender);
-
-                drop(wg);
-                Ok(())
-            });
+                    for dir_sender in dir_receiver.iter() {
+                        walkdir_from(
+                            dir_sender.parent_path(),
+                            dir_sender.sender(),
+                            dir_child_sender.clone(),
+                            &ign,
+                        );
+                    }
+                    drop(dir_receiver);
+                    drop(dir_child_sender);
+                    drop(wg);
+                    log::debug!("Done with thread {}", i);
+                });
+            }
         }
         wg.wait();
+        for h in handle {
+            h.join().unwrap()?; // fail if any thread fails
+        }
         Ok(())
     })
     .expect("Failed to spawn thread for dir insertion")
-    .expect("Failed to return from scope");
-    Ok(())
 }
 
 pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
@@ -565,28 +555,6 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
     Ok(ign)
 }
 
-// walkdir over the children and send the children for insertion into db using the sender for DirChildren.
-// This is a sort of recursive function, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
-// Eventually, each such  `DirSender` will be received by some thread which calls `walk_recvd_dirs` again on them
-// to send the children of the subdirectory.
-/*fn walk_recvd_dirs(
-    dir_receiver: Receiver<DirSender>,
-    dir_child_sender: Sender<DirChildren>,
-    ign: &Gitignore,
-) -> eyre::Result<()> {
-    for dir_sender in dir_receiver.iter() {
-        walkdir_from(
-            dir_sender.parent_path(),
-            dir_sender.sender(),
-            dir_child_sender.clone(),
-            ign,
-        )?;
-    }
-    drop(dir_receiver);
-    drop(dir_child_sender);
-    Ok(())
-}*/
-
 /// For the received nodes which are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
 /// Those not in database will be inserted.
 fn add_modify_nodes(
@@ -603,7 +571,6 @@ fn add_modify_nodes(
         let now = SystemTime::now();
         for node_at_path in nodereceiver.iter() {
             let node = node_at_path.get_prepared_node();
-            //log::debug!("recvd {}, {:?}", node.get_name(), node.get_type());
             let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
             if node.get_type() == &Dir {
                 let id = inserted.get_id();
