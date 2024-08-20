@@ -166,6 +166,8 @@ pub struct Node {
     srcid: i64,
 }
 
+impl Node {}
+
 impl PartialEq<Self> for Node {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -296,14 +298,14 @@ impl Node {
             srcid: -1,
         }
     }
-    pub fn new_env(id: i64, dirid: i64, name: String) -> Node {
+    pub fn new_env(id: i64, dirid: i64, name: String, value: String) -> Node {
         Node {
             id,
             dirid,
             mtime: 0,
             name,
             rtype: RowType::Env,
-            display_str: "".to_string(),
+            display_str: value,
             flags: "".to_string(),
             srcid: -1,
         }

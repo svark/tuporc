@@ -14,3 +14,5 @@ out.txt
 ptrace*.txt
 /History.md
 /AUTHORS
+/.vscode/
+/.vs/

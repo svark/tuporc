@@ -28,11 +28,11 @@ use eyre::{eyre, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 
-use db::{Node, RowType};
-use tupparser::locate_file;
-
 use crate::db::{init_db, is_initialized, LibSqlPrepare};
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
+use db::{Node, RowType};
+use tupparser::locate_file;
+use tupparser::paths::NormalPath;
 
 mod db;
 mod execute;
@@ -211,7 +211,12 @@ fn main() -> Result<()> {
     let args = Args::parse();
     env_logger::init();
     log::info!("Sqlite version: {}\n", rusqlite::version());
-    if let Some(act) = args.command {
+    if let Some(act) = args.command.or_else(|| {
+        Some(Action::Upd {
+            target: Vec::new(),
+            keep_going: false,
+        })
+    }) {
         match act {
             Action::Init => {
                 init_db();
@@ -353,13 +358,12 @@ fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
     let root = current_dir()?;
     if !root.eq(&curdir) {
         println!("Changed root to {}", root.display());
+        let prefix = curdir.strip_prefix(&root).unwrap();
         // adjust the target paths to be relative to the new root
         let mut new_targets = Vec::new();
         for t in target.iter() {
-            let mut p = PathBuf::new();
-            p.push(root.as_path());
-            p.push(t);
-            new_targets.push(p.to_string_lossy().to_string());
+            let p = NormalPath::new_from_cow_str(prefix.to_string_lossy());
+            new_targets.push(p.join(t).to_string());
         }
         *target = new_targets;
     }
@@ -367,19 +371,16 @@ fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
 }
 
 fn change_root() -> Result<()> {
-    let tupfile_ini = locate_file(current_dir()?, "Tupfile.ini", "root");
-    if tupfile_ini.is_none() {
-        return Err(eyre!(
-            "Tupfile.ini not found in current directory or any parent directory"
-        ));
-    }
-    set_current_dir(
-        tupfile_ini
-            .unwrap()
-            .parent()
-            .expect("Tupfile.ini has no parent"),
-    )?;
-    Ok(())
+    let (_, parent) = locate_file(current_dir()?, ".tup/db", "root").ok_or(eyre!(
+        ".tup/db not found in current directory or any parent directory"
+    ))?;
+    set_current_dir(parent.as_path()).map_err(|e| {
+        eyre!(
+            "Failed to change root to {} due to {}",
+            parent.display(),
+            &e
+        )
+    })
 }
 
 fn scan_and_get_tupfiles(

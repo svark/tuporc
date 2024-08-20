@@ -213,7 +213,7 @@ impl NodeAtPath {
         NodeAtPath { node, pbuf }
     }
 
-    pub fn get_node(&self) -> &Node {
+    pub fn get_prepared_node(&self) -> &Node {
         &self.node
     }
     pub fn get_hashed_path(&self) -> &HashedPath {
@@ -551,8 +551,7 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
     let mut binding = GitignoreBuilder::new(root);
     let builder = binding
         .add_line(None, ".tup")?
-        .add_line(None, ".tup/*")?
-        .add_line(None, ".git/*")?
+        .add_line(None, ".git")?
         .add_line(None, ".tupignore")?;
     if root.join(".tupignore").is_file() {
         let err = builder.add(".tupignore");
@@ -603,7 +602,7 @@ fn add_modify_nodes(
         let mut cnt = 0;
         let now = SystemTime::now();
         for node_at_path in nodereceiver.iter() {
-            let node = node_at_path.get_node();
+            let node = node_at_path.get_prepared_node();
             //log::debug!("recvd {}, {:?}", node.get_name(), node.get_type());
             let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
             if node.get_type() == &Dir {
