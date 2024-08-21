@@ -356,7 +356,7 @@ fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
     let curdir = current_dir()?;
     change_root()?;
     let root = current_dir()?;
-    if !root.eq(&curdir) {
+    if root.ne(&curdir) {
         println!("Changed root to {}", root.display());
         let prefix = curdir.strip_prefix(&root).unwrap();
         // adjust the target paths to be relative to the new root

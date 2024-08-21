@@ -22,7 +22,7 @@ use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 
-use crate::db::RowType::{Dir, Env, Excluded, File, GenF, Glob, Rule, TupF};
+use crate::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, TupF};
 use crate::db::{
     create_path_buf_temptable, db_path_str, AnyError, CallBackError, ForEachClauses, LibSqlExec,
     MiscStatements, SqlStatement,
@@ -34,17 +34,17 @@ use crate::{LibSqlPrepare, Node, RowType, TermProgress};
 // These are two ways maps, so you can query both ways
 #[derive(Debug, Clone, Default)]
 pub struct CrossRefMaps {
-    gbo: BiMap<GroupPathDescriptor, (i64, i64)>,
+    group_id: BiMap<GroupPathDescriptor, (i64, i64)>,
     // group id and the corresponding db id,, parent id
-    pbo: BiMap<PathDescriptor, (i64, i64)>,
+    path_id: BiMap<PathDescriptor, (i64, i64)>,
     // path id and the corresponding db id, parent id (includes globs)
-    rbo: BiMap<RuleDescriptor, (i64, i64)>,
+    rule_id: BiMap<RuleDescriptor, (i64, i64)>,
     // rule id and the corresponding db id, parent id
-    dbo: BiMap<TupPathDescriptor, (i64, i64)>,
+    tup_id: BiMap<TupPathDescriptor, (i64, i64)>,
     // tup id and the corresponding db id, parent id
-    ebo: BiMap<EnvDescriptor, i64>, // env id and the corresponding db id
+    env_id: BiMap<EnvDescriptor, i64>, // env id and the corresponding db id
     // task id and the corresponding db id, parent id
-    tbo: BiMap<TaskDescriptor, (i64, i64)>,
+    task_id: BiMap<TaskDescriptor, (i64, i64)>,
 }
 
 type SrcId = RuleDescriptor;
@@ -253,54 +253,54 @@ impl NodeToInsert {
 }
 impl CrossRefMaps {
     pub fn get_group_db_id(&self, g: &GroupPathDescriptor) -> Option<(i64, i64)> {
-        self.gbo.get_by_left(g).copied()
+        self.group_id.get_by_left(g).copied()
     }
     pub fn get_path_db_id(&self, p: &PathDescriptor) -> Option<(i64, i64)> {
         if p.eq(&PathDescriptor::default()) {
             Some((1, 0))
         } else {
-            self.pbo.get_by_left(p).copied()
+            self.path_id.get_by_left(p).copied()
         }
     }
     pub fn get_rule_db_id(&self, r: &RuleDescriptor) -> Option<(i64, i64)> {
-        self.rbo.get_by_left(r).copied()
+        self.rule_id.get_by_left(r).copied()
     }
 
     pub fn get_tup_db_id(&self, r: &TupPathDescriptor) -> Option<(i64, i64)> {
-        self.dbo.get_by_left(r).copied()
+        self.tup_id.get_by_left(r).copied()
     }
 
     pub fn get_env_db_id(&self, e: &EnvDescriptor) -> Option<i64> {
-        self.ebo.get_by_left(e).copied()
+        self.env_id.get_by_left(e).copied()
     }
 
     pub fn get_glob_db_id(&self, s: &GlobPathDescriptor) -> Option<(i64, i64)> {
-        self.pbo.get_by_left(&s).copied()
+        self.path_id.get_by_left(&s).copied()
     }
 
     #[allow(dead_code)]
     pub fn get_task_id(&self, t: &TaskDescriptor) -> Option<(i64, i64)> {
-        self.tbo.get_by_left(t).copied()
+        self.task_id.get_by_left(t).copied()
     }
 
     pub fn add_group_xref(&mut self, g: GroupPathDescriptor, db_id: i64, par_db_id: i64) {
-        self.gbo.insert(g, (db_id, par_db_id));
+        self.group_id.insert(g, (db_id, par_db_id));
     }
     pub fn add_env_xref(&mut self, e: EnvDescriptor, db_id: i64) {
-        self.ebo.insert(e, db_id);
+        self.env_id.insert(e, db_id);
     }
 
     pub fn add_path_xref(&mut self, p: PathDescriptor, db_id: i64, par_db_id: i64) {
-        self.pbo.insert(p, (db_id, par_db_id));
+        self.path_id.insert(p, (db_id, par_db_id));
     }
     pub fn add_rule_xref(&mut self, r: RuleDescriptor, db_id: i64, par_db_id: i64) {
-        self.rbo.insert(r, (db_id, par_db_id));
+        self.rule_id.insert(r, (db_id, par_db_id));
     }
     pub fn add_tup_xref(&mut self, t: TupPathDescriptor, db_id: i64, par_db_id: i64) {
-        self.dbo.insert(t, (db_id, par_db_id));
+        self.tup_id.insert(t, (db_id, par_db_id));
     }
     pub fn add_task_xref(&mut self, t: TaskDescriptor, db_id: i64, par_db_id: i64) {
-        self.tbo.insert(t.into(), (db_id, par_db_id));
+        self.task_id.insert(t.into(), (db_id, par_db_id));
     }
 }
 
@@ -667,7 +667,7 @@ fn gather_rules_from_tupfiles(
     term_progress.set_message("Parsing Tupfiles");
     crossbeam::thread::scope(|s| -> Result<ResolvedRules> {
         let wg = WaitGroup::new();
-        let mut poisoned = Arc::new(AtomicBool::new(false));
+        let poisoned = Arc::new(AtomicBool::new(false));
         let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
         let mut handles = Vec::new();
         for ithread in 0..num_threads {
@@ -689,6 +689,7 @@ fn gather_rules_from_tupfiles(
                         return Ok(());
                     }
                     let tupfile_name = tupfile.get_name();
+                    log::debug!("Parsing :{}", tupfile_name);
                     pb.set_message(format!("Parsing :{tupfile_name}"));
                     let res =
                         p.parse_tupfile(tupfile.get_name(), sender.clone())
@@ -1059,6 +1060,10 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
             Ok(dir)
         })?;
 
+    if dir.is_negative() {
+        return Ok((dir, -1));
+    }
+
     let mut insert_in_dir = |name: Cow<str>, path: &Path, dir: i64| -> Result<(i64, i64)> {
         let pbuf = path.to_owned();
         let hashed_path = crate::scan::HashedPath::from(pbuf);
@@ -1079,7 +1084,8 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
             }
             Ok((node.get_id(), dir))
         } else {
-            Err(eyre!("Error while inserting path: {:?}", path))
+            log::warn!("Error while inserting path: {:?}", path);
+            Ok((-1, -1))
         }
     };
     insert_in_dir(name, path.as_ref(), dir)
@@ -1107,7 +1113,7 @@ pub struct NodeStatements<'a> {
     update_flags: SqlStatement<'a>,
     update_srcid: SqlStatement<'a>,
     find_dir_id_with_par: SqlStatement<'a>,
-    find_nodeid: SqlStatement<'a>,
+    //find_nodeid: SqlStatement<'a>,
     add_to_dirpathbuf: SqlStatement<'a>,
     update_type: SqlStatement<'a>,
     add_to_tuppathbuf: SqlStatement<'a>,
@@ -1303,7 +1309,7 @@ fn insert_nodes(
         Ok(dir)
     };
     // collect all un-added groups and add them in a single transaction.
-    let mut nodes: Vec<_> = {
+    let nodes: Vec<_> = {
         let mut collector = Collector::new(read_write_buf.clone())?;
         collector.add_groups()?;
         for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
@@ -1359,7 +1365,9 @@ fn insert_nodes(
                     &mut add_ids_statements,
                     true,
                 )?;
-                crossref.add_path_xref(parent_desc, parid, parparid);
+                if !parid.is_negative() {
+                    crossref.add_path_xref(parent_desc, parid, parparid);
+                }
             }
         }
         for node_to_insert in &nodes {
@@ -1369,8 +1377,10 @@ fn insert_nodes(
                     find_upsert_node(&mut node_statements, &mut add_ids_statements, &node)?;
                 (upsnode.get_id(), upsnode.get_dir())
             };
-            nodeids.insert((db_id, *node.get_type()));
-            node_to_insert.update_crossref(crossref, db_id, db_par_id);
+            if !db_id.is_negative() {
+                nodeids.insert((db_id, *node.get_type()));
+                node_to_insert.update_crossref(crossref, db_id, db_par_id);
+            }
         }
         let mut inst_env_stmt = tx.insert_env_prepare()?;
         let mut fetch_env_stmt = tx.fetch_env_id_prepare()?;
@@ -1380,7 +1390,7 @@ fn insert_nodes(
             let env_val = env_var.get().get_val_str();
             let key = env_var.get().get_key_str();
             if let Ok((env_id, env_val_db)) = fetch_env_stmt.fetch_env_id(key) {
-                if !env_val_db.as_str().eq(env_val) {
+                if env_val_db.as_str().ne(env_val) {
                     update_env_stmt.update_env_exec(env_id, env_val)?;
                     add_to_modify_env_stmt.add_to_modify_exec(env_id, Env)?;
                 }
@@ -1453,7 +1463,7 @@ impl NodeStatements<'_> {
         let update_flags = conn.update_flags_prepare()?;
         let update_srcid = conn.update_srcid_prepare()?;
         let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
-        let find_nodeid = conn.fetch_nodeid_prepare()?;
+        //let find_nodeid = conn.fetch_nodeid_prepare()?;
         let add_to_dirpathbuf = conn.insert_dir_aux_prepare()?;
         let update_type = conn.update_type_prepare()?;
         let add_to_tuppathbuf = conn.insert_tup_aux_prepare()?;
@@ -1468,7 +1478,7 @@ impl NodeStatements<'_> {
             update_flags,
             update_srcid,
             find_dir_id_with_par,
-            find_nodeid,
+            // find_nodeid,
             add_to_dirpathbuf,
             update_type,
             add_to_tuppathbuf,
@@ -1501,10 +1511,10 @@ impl NodeStatements<'_> {
         self.update_srcid.update_srcid_exec(nodeid, srcid)
     }
 
-    #[allow(dead_code)]
+    /* #[allow(dead_code)]
     fn fetch_node_id(&mut self, name: &str, dirid: i64) -> crate::db::Result<i64> {
         self.find_nodeid.fetch_node_id(name, dirid)
-    }
+    }*/
     fn fetch_dirid_with_par(&mut self, parent: &Path) -> crate::db::Result<(i64, i64)> {
         self.find_dir_id_with_par.fetch_dirid_with_par(parent)
     }
@@ -1586,15 +1596,22 @@ fn update_columns(
 ) -> Result<(), AnyError> {
     let mut modify = false;
     // verify that columns of this row are the same as `node`'s, if not update them
-    if existing_node.get_type().eq(&File) && node.get_type().eq(&GenF) {
-        debug!(
-            "update type for:{}, {} -> {}",
-            existing_node.get_name(),
-            existing_node.get_type(),
-            node.get_type()
-        );
-        node_statements.update_type(existing_node.get_id(), GenF)?;
-        modify = true;
+    if existing_node.get_type().ne(&node.get_type()) {
+        if is_generated(existing_node.get_type()) {
+            log::debug!(
+                "Keeping row type of generated file: {} until no rule writes to it",
+                existing_node.get_name()
+            );
+        } else {
+            debug!(
+                "update type for:{}, {} -> {}",
+                existing_node.get_name(),
+                existing_node.get_type(),
+                node.get_type()
+            );
+            node_statements.update_type(existing_node.get_id(), *node.get_type())?;
+            modify = true;
+        }
     }
     if (existing_node.get_mtime() - node.get_mtime()).abs() > 1 {
         debug!(
@@ -1641,6 +1658,10 @@ fn update_columns(
     }
     add_ids_statements.add_to_present(existing_node.get_id(), *existing_node.get_type())?;
     Ok(())
+}
+
+fn is_generated(p0: &RowType) -> bool {
+    p0 == &GenF || p0 == &DirGen
 }
 
 /// add links from targets that contribute to a group to the group id

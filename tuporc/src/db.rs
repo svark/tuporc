@@ -338,10 +338,12 @@ impl Node {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StatementType {
+    #[allow(dead_code)]
     DoNothing,
     AddToMod,
     AddToDel,
     AddToPres,
+    #[allow(dead_code)]
     AddToTempIds,
     InsertDir,
     InsertDirAux,
@@ -354,6 +356,7 @@ pub(crate) enum StatementType {
     //InsertFnTrace,
     FindDirId,
     FindDirIdWithPar,
+    #[allow(dead_code)]
     FindGroupId,
     FindNode,
     FindNodeId,
@@ -362,6 +365,7 @@ pub(crate) enum StatementType {
     FindRuleNodes,
     FindGlobNodes,
     FindNodePath,
+    #[allow(dead_code)]
     FindNodeByPath,
     FindParentRule,
     //FindIo,
@@ -370,18 +374,26 @@ pub(crate) enum StatementType {
     UpdDisplayStr,
     UpdateFlags,
     UpdateSrcId,
+    #[allow(dead_code)]
     UpdateDirId,
+    #[allow(dead_code)]
     UpdateEnv,
     DeleteId,
     DeleteNormalRuleLinks,
     ImmediateDeps,
     RuleSuccess,
+    #[allow(dead_code)]
     RuleDepRules,
     RestoreDeleted,
+    #[allow(dead_code)]
     FetchIO,
+    #[allow(dead_code)]
     FetchEnvsForRule,
+    #[allow(dead_code)]
     RemovePresents,
+    #[allow(dead_code)]
     RemoveSuccess,
+    #[allow(dead_code)]
     PruneMod,
     FetchOutputsForRule,
     FetchInputsForRule,
@@ -389,9 +401,12 @@ pub(crate) enum StatementType {
     InsertTrace,
     FetchMonitored,
     InsertMonitored,
+    #[allow(dead_code)]
     RemoveMonitoredByPath,
+    #[allow(dead_code)]
     RemoveMonitoredById,
     FetchMessage,
+    #[allow(dead_code)]
     FindFirstParentContaining,
 }
 
@@ -404,9 +419,13 @@ pub(crate) trait LibSqlPrepare {
     fn add_to_modify_prepare(&self) -> Result<SqlStatement>;
     fn add_to_delete_prepare(&self) -> Result<SqlStatement>;
     fn add_to_present_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn remove_presents_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn remove_success_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
     fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
     fn remove_dir_aux_prepare(&self) -> Result<SqlStatement>;
@@ -417,9 +436,13 @@ pub(crate) trait LibSqlPrepare {
     fn insert_env_prepare(&self) -> Result<SqlStatement>;
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_dirid_with_par_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_node_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_node_insensitive_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn do_nothing_prepare(&self) -> Result<SqlStatement>;
     fn fetch_nodeid_prepare(&self) -> Result<SqlStatement>;
     fn fetch_node_by_id_prepare(&self) -> Result<SqlStatement>;
@@ -428,32 +451,44 @@ pub(crate) trait LibSqlPrepare {
     fn fetch_glob_nodes_prepare(&self, is_recursive: bool) -> Result<SqlStatement>;
     fn fetch_node_path_prepare(&self) -> Result<SqlStatement>;
     fn fetch_parent_rule_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_type_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn update_display_str_prepare(&self) -> Result<SqlStatement>;
     fn update_flags_prepare(&self) -> Result<SqlStatement>;
     fn update_srcid_prepare(&self) -> Result<SqlStatement>;
     fn update_env_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn delete_prepare(&self) -> Result<SqlStatement>;
     fn delete_tup_rule_links_prepare(&self) -> Result<SqlStatement>;
     fn mark_outputs_deleted_prepare(&self) -> Result<SqlStatement>;
     fn mark_rule_success_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn get_rule_deps_tupfiles_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn restore_deleted_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn mark_deleted_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_io_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_envs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_outputs_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn fetch_inputs_for_rule_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_flags_for_rule_prepare(&self) -> Result<SqlStatement>;
     fn insert_trace_prepare(&self) -> Result<SqlStatement>;
     fn insert_monitored_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn remove_monitored_by_id_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn remove_monitored_gen_files_prepare(&self) -> Result<SqlStatement>;
     fn fetch_monitored_prepare(&self) -> Result<SqlStatement>;
     // fetch the next message from build system.
+    #[allow(dead_code)]
     fn fetch_message_prepare(&self) -> Result<SqlStatement>;
 }
 
@@ -464,11 +499,16 @@ pub(crate) trait LibSqlExec {
     fn add_to_delete_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
     /// Add a node to the present list. These are nodes(files rules, etc.) that still exists after the last run
     fn add_to_present_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
+    #[allow(dead_code)]
     fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
+    #[allow(dead_code)]
     fn remove_presents_exec(&mut self) -> Result<()>;
+    #[allow(dead_code)]
     fn remove_failed_exec(&mut self) -> Result<()>;
+    #[allow(dead_code)]
     fn add_failed_to_modified_exec(&mut self) -> Result<()>;
     /// Insert a directory node into the database
+    #[allow(dead_code)]
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
     /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxiliary table
     fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
@@ -495,6 +535,7 @@ pub(crate) trait LibSqlExec {
     /// fetch directory node id from its path and its parent directory id.
     fn fetch_dirid_with_par<P: AsRef<Path>>(&mut self, p: P) -> Result<(i64, i64)>;
     /// fetch group id from its name and directory
+    #[allow(dead_code)]
     fn fetch_group_id(&mut self, node_name: &str, dir: i64) -> Result<i64>;
     /// fetch a node from its name and directory
     fn fetch_node(&mut self, node_name: &str, dir: i64) -> Result<Node>;
@@ -520,6 +561,7 @@ pub(crate) trait LibSqlExec {
     /// fetch rule that produces the given node
     fn fetch_parent_rule(&mut self, id: i64) -> Result<Vec<i64>>;
     /// fetch node path from its name and directory id
+    #[allow(dead_code)]
     fn fetch_node_path(&mut self, name: &str, dirid: i64) -> Result<PathBuf>;
     fn fetch_node_dir_path(&mut self, dirid: i64) -> Result<PathBuf>;
     /// update modified time for a node with the given id
@@ -529,23 +571,28 @@ pub(crate) trait LibSqlExec {
     fn update_flags_exec(&mut self, id: i64, flags: &str) -> Result<()>;
     fn update_srcid_exec(&mut self, id: i64, srcid: i64) -> Result<()>;
     /// update directory id for a node with the given id
+    #[allow(dead_code)]
     fn update_dirid_exec(&mut self, dirid: i64, id: i64) -> Result<()>;
     /// update env value  for an env node with the given id
     fn update_env_exec(&mut self, id: i64, val: &str) -> Result<()>;
     /// delete a node with the given id
+    #[allow(dead_code)]
     fn delete_exec(&mut self, id: i64) -> Result<()>;
     /// deleted nodes that are outputs of a rule with the given rule id
     fn mark_rule_outputs_deleted(&mut self, rule_id: i64) -> Result<()>;
     fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()>;
     /// fetch all tupfiles that depend on the given rule (usually via a group output)
+    #[allow(dead_code)]
     fn fetch_dependent_tupfiles(&mut self, rule_id: i64) -> Result<Vec<Node>>;
     /// delete normal links between nodes that are inputs and outputs of a rule with the given rule id
     fn delete_normal_rule_links(&mut self, rule_id: i64) -> Result<()>;
     /// find node by path
+    #[allow(dead_code)]
     fn find_node_by_path<P: AsRef<Path>>(&mut self, dir_path: P, name: &str) -> Result<(i64, i64)>;
     /// fetch all read write operations performed by a process with given pid
     fn fetch_io(&mut self, proc_id: i32) -> Result<Vec<(String, u8)>>;
     /// fetch all envs necessary for the given rule
+    #[allow(dead_code)]
     fn fetch_envs(&mut self, rule_id: i32) -> Result<Vec<String>>;
     /// fetch all inputs of the given rule
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>>;
@@ -565,7 +612,9 @@ pub(crate) trait LibSqlExec {
     fn insert_monitored<P: AsRef<Path>>(&mut self, p: P, keyword_id: i64, event: i32)
         -> Result<()>;
     fn fetch_monitored(&mut self, generation_id: i64) -> Result<Vec<(String, bool)>>;
+    #[allow(dead_code)]
     fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, generation_id: i64) -> Result<()>;
+    #[allow(dead_code)]
     fn remove_monitored_by_generation_id(&mut self, generation_id: i64) -> Result<()>;
 }
 pub(crate) trait MiscStatements {
@@ -576,14 +625,19 @@ pub(crate) trait MiscStatements {
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
     fn prune_present_list(&self) -> Result<()>;
     fn prune_modified_list(&self) -> Result<()>;
+    #[allow(dead_code)]
     fn remove_modified_list(&self) -> Result<()>;
+    #[allow(dead_code)]
     fn write_message(&self, message: &str) -> Result<()>;
+    #[allow(dead_code)]
     fn read_message(&self, last_id: i64) -> Result<String>;
 }
 pub(crate) trait ForEachClauses {
+    #[allow(dead_code)]
     fn for_each_file_node_id<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(i64) -> Result<()>;
+    #[allow(dead_code)]
     fn for_each_node_id<P, F>(&self, p: P, f: F) -> Result<()>
     where
         P: Params,
@@ -595,6 +649,7 @@ pub(crate) trait ForEachClauses {
     fn for_tup_node_with_path<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>;
+    #[allow(dead_code)]
     fn for_each_grp_nodeid_provider<F>(
         &self,
         group_id: i64,
@@ -611,6 +666,7 @@ pub(crate) trait ForEachClauses {
     ) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>;
+    #[allow(dead_code)]
     fn for_each_grp_node_requirer<F>(
         &self,
         group_id: i64,
@@ -619,14 +675,18 @@ pub(crate) trait ForEachClauses {
     ) -> Result<()>
     where
         F: FnMut(Node) -> Result<()>;
+    #[allow(dead_code)]
     fn fetch_db_sticky_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
+    #[allow(dead_code)]
     fn fetch_db_inputs(&self, rule_id: i64) -> Result<Vec<i64>>;
+    #[allow(dead_code)]
     fn fetch_db_outputs(&self, rule_id: i64) -> Result<Vec<i64>>;
 
     fn for_tupid_and_path<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
     where
         P: Params,
         F: FnMut(Node) -> Result<()>;
+    #[allow(dead_code)]
     fn for_id<P, F>(p: P, f: F, stmt: &mut Statement) -> Result<()>
     where
         P: Params,
@@ -635,6 +695,7 @@ pub(crate) trait ForEachClauses {
     where
         P: Params,
         F: FnMut(Node) -> Result<()>;
+    #[allow(dead_code)]
     fn rule_link(rule_id: i64, stmt: &mut Statement) -> Result<Vec<i64>>;
     fn for_each_link<F>(&mut self, f: F) -> Result<()>
     where
@@ -1185,6 +1246,7 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         assert_eq!(
             self.tok, AddToTempIds,
@@ -1194,6 +1256,7 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn remove_presents_exec(&mut self) -> Result<()> {
         assert_eq!(
             self.tok, RemovePresents,
@@ -1203,12 +1266,14 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn remove_failed_exec(&mut self) -> Result<()> {
         assert_eq!(self.tok, RemoveSuccess, "wrong token for removing failed");
         self.stmt.execute([])?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn add_failed_to_modified_exec(&mut self) -> Result<()> {
         assert_eq!(
             self.tok, PruneMod,

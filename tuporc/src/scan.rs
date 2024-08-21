@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use crate::RowType::File;
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::db::RowType::{Dir, TupF};
-use crate::db::{LibSqlExec, LibSqlPrepare, MiscStatements, Node, RowType};
+use crate::db::{MiscStatements, Node, RowType};
 use crate::parse::find_upsert_node;
 use crate::{db, parse, TermProgress};
 
@@ -311,16 +311,16 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
         .ok()
         .unwrap_or(Duration::from_secs(0))
         .subsec_nanos() as i64;
-    let rtype = if metadata.is_file() {
-        if crate::is_tupfile(file_name.as_ref()) {
-            TupF
-        } else {
-            RowType::File
+    let rtype = match () {
+        _ if metadata.is_file() => {
+            if crate::is_tupfile(file_name.as_ref()) {
+                TupF
+            } else {
+                File
+            }
         }
-    } else if metadata.is_dir() {
-        Dir
-    } else {
-        return (None);
+        _ if metadata.is_dir() => Dir,
+        _ => return None,
     };
     Some(create_node_at_path(dirid, file_name, p, mtime, rtype))
 }
@@ -334,19 +334,34 @@ fn insert_direntries(
     log::debug!("Inserting/updating directory entries to db");
     db::create_temptables(conn)?;
     {
-        let n = conn.fetch_nodeid_prepare()?.fetch_node_id(".", 0).ok();
-        let n = n.ok_or_else(|| eyre!("no such node : '.'"));
-        let n = n.or_else(|_| -> eyre::Result<i64> {
-            let mut insert_dir = conn.insert_dir_prepare()?;
-            let i = insert_dir.insert_dir_exec(".", 0)?;
-            Ok(i)
-        })?;
-        eyre::ensure!(n == 1, format!("unexpected id for root dir :{} ", n));
-        conn.add_to_present_prepare()?.add_to_present_exec(n, Dir)?;
+        let mut node_statements = parse::NodeStatements::new(conn)?;
+        let mut add_ids_statements = parse::AddIdsStatements::new(conn)?;
+        let mt = std::fs::metadata(root).ok();
+        let root_node = prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt)
+            .expect("Unable to prepare root node for insertion");
+        let inserted = find_upsert_node(
+            &mut node_statements,
+            &mut add_ids_statements,
+            &root_node.get_prepared_node(),
+        )?;
+
+        let mt = std::fs::metadata(root.join("tup.config")).ok();
+        let tup_config_node = prepare_node_at_path(
+            inserted.get_id(),
+            "tup.config",
+            HashedPath::from(root.join("tup.config")),
+            mt,
+        )
+        .expect("Unable to prepare tup.config node for insertion");
+        let _ = find_upsert_node(
+            &mut node_statements,
+            &mut add_ids_statements,
+            &tup_config_node.get_prepared_node(),
+        )?;
     }
 
     let pb = term_progress.pb_main.clone();
-    // Begin processessing
+    // Begin processing the directory tree
     crossbeam::scope(|s| -> eyre::Result<()> {
         let mut handle = Vec::new();
         let wg = WaitGroup::new();
