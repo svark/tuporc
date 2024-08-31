@@ -139,7 +139,10 @@ impl NodeToInsert {
     }
     fn get_flags(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_flags(),
+            NodeToInsert::Rule(r) => read_write_buffer_objects
+                .get_rule(r)
+                .get_flags()
+                .to_string(),
             _ => Default::default(),
         }
     }
@@ -338,7 +341,7 @@ impl DbPathSearcher {
 
             let base_path = glob_path.get_base_desc();
             let tup_cwd = glob_path.get_tup_dir_desc();
-            debug!("base path is : {:?}", ph.get_path(base_path));
+            //debug!("base path is : {:?}", ph.get_path(base_path));
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
             let fetch_row = |s: &String| -> Option<MatchingPath> {
                 debug!("found:{} at {:?}", s, base_path);
@@ -571,8 +574,8 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 }
 
 /// adds links from glob patterns specified at each directory that are inputs to rules  to the tupfile directory
-/// We dont directly add links from glob patterns to rules, because already have resolved the glob patterns to paths in a previous iterations of parsing.
-/// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a  re-iteration parsing phase of Tupfile which the glob pattern links to
+/// We don't directly add links from glob patterns to rules but instead add links from glob patterns to the tupfile so that they are parsed whenever glob patterns are modified
+/// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a re-iterations parsing phase of Tupfile which the glob pattern links to
 fn add_link_glob_dir_to_rules(
     conn: &mut Connection,
     rw_buf: &ReadWriteBufferObjects,
@@ -632,10 +635,11 @@ pub fn gather_modified_tupfiles(conn: &mut Connection, targets: &Vec<String>) ->
     }
     conn.for_changed_or_created_tup_node_with_path(|n: Node| {
         // name stores full path here
+        log::debug!("tupfile to parse:{}", n.get_name());
         if target_dirs_and_names.is_empty()
             || target_dirs_and_names
                 .iter()
-                .any(|x| n.get_name().eq(x.as_str()))
+                .any(|x| n.get_name().strip_prefix(x.as_str()).is_some())
         {
             tupfiles.push(n);
         }

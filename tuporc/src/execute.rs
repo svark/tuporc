@@ -128,13 +128,7 @@ pub(crate) fn execute_targets(
             rule_id,
             node.get_dir(),
             rule_string,
-        )
-        .map_err(|e| {
-            AnyError::from(format!(
-                "Error decoding group captures for rule:{}\n Error:{}",
-                rule_string, e
-            ))
-        })?;
+        );
 
         Ok(Node::new_rule(
             node.get_id(),
