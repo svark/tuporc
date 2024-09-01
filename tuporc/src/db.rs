@@ -1454,7 +1454,7 @@ impl LibSqlExec for SqlStatement<'_> {
         if recursive {
             path_str.push('*')
         }
-        debug!("query glob:{:?}", gname.as_ref());
+        //debug!("query glob:{:?}", gname.as_ref());
         let mut rows = self
             .stmt
             .query((gname.as_ref().to_string_lossy().as_ref(), path_str))?;
