@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use log::debug;
 use pathdiff::diff_paths;
 use rusqlite::{Connection, Params, Row, Statement};
-
 use tupparser::paths::MatchingPath;
 
 use crate::db::RowType::GenF;

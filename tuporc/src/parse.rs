@@ -2,7 +2,8 @@ use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, OptionExt, Report, Result};
 use log::debug;
-use parking_lot::Mutex;
+use parking_lot::lock_api::MutexGuard;
+use parking_lot::{Mutex, RawMutex};
 use rusqlite::Connection;
 use std::borrow::Cow;
 // use std::cmp::Ordering;
@@ -12,7 +13,6 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
 use tupparser::buffers::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
     PathDescriptor, RuleDescriptor, TaskDescriptor, TupPathDescriptor,
@@ -48,6 +48,7 @@ pub struct CrossRefMaps {
 }
 
 type SrcId = RuleDescriptor;
+#[derive(Debug, Clone)]
 enum NodeToInsert {
     Rule(RuleDescriptor),
     #[allow(dead_code)]
@@ -171,6 +172,7 @@ impl NodeToInsert {
         read_write_buffer_objects: &ReadWriteBufferObjects,
         crossref: &CrossRefMaps,
     ) -> Result<Node> {
+        debug!("building node for {:?}", self);
         let parent_id = self.get_parent_id(read_write_buffer_objects);
         let (parent_id, _) = crossref.get_path_db_id(&parent_id).ok_or_eyre(eyre!(
             "parent id not found when building node {:?}",
@@ -314,6 +316,7 @@ struct DbPathSearcher {
     conn: Arc<Mutex<Connection>>,
     psx: OutputHolder,
     root: std::path::PathBuf,
+    last_search_dir: Arc<Mutex<PathDescriptor>>,
 }
 
 impl DbPathSearcher {
@@ -322,14 +325,50 @@ impl DbPathSearcher {
             conn: Arc::new(Mutex::new(conn)),
             psx: OutputHolder::new(),
             root: root.as_ref().to_path_buf(),
+            last_search_dir: Arc::new(Mutex::new(PathDescriptor::default())),
         }
     }
 
+    pub fn get_last_search_dir(&self) -> MutexGuard<'_, RawMutex, PathDescriptor> {
+        self.last_search_dir.lock()
+    }
+    pub fn set_last_search_dir(&self, pd: PathDescriptor) {
+        if let Some(mut v) = self.last_search_dir.try_lock() {
+            if *v != pd {
+                *v = pd;
+            }
+        }
+    }
     fn fetch_glob_nodes(
         &self,
         ph: &impl PathBuffers,
         glob_paths: &[GlobPath], // glob paths to search for (corresponding to search dirs that were specified before)
     ) -> std::result::Result<Vec<MatchingPath>, AnyError> {
+        let mut index_to_try_first = 0;
+        {
+            let last_search_dir = self.get_last_search_dir();
+            if let Some((i, _)) = glob_paths
+                .iter()
+                .enumerate()
+                .find(|(_, g)| g.get_base_desc().eq(last_search_dir.deref()))
+            {
+                index_to_try_first = i;
+            }
+        }
+
+        if index_to_try_first != 0 {
+            let (first, rest) = glob_paths.split_at(index_to_try_first);
+            let mut new_glob_paths = Vec::with_capacity(glob_paths.len());
+            new_glob_paths.extend_from_slice(&rest);
+            new_glob_paths.extend_from_slice(&first);
+            return self.fetch_glob_nodes(ph, &new_glob_paths);
+        }
+        let conn = self.conn.deref().lock();
+        let recursive = glob_paths[0].is_recursive_prefix();
+
+        let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
+        //debug!("base path is : {:?}", ph.get_path(base_path));
+
         for glob_path in glob_paths {
             let has_glob_pattern = glob_path.has_glob_pattern();
             if has_glob_pattern {
@@ -340,9 +379,14 @@ impl DbPathSearcher {
             }
 
             let base_path = glob_path.get_base_desc();
+            debug!("base path:{:?}", base_path);
             let tup_cwd = glob_path.get_tup_dir_desc();
             //debug!("base path is : {:?}", ph.get_path(base_path));
             let glob_pattern = ph.get_rel_path(&glob_path.get_glob_path_desc(), base_path);
+            debug!("glob pattern is : {:?}", glob_pattern);
+            if glob_pattern.to_string().contains("$(") {
+                log::error!("unexpected path to search!");
+            }
             let fetch_row = |s: &String| -> Option<MatchingPath> {
                 debug!("found:{} at {:?}", s, base_path);
                 let full_path_pd = base_path.join(s.as_str()).ok()?;
@@ -367,10 +411,6 @@ impl DbPathSearcher {
                     None
                 }
             };
-            let conn = self.conn.deref().lock();
-            let recursive = glob_path.is_recursive_prefix();
-
-            let mut glob_query = conn.fetch_glob_nodes_prepare(recursive)?;
 
             let mps = glob_query.fetch_glob_nodes(
                 base_path.get_path_ref().as_path(),
@@ -381,6 +421,7 @@ impl DbPathSearcher {
             match mps {
                 Ok(mps) => {
                     if !mps.is_empty() {
+                        self.set_last_search_dir(base_path.clone());
                         return Ok(mps);
                     }
                 }
@@ -390,6 +431,7 @@ impl DbPathSearcher {
                 Err(e) => return Err(e),
             }
         }
+        log::error!("no rows found for any glob pattern: {:?}", glob_paths);
         Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows))
     }
 }
@@ -565,7 +607,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 
     check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
 
-    add_links_to_groups(&mut conn, &resolved_rules, &crossref)?;
+    add_group_providers(&mut conn, &resolved_rules, &crossref)?;
     fetch_group_providers(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
     add_rule_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
     // add links from glob inputs to tupfiles's directory
@@ -1669,7 +1711,7 @@ fn is_generated(p0: &RowType) -> bool {
 }
 
 /// add links from targets that contribute to a group to the group id
-fn add_links_to_groups(
+fn add_group_providers(
     conn: &mut Connection,
     resolved_rules: &ResolvedRules,
     crossref: &CrossRefMaps,
