@@ -15,7 +15,6 @@ extern crate parking_lot;
 extern crate regex;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::env::{current_dir, set_current_dir};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
@@ -446,10 +445,4 @@ fn scan_and_get_all_tupfiles(
     }
     term_progress.clear();
     crate::parse::gather_tupfiles(&mut conn)
-}
-
-// WIP... delete files and rules in db that arent in the filesystem or in use
-// should restrict attention to the outputs of tupfiles that are modified/deleted.
-fn __delete_missing(_conn: &Connection, _present: &HashSet<i64>) -> Result<()> {
-    Ok(())
 }

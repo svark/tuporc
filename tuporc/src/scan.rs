@@ -25,7 +25,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::db::RowType::{Dir, TupF};
 use crate::db::{MiscStatements, Node, RowType};
 use crate::parse::find_upsert_node;
-use crate::{db, parse, TermProgress};
+use crate::{db, is_tupfile, parse, TermProgress};
 
 const MAX_THRS_NODES: u8 = 4;
 pub const MAX_THRS_DIRS: usize = 10;
@@ -41,11 +41,11 @@ pub(crate) fn scan_root(
 }
 
 /// mtime stored wrt 1-1-1970
-fn time_since_unix_epoch(meta_data: &Metadata) -> eyre::Result<Duration, IOError> {
-    let st = meta_data.modified()?;
-    Ok(st
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0)))
+fn time_since_unix_epoch(meta_data: Metadata) -> Option<Duration> {
+    meta_data
+        .modified()
+        .ok()
+        .and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok())
 }
 
 /// `DirE` is our version of Walkdir's DirEntry. Keeping only the information we are interested in
@@ -296,33 +296,13 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     file_name: S,
     p: HashedPath,
     metadata: Option<Metadata>,
+    rtype: &RowType,
 ) -> Option<NodeAtPath> {
-    let metadata = match metadata {
-        Some(metadata) => metadata,
-        None => {
-            eprintln!(
-                "cannot read metadata for directory entry: {:?}",
-                file_name.as_ref()
-            );
-            return None;
-        }
-    };
-    let mtime = time_since_unix_epoch(&metadata)
-        .ok()
+    let mtime = metadata
+        .and_then(time_since_unix_epoch)
         .unwrap_or(Duration::from_secs(0))
         .subsec_nanos() as i64;
-    let rtype = match () {
-        _ if metadata.is_file() => {
-            if crate::is_tupfile(file_name.as_ref()) {
-                TupF
-            } else {
-                File
-            }
-        }
-        _ if metadata.is_dir() => Dir,
-        _ => return None,
-    };
-    Some(create_node_at_path(dirid, file_name, p, mtime, rtype))
+    Some(create_node_at_path(dirid, file_name, p, mtime, *rtype))
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
@@ -337,8 +317,9 @@ fn insert_direntries(
         let mut node_statements = parse::NodeStatements::new(conn)?;
         let mut add_ids_statements = parse::AddIdsStatements::new(conn)?;
         let mt = std::fs::metadata(root).ok();
-        let root_node = prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt)
-            .expect("Unable to prepare root node for insertion");
+        let root_node =
+            prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt, &Dir)
+                .expect("Unable to prepare root node for insertion");
         let inserted = find_upsert_node(
             &mut node_statements,
             &mut add_ids_statements,
@@ -351,6 +332,7 @@ fn insert_direntries(
             "tup.config",
             HashedPath::from(root.join("tup.config")),
             mt,
+            &RowType::File,
         )
         .expect("Unable to prepare tup.config node for insertion");
         let _ = find_upsert_node(
@@ -479,8 +461,13 @@ fn insert_direntries(
                             let hashed_path = p.take_path();
                             let metadata = p.take_metadata();
                             let file_name = p.get_file_name().to_string_lossy();
+                            let rtype = if metadata.as_ref().map_or(false, |m| m.is_dir()) {
+                                Dir
+                            } else {
+                                if is_tupfile(file_name.as_ref()) { TupF } else { File }
+                            };
                             let node_at_path =
-                                prepare_node_at_path(dirid, file_name, hashed_path, metadata);
+                                prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype);
                             if let Some(node_at_path) = node_at_path {
                                 ns.send(node_at_path).expect("Failed to send prepared node");
                             }
@@ -491,6 +478,7 @@ fn insert_direntries(
                 drop(nodesender);
             }
             {
+                // Sink for the data being transfered over channels processed in different threads.
                 // Thread below adds nodes to database for the nodes prepared so far.
                 // Nodes are expected to have parent dir ids at this stage.
                 // Once a dir is upserted this also sends database ids of dirs so that children of inserted dirs can also be inserted
@@ -604,6 +592,7 @@ fn add_modify_nodes(
     tx.enrich_modified_list_with_outside_mods()?;
     tx.enrich_modified_list()?;
     tx.prune_modified_list()?;
+    tx.delete_nodes()?;
     tx.commit()?;
 
     Ok(())

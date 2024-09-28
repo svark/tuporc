@@ -9,6 +9,7 @@ use std::borrow::Cow;
 // use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::fs::read;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 
-use crate::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, TupF};
+use crate::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
 use crate::db::{
     create_path_buf_temptable, db_path_str, AnyError, CallBackError, ForEachClauses, LibSqlExec,
     MiscStatements, SqlStatement,
@@ -253,6 +254,26 @@ impl NodeToInsert {
             NodeToInsert::ExcludedFile(p) => {
                 crossref.add_path_xref(p.clone(), id, parid);
             }
+        }
+    }
+    pub fn get_path(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
+        self.get_parent_id(read_write_buffer_objects)
+            .get_path_ref()
+            .to_string()
+            + "/"
+            + &*self.get_name(read_write_buffer_objects)
+    }
+    pub fn get_type(&self) -> RowType {
+        match self {
+            NodeToInsert::Rule(_) => Rule,
+            NodeToInsert::Tup(_) => TupF,
+            NodeToInsert::Group(_) => RowType::Grp,
+            NodeToInsert::GeneratedFile(_, _) => GenF,
+            NodeToInsert::Env(_) => RowType::Env,
+            NodeToInsert::Task(_) => Task,
+            NodeToInsert::InputFile(_) => File,
+            NodeToInsert::Glob(_) => Glob,
+            NodeToInsert::ExcludedFile(_) => Excluded,
         }
     }
 }
@@ -554,7 +575,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     term_progress: &TermProgress,
 ) -> Result<()> {
     let mut crossref = CrossRefMaps::default();
-    let (resolved_rules, mut rwbufs, mut outs) = {
+    let (resolved_rules, rwbufs, outs) = {
         let conn = connection;
 
         let db = DbPathSearcher::new(conn, root.as_ref());
@@ -604,20 +625,151 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         .expect("Connection to tup database in .tup/db could not be established");
 
     let _ = insert_nodes(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
-
     check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
+    let _ = insert_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
+    Ok(())
+}
 
-    add_group_providers(&mut conn, &resolved_rules, &crossref)?;
-    fetch_group_providers(&mut conn, &mut rwbufs, &mut outs, &mut crossref)?;
-    add_rule_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
-    // add links from glob inputs to tupfiles's directory
-    add_link_glob_dir_to_rules(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
+fn insert_links(
+    conn: &mut Connection,
+    _rwbufs: &ReadWriteBufferObjects,
+    resolved_rules: &ResolvedRules,
+    crossref: &mut CrossRefMaps,
+) -> Result<()> {
+    // collect all un-added groups and add them in a single transaction.
+    let mut link_collector = LinkCollector::new();
+    let links = {
+        for resolved_links in resolved_rules.rules_by_tup().iter() {
+            for rl in resolved_links.iter() {
+                let rd = rl.get_rule_desc();
+                let rule_ref = rl.get_tup_loc();
+                let tup_desc = rule_ref.get_tupfile_desc();
+                link_collector.add_tupfile_to_rule(tup_desc, rd);
+                for p in rl.get_targets() {
+                    link_collector.add_output_to_rule_link(rd, p);
+                    if let Some(group_desc) = rl.get_group_desc() {
+                        link_collector.add_output_to_group_link(p, &group_desc);
+                    }
+                }
+                for s in rl.get_sources() {
+                    link_collector.add_input_to_rule_link(s, rd);
+                    link_collector.add_group_to_rule_link(s, rd);
+                    link_collector.add_glob_to_tupfile_link(s, &tup_desc);
+                }
+                for env in rl.get_env_list().iter() {
+                    link_collector.add_env_to_rule_link(&env, rd);
+                }
+                for tupfile_read in rl.get_tupfiles_read() {
+                    link_collector.add_tupfile_to_tupfile_link(tupfile_read, tup_desc);
+                }
+            }
+        }
+        link_collector.links()
+    };
+    let tx = conn.transaction()?;
+    {
+        let mut insert_link = tx.insert_link_prepare()?;
+        for l in links {
+            match l {
+                Link::InputToRule(i, rd) => {
+                    let (input_id, _) = crossref.get_path_db_id(&i).ok_or_else(|| {
+                        eyre!("input not found:{:?} mentioned in rule {:?}", i, rd)
+                    })?;
+                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
+                        eyre!("rule not found:{:?} mentioned in rule {:?}", rd, i)
+                    })?;
+                    insert_link
+                        .insert_link(input_id, rule_id, false, RowType::Rule)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::RuleToOutput(rd, out) => {
+                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
+                        eyre!("rule not found:{:?} mentioned in output {:?}", rd, out)
+                    })?;
+                    let (output_id, _) = crossref.get_path_db_id(&out).ok_or_else(|| {
+                        eyre!("output not found:{:?} mentioned in rule {:?}", out, rd)
+                    })?;
+                    insert_link
+                        .insert_link(output_id, rule_id, true, RowType::Rule)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::OutputToGroup(out, group) => {
+                    let (output_id, _) = crossref.get_path_db_id(&out).ok_or_else(|| {
+                        eyre!("output not found:{:?} mentioned in group {:?}", out, group)
+                    })?;
+                    let (group_id, _) = crossref.get_group_db_id(&group).ok_or_else(|| {
+                        eyre!("group not found:{:?} mentioned in output {:?}", group, out)
+                    })?;
+                    insert_link
+                        .insert_link(output_id, group_id, true, RowType::Grp)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::GroupToRule(group, rd) => {
+                    let (group_id, _) = crossref.get_group_db_id(&group).ok_or_else(|| {
+                        eyre!("group not found:{:?} mentioned in rule {:?}", group, rd)
+                    })?;
+                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
+                        eyre!("rule not found:{:?} mentioned in group {:?}", rd, group)
+                    })?;
+                    insert_link
+                        .insert_link(group_id, rule_id, false, RowType::Rule)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::EnvToRule(env, rd) => {
+                    let env_id = crossref.get_env_db_id(&env).ok_or_else(|| {
+                        eyre!("env not found:{:?} mentioned in rule {:?}", env, rd)
+                    })?;
+                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
+                        eyre!("rule not found:{:?} mentioned in env {:?}", rd, env)
+                    })?;
+                    insert_link
+                        .insert_link(env_id, rule_id, true, RowType::Rule)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::TupfileToTupfile(pd, tupd) => {
+                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
+                        eyre!("tupfile not found:{:?} mentioned in tupfile {:?}", tupd, pd)
+                    })?;
+                    let (tupfile_read_id, _) = crossref.get_path_db_id(&pd).ok_or_else(|| {
+                        eyre!("tupfile not found:{:?} mentioned in tupfile {:?}", pd, tupd)
+                    })?;
+                    insert_link
+                        .insert_link(tupfile_read_id, tupfile_id, true, RowType::TupF)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::GlobToTupfile(g, tupd) => {
+                    let (glob_id, _) = crossref.get_glob_db_id(&g).ok_or_else(|| {
+                        eyre!("glob not found:{:?} mentioned in tupfile {:?}", g, tupd)
+                    })?;
+                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
+                        eyre!("tupfile not found:{:?} mentioned in glob {:?}", tupd, g)
+                    })?;
+                    insert_link
+                        .insert_link(glob_id, tupfile_id, true, RowType::TupF)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+                Link::TupfileToRule(tupd, rd) => {
+                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
+                        eyre!("tupfile not found:{:?} mentioned in rule {:?}", tupd, rd)
+                    })?;
+                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
+                        eyre!("rule not found:{:?} mentioned in tupfile {:?}", rd, tupd)
+                    })?;
+                    insert_link
+                        .insert_link(tupfile_id, rule_id, false, RowType::Rule)
+                        .map_err(|e| eyre!(e.to_string()))?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// adds links from glob patterns specified at each directory that are inputs to rules  to the tupfile directory
 /// We don't directly add links from glob patterns to rules but instead add links from glob patterns to the tupfile so that they are parsed whenever glob patterns are modified
 /// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a re-iterations parsing phase of Tupfile which the glob pattern links to
+#[allow(dead_code)]
 fn add_link_glob_dir_to_rules(
     conn: &mut Connection,
     rw_buf: &ReadWriteBufferObjects,
@@ -850,6 +1002,7 @@ fn check_uniqueness_of_parent_rule(
 }
 
 /// add links to/from rules to their inputs and outputs
+#[allow(dead_code)]
 fn add_rule_links(
     conn: &mut Connection,
     rbuf: &ReadWriteBufferObjects,
@@ -995,6 +1148,7 @@ fn add_rule_links(
 }
 
 /// get a global list of files corresponding  to each group
+#[allow(dead_code)]
 fn fetch_group_providers(
     conn: &mut Connection,
     rwbuf: &mut ReadWriteBufferObjects,
@@ -1087,40 +1241,34 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
     recurse: bool,
+    rtype: RowType,
 ) -> Result<(i64, i64)> {
     let (parent, name) = split_path(path.as_ref());
     if parent.as_os_str().is_empty() || parent.as_os_str().eq(".") {
         return Ok((0, 0));
     }
-    let dir = node_statements
-        .fetch_dirid_with_par(parent.as_ref())
-        .map(|(dir, _)| dir)
-        .or_else(|_| -> Result<i64> {
-            // try adding parent directory if not in db
-            let (dir, _) = insert_path(
-                parent.as_ref(),
-                node_statements,
-                add_ids_statements,
-                recurse,
-            )?;
-            Ok(dir)
-        })?;
+    let (dir, _) =
+        ensure_parent_inserted(node_statements, add_ids_statements, recurse, &rtype, parent)?;
 
     if dir.is_negative() {
         return Ok((dir, -1));
     }
 
-    let mut insert_in_dir = |name: Cow<str>, path: &Path, dir: i64| -> Result<(i64, i64)> {
+    let mut insert_in_dir = |name: Cow<str>,
+                             path: &Path,
+                             dir: i64,
+                             rtype: RowType|
+     -> Result<(i64, i64)> {
         let pbuf = path.to_owned();
         let hashed_path = crate::scan::HashedPath::from(pbuf);
         let metadata = fs::metadata(path).ok();
         if let Some(node_at_path) =
-            crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata)
+            crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata, &rtype)
         {
             let in_node = node_at_path.get_prepared_node();
             let node = find_upsert_node(node_statements, add_ids_statements, in_node)?;
             // add to auxiliary tables : dirpathbuf if it is a directory and Tuppathbuf if it is a tupfile
-            if node.get_type() == &Dir {
+            if node.get_type() == &Dir || node.get_type() == &DirGen {
                 node_statements
                     .add_to_dirpathbuf(node.get_id(), node_at_path.get_hashed_path().as_ref())?;
             }
@@ -1134,7 +1282,35 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
             Ok((-1, -1))
         }
     };
-    insert_in_dir(name, path.as_ref(), dir)
+    insert_in_dir(name, path.as_ref(), dir, rtype)
+}
+
+fn ensure_parent_inserted(
+    node_statements: &mut NodeStatements,
+    add_ids_statements: &mut AddIdsStatements,
+    recurse: bool,
+    rtype: &RowType,
+    parent: Cow<Path>,
+) -> Result<(i64, i64), Report> {
+    let pardir_type = if is_generated(&rtype) { DirGen } else { Dir };
+    if pardir_type.eq(&DirGen) {
+        // make sure directory is physically present for generated files
+        fs::create_dir_all(parent.as_ref()).map_err(|e| eyre!(e.to_string()))?;
+    }
+    let (dir, pardir) = node_statements
+        .fetch_dirid_with_par(parent.as_ref())
+        .or_else(|_| -> Result<(i64, i64)> {
+            // try adding parent directory if not in db
+            let (dir, pardir) = insert_path(
+                parent.as_ref(),
+                node_statements,
+                add_ids_statements,
+                recurse,
+                pardir_type,
+            )?;
+            Ok((dir, pardir))
+        })?;
+    Ok((dir, pardir))
 }
 
 fn split_path(path: &Path) -> (Cow<Path>, Cow<'_, str>) {
@@ -1142,6 +1318,7 @@ fn split_path(path: &Path) -> (Cow<Path>, Cow<'_, str>) {
     let name = path.file_name().unwrap_or("".as_ref()).to_string_lossy();
     (parent, name)
 }
+#[derive(Debug, Clone)]
 struct Collector {
     processed_globs: HashSet<PathDescriptor>,
     processed: HashSet<PathDescriptor>,
@@ -1151,6 +1328,80 @@ struct Collector {
     read_write_buffer_objects: ReadWriteBufferObjects,
     processed_envs: HashSet<EnvDescriptor>,
 }
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+enum Link {
+    InputToRule(PathDescriptor, RuleDescriptor),
+    RuleToOutput(RuleDescriptor, PathDescriptor),
+    OutputToGroup(PathDescriptor, GroupPathDescriptor),
+    GroupToRule(GroupPathDescriptor, RuleDescriptor),
+    EnvToRule(EnvDescriptor, RuleDescriptor),
+    TupfileToTupfile(PathDescriptor, TupPathDescriptor),
+    GlobToTupfile(GlobPathDescriptor, TupPathDescriptor),
+    TupfileToRule(TupPathDescriptor, RuleDescriptor),
+}
+
+#[derive(Debug, Clone, Default)]
+struct LinkCollector {
+    links: HashSet<Link>,
+}
+impl LinkCollector {
+    pub(crate) fn new() -> LinkCollector {
+        LinkCollector::default()
+    }
+    pub(crate) fn add_output_to_rule_link(&mut self, rd: &RuleDescriptor, output: &PathDescriptor) {
+        self.links
+            .insert(Link::RuleToOutput(rd.clone(), output.clone()));
+    }
+    pub(crate) fn add_input_to_rule_link(&mut self, inp: &InputResolvedType, rd: &RuleDescriptor) {
+        inp.get_resolved_path_desc().map(|p| {
+            self.links.insert(Link::InputToRule(p.clone(), rd.clone()));
+        });
+    }
+    pub(crate) fn add_output_to_group_link(
+        &mut self,
+        output: &PathDescriptor,
+        g: &GroupPathDescriptor,
+    ) {
+        self.links
+            .insert(Link::OutputToGroup(output.clone(), g.clone()));
+    }
+    pub(crate) fn add_env_to_rule_link(&mut self, e: &EnvDescriptor, rd: &RuleDescriptor) {
+        self.links.insert(Link::EnvToRule(e.clone(), rd.clone()));
+    }
+    pub(crate) fn add_tupfile_to_tupfile_link(
+        &mut self,
+        t: &PathDescriptor,
+        tup: &TupPathDescriptor,
+    ) {
+        self.links
+            .insert(Link::TupfileToTupfile(t.clone(), tup.clone()));
+    }
+    pub(crate) fn add_glob_to_tupfile_link(
+        &mut self,
+        i: &InputResolvedType,
+        tup: &TupPathDescriptor,
+    ) {
+        i.get_glob_path_desc().map(|g| {
+            self.links
+                .insert(Link::GlobToTupfile(g.clone(), tup.clone()));
+        });
+    }
+    pub(crate) fn add_group_to_rule_link(&mut self, i: &InputResolvedType, rd: &RuleDescriptor) {
+        i.get_group_ref().map(|g| {
+            self.links.insert(Link::GroupToRule(g.clone(), rd.clone()));
+        });
+    }
+    pub(crate) fn add_tupfile_to_rule(&mut self, t: &TupPathDescriptor, rd: &RuleDescriptor) {
+        self.links
+            .insert(Link::TupfileToRule(t.clone(), rd.clone()));
+    }
+
+    pub(crate) fn links(&self) -> impl Iterator<Item = &Link> {
+        self.links.iter()
+    }
+}
+
 pub struct NodeStatements<'a> {
     insert_node: SqlStatement<'a>,
     find_node: SqlStatement<'a>,
@@ -1322,14 +1573,11 @@ impl Collector {
         }
         Ok(())
     }
-
-    fn add_groups(&mut self) -> Result<()> {
-        self.read_write_buffer_objects.for_each_group(|grp_id| {
+    pub(crate) fn add_group(&mut self, p0: Option<&GroupPathDescriptor>) {
+        if let Some(group) = p0 {
             self.nodes_to_insert
-                .push(NodeToInsert::Group(grp_id.clone()));
-            Ok(())
-        })?;
-        Ok(())
+                .push(NodeToInsert::Group(group.clone()));
+        }
     }
 }
 
@@ -1355,9 +1603,8 @@ fn insert_nodes(
         Ok(dir)
     };
     // collect all un-added groups and add them in a single transaction.
-    let nodes: Vec<_> = {
+    let mut nodes: Vec<_> = {
         let mut collector = Collector::new(read_write_buf.clone())?;
-        collector.add_groups()?;
         for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
             for resolvedtask in resolvedtasks.iter() {
                 let rd = resolvedtask.get_task_descriptor();
@@ -1380,6 +1627,9 @@ fn insert_nodes(
                 for p in rl.get_targets() {
                     collector.add_output(p, rl.get_rule_desc().clone())?
                 }
+                let group = rl.get_group_desc();
+                collector.add_group(group);
+
                 for s in rl.get_sources() {
                     collector.add_input_for_insert(s)?;
                 }
@@ -1396,20 +1646,32 @@ fn insert_nodes(
         }
         collector.nodes()
     };
+    nodes.sort_by(|a, b| {
+        if a.get_type().eq(&b.get_type()) {
+            a.get_path(&read_write_buf)
+                .cmp(&b.get_path(&read_write_buf))
+        } else {
+            a.get_type().cmp(&b.get_type())
+        }
+    });
 
     let tx = conn.transaction()?;
     {
         let mut node_statements = NodeStatements::new(tx.deref())?;
         let mut add_ids_statements = AddIdsStatements::new(tx.deref())?;
-        let parent_descriptors = nodes.iter().map(|n| n.get_parent_id(read_write_buf));
+        let parent_descriptors = nodes
+            .iter()
+            .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
         // make sure directories are inserted before files
-        for parent_desc in parent_descriptors {
+        //parent_descriptors.sort_by(|a, b| a.0.ancestors().count().cmp((&b.0));
+        for (parent_desc, rowtype) in parent_descriptors {
             if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
-                let (parid, parparid) = insert_path(
-                    read_write_buf.get_path(&parent_desc).as_path(),
+                let (parid, parparid) = ensure_parent_inserted(
                     &mut node_statements,
                     &mut add_ids_statements,
                     true,
+                    &rowtype,
+                    Cow::from(parent_desc.get_path_ref().as_path()),
                 )?;
                 if !parid.is_negative() {
                     crossref.add_path_xref(parent_desc, parid, parparid);
@@ -1524,7 +1786,6 @@ impl NodeStatements<'_> {
             update_flags,
             update_srcid,
             find_dir_id_with_par,
-            // find_nodeid,
             add_to_dirpathbuf,
             update_type,
             add_to_tuppathbuf,
@@ -1634,6 +1895,7 @@ pub(crate) fn find_upsert_node(
     Ok(db_node)
 }
 
+/// Update the columns of the node table with newer values
 fn update_columns(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
@@ -1708,35 +1970,4 @@ fn update_columns(
 
 fn is_generated(p0: &RowType) -> bool {
     p0 == &GenF || p0 == &DirGen
-}
-
-/// add links from targets that contribute to a group to the group id
-fn add_group_providers(
-    conn: &mut Connection,
-    resolved_rules: &ResolvedRules,
-    crossref: &CrossRefMaps,
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    {
-        let mut inp_linker = tx.insert_link_prepare()?;
-
-        for (group_id, targets) in resolved_rules
-            .get_resolved_links()
-            .iter()
-            .filter_map(|rl| rl.get_group_desc().as_ref().map(|g| (*g, rl.get_targets())))
-        // filter those that have a group descriptor
-        {
-            let (group_db_id, _) = crossref
-                .get_group_db_id(group_id)
-                .ok_or_else(|| eyre!("group db id not found for group: {:?}", group_id))?;
-            for target in targets {
-                let (path_db_id, _) = crossref
-                    .get_path_db_id(target)
-                    .ok_or_else(|| eyre!("path db id not found for target: {:?}", target))?;
-                inp_linker.insert_link(path_db_id, group_db_id, false, RowType::Grp)?;
-            }
-        }
-    }
-    tx.commit()?;
-    Ok(())
 }

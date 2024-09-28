@@ -17,7 +17,7 @@ use notify::{
 };
 use rusqlite::Connection;
 
-use crate::db::{LibSqlExec, LibSqlPrepare};
+use crate::db::{LibSqlExec, LibSqlPrepare, RowType};
 use crate::parse::{AddIdsStatements, NodeStatements};
 use crate::scan::scan_root;
 use crate::TermProgress;
@@ -217,7 +217,13 @@ fn run_monitor(
     let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
     let mut update_nodes = |path: &Path, added: bool| -> Result<()> {
         if added {
-            crate::parse::insert_path(&path, &mut node_statements, &mut add_ids_statements, true)?;
+            crate::parse::insert_path(
+                &path,
+                &mut node_statements,
+                &mut add_ids_statements,
+                true,
+                RowType::File,
+            )?;
         } else {
             crate::parse::remove_path(&path, &mut node_statements, &mut add_ids_statements)?;
         }

@@ -419,8 +419,6 @@ pub(crate) trait LibSqlPrepare {
     fn add_to_delete_prepare(&self) -> Result<SqlStatement>;
     fn add_to_present_prepare(&self) -> Result<SqlStatement>;
     #[allow(dead_code)]
-    fn remove_presents_prepare(&self) -> Result<SqlStatement>;
-    #[allow(dead_code)]
     fn remove_success_prepare(&self) -> Result<SqlStatement>;
     #[allow(dead_code)]
     fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement>;
@@ -498,14 +496,6 @@ pub(crate) trait LibSqlExec {
     fn add_to_delete_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
     /// Add a node to the present list. These are nodes(files rules, etc.) that still exists after the last run
     fn add_to_present_exec(&mut self, node_id: i64, rtype: RowType) -> Result<()>;
-    #[allow(dead_code)]
-    fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()>;
-    #[allow(dead_code)]
-    fn remove_presents_exec(&mut self) -> Result<()>;
-    #[allow(dead_code)]
-    fn remove_failed_exec(&mut self) -> Result<()>;
-    #[allow(dead_code)]
-    fn add_failed_to_modified_exec(&mut self) -> Result<()>;
     /// Insert a directory node into the database
     #[allow(dead_code)]
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
@@ -617,13 +607,21 @@ pub(crate) trait LibSqlExec {
     fn remove_monitored_by_generation_id(&mut self, generation_id: i64) -> Result<()>;
 }
 pub(crate) trait MiscStatements {
+    /// Populate deletelist (DeleteList = ids of type file/dir Node  - ids in PresentList)
     fn populate_delete_list(&self) -> Result<()>;
     fn first_containing(&self, name: &str, dir: i64) -> Result<(String, i64)>;
+    /// Enrich the modified list with nodes that have been modified outside of tup
     fn enrich_modified_list_with_outside_mods(&self) -> Result<()>;
+    /// Enrich the modified list with more entries determined by dependencies between nodes
     fn enrich_modified_list(&self) -> Result<()>;
+    ///Remove given id from the delete list
     fn remove_id_from_delete_list(&self, id: i64) -> Result<()>;
     fn prune_present_list(&self) -> Result<()>;
+    /// Remove entries in modify list that are in successlist(rules that exectued successfuly) or deletelist
     fn prune_modified_list(&self) -> Result<()>;
+
+    /// Delete nodes marked in DeleteList
+    fn delete_nodes(&self) -> Result<()>;
     #[allow(dead_code)]
     fn remove_modified_list(&self) -> Result<()>;
     #[allow(dead_code)]
@@ -657,6 +655,7 @@ pub(crate) trait ForEachClauses {
     ) -> Result<()>
     where
         F: FnMut(i64) -> Result<()>;
+    #[allow(dead_code)]
     fn for_each_grp_node_provider<F>(
         &self,
         group_id: i64,
@@ -770,15 +769,6 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: AddToPres,
-        })
-    }
-
-    fn remove_presents_prepare(&self) -> Result<SqlStatement> {
-        let stmt =
-            self.prepare("DELETE from DeleteList where id in (SELECT id from PresentList)")?;
-        Ok(SqlStatement {
-            stmt,
-            tok: RemovePresents,
         })
     }
 
@@ -1242,43 +1232,6 @@ impl LibSqlExec for SqlStatement<'_> {
     fn add_to_present_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
         assert_eq!(self.tok, AddToPres, "wrong token for update to presentlist");
         self.stmt.execute((id, rtype as u8))?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn add_to_temp_ids_table_exec(&mut self, id: i64, rtype: RowType) -> Result<()> {
-        assert_eq!(
-            self.tok, AddToTempIds,
-            "wrong token for update to tempidslist"
-        );
-        self.stmt.insert((id, rtype as u8))?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn remove_presents_exec(&mut self) -> Result<()> {
-        assert_eq!(
-            self.tok, RemovePresents,
-            "wrong token for removing presents"
-        );
-        self.stmt.execute([])?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn remove_failed_exec(&mut self) -> Result<()> {
-        assert_eq!(self.tok, RemoveSuccess, "wrong token for removing failed");
-        self.stmt.execute([])?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn add_failed_to_modified_exec(&mut self) -> Result<()> {
-        assert_eq!(
-            self.tok, PruneMod,
-            "wrong token for adding failed to modified"
-        );
-        self.stmt.execute([])?;
         Ok(())
     }
 
@@ -2047,10 +2000,11 @@ impl MiscStatements for Connection {
     fn populate_delete_list(&self) -> Result<()> {
         let ftype = RowType::File as u8;
         let dtype = RowType::Dir as u8;
+        let tup_type = RowType::TupF as u8;
         // add all files and directories to delete list that are not in the present list or modify list
         let mut stmt = self.prepare(
-            &*format!("Insert  or IGNORE into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} ) and id NOT in( \
-         SELECT id from PresentList Union Select id from ModifyList)",
+            &*format!("Insert  or IGNORE into DeleteList SELECT id, type from Node Where (type= {ftype} or type = {dtype} or type = {tup_type} ) and id NOT in( \
+         SELECT id from PresentList)",
             ))?;
         stmt.execute([])?;
 
@@ -2102,18 +2056,22 @@ LIMIT 1;
     fn enrich_modified_list(&self) -> Result<()> {
         // add parent dirs to modify list if children of that directory are already in it
         let rtype = RowType::Rule as u8;
-        let grptype = RowType::Grp as u8;
+        //let grptype = RowType::Grp as u8;
         {
             // add parent dirs/glob to modify list if any child of that directory with matched glob pattern is in the delete list/modify list
 
             let ftype = RowType::File as u8;
             let gentype = RowType::GenF as u8;
             let globtype = RowType::Glob as u8;
+            let tupf = RowType::TupF as u8;
             //stmt.execute([])?;
-
+            // delete entries in modify list if they appear in delete list
+            let mut stmt =
+                self.prepare("DELETE from ModifyList where id in (SELECT id from DeleteList)")?;
+            stmt.execute([])?;
             // mark glob patterns as modified if any of its inputs are in the deletelist or modified list
             // note that glob patterns are mapped to Tupfiles in  NormalLink table
-            // which will then trigger a loading of these tupfiles
+            // which will then trigger parsing of these tupfiles
             let mut stmt = self.prepare(&*format!(
                 "INSERT OR IGNORE INTO ModifyList
 SELECT globPatterns.id, {globtype}
@@ -2135,19 +2093,31 @@ AND EXISTS (
             ))?;
             stmt.execute([])?;
 
-            // mark groups as Modified if any of its inputs are in the deletelist or modified list
-            let mut stmt = self.prepare(
-                &*format!("Insert or IGNORE into ModifyList SELECT id, {grptype} from Node where  type = {rtype} and id in \
-            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {gentype} UNION SELECT id from ModifyList where type = {gentype}) )"),
+            // remove rules in tupfile that was deleted.
+            let mut stmt = self.prepare(&*format!(
+                "INSERT or IGNORE into DeleteList SELECT id, {rtype} from Node where type = {rtype} and id in \
+                (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {tupf} ) )")
             )?;
             stmt.execute([])?;
 
-            // mark rules as Modified if any of its inputs are in the deletelist or ModifyList
+            // mark node as Modified if any of its inputs are in the deletelist or modified list
+            let mut stmt = self.prepare(
+                "Insert or IGNORE into ModifyList SELECT id, type from Node where id in \
+            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList) )"
+            )?;
+            stmt.execute([])?;
+
+            // mark node as Modified if it depends on nodes in deletelist or modified list
             let mut stmt = self.prepare(
                 &*format!("Insert or IGNORE into ModifyList SELECT id, {rtype} from Node where  type = {rtype} and id in \
             (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList ) )"),
             )?;
             stmt.execute([])?;
+
+            // delete normal links with from / to id in deletelist
+            let mut stmt = self.prepare("DELETE from NormalLink where from_id in (SELECT id from DeleteList) or to_id in (SELECT id from DeleteList)")?;
+            stmt.execute([])?;
+
             // recursively mark all rules as modified if any of the parent rules are marked as modified
             // this is the closure operation.
             let mut stmt = self
@@ -2194,6 +2164,15 @@ FROM NodeChain;"
         Ok(())
     }
 
+    fn delete_nodes(&self) -> Result<()> {
+        let mut stmt =
+            self.prepare_cached("DELETE FROM Node WHERE id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        let mut stmt = self.prepare_cached("DELETE from NormalLink where from_id in (SELECT id from DeleteList) or to_id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        Ok(())
+    }
+
     fn remove_modified_list(&self) -> Result<()> {
         let mut stmt = self.prepare_cached("DELETE FROM ModifyList")?;
         stmt.execute([])?;
@@ -2210,15 +2189,17 @@ FROM NodeChain;"
             self.prepare_cached("SELECT id, message FROM MESSAGE ORDER BY id DESC LIMIT 1")?;
         let mut message_iter = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
-        if let Some(message_row) = message_iter.next() {
-            let (id, message): (i64, String) = message_row?;
-            if id == last_id {
-                return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows));
-            }
-            Ok(message)
-        } else {
-            return Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows)).into();
-        }
+        message_iter
+            .next()
+            .ok_or(AnyError::Db(rusqlite::Error::QueryReturnedNoRows))
+            .and_then(|message_row| {
+                let (id, message): (i64, String) = message_row?;
+                if id == last_id {
+                    Err(AnyError::Db(rusqlite::Error::QueryReturnedNoRows))
+                } else {
+                    Ok(message)
+                }
+            })
     }
 }
 
