@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::io::Error as IOError;
+//use std::io::Error as IOError;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
