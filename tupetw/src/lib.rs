@@ -147,8 +147,6 @@ impl DynDepTracker {
                                 let ppid = gen_proc(parent_id);
                                 if parent_id == root_process_id || parents.contains_key(&ppid) {
                                     if active_processtreeids.insert(processid) {
-                                        debug!("Child process id: {}", processid);
-
                                         let cur_id: i64 = gen_proc(processid);
                                         numchildren_and_self.insert(
                                             cur_id,
@@ -159,6 +157,7 @@ impl DynDepTracker {
                                         let parent_id = if let Some(&p) = parents.get(&ppid) {
                                             p
                                         } else {
+                                            log::warn!("Child process id: {}", processid);
                                             cur_id
                                         };
                                         parents.insert(cur_id, parent_id);
@@ -167,6 +166,11 @@ impl DynDepTracker {
                                             numchildren_and_self.get(&parent_id).unwrap_or(&0) + 1,
                                         );
                                         txpar.send((cur_id, parent_id)).unwrap();
+                                        log::debug!(
+                                            "Process id: {} created with parent {}",
+                                            processid,
+                                            parent_id >> 0x20
+                                        );
                                         ctx_process
                                             .send(EventHeader::new(
                                                 cur_id,
@@ -187,7 +191,7 @@ impl DynDepTracker {
                         let parser = Parser::create(event, &sch);
                         if let Ok(processid) = parser.try_parse::<u32>("ProcessId") {
                             if active_processtreeids.remove(&processid) {
-                                println!("Process id: {} deleted", processid);
+                                log::debug!("Process id: {} deleted", processid);
                                 let pid = gen_proc(processid);
                                 let g = proc_generation.entry(processid).or_insert(0);
                                 tx.send((processid, op)).unwrap();
@@ -196,22 +200,33 @@ impl DynDepTracker {
                                     numchildren_and_self.entry(pid).and_modify(|x| *x -= 1);
                                 }
                                 txpar.send((pid, 0)).unwrap();
-                                if let Some(parent_id) = parents.get(&pid) {
-                                    numchildren_and_self
-                                        .entry(*parent_id)
-                                        .and_modify(|x| *x -= 1);
-                                    let child_count = numchildren_and_self[parent_id];
+                                let parent_id = parents.get(&pid).cloned().unwrap_or(0);
+                                {
+                                    if parent_id > 0 {
+                                        numchildren_and_self
+                                            .entry(parent_id)
+                                            .and_modify(|x| *x -= 1);
+                                    }
+                                    let child_count = if parent_id != 0 {
+                                        numchildren_and_self[&parent_id]
+                                    } else {
+                                        0u32
+                                    };
                                     ctx_process
                                         .send(EventHeader::new(
                                             pid,
-                                            *parent_id,
+                                            parent_id,
                                             EventType::ProcessDeletion,
                                             "".to_string(),
                                             child_count,
                                         ))
                                         .unwrap();
+                                }
+                                debug!("Process id: {} deleted & processed", processid);
+                                if parent_id != 0 {
+                                    debug!("Parent id: {}", parent_id);
                                 } else {
-                                    println!("Process id: {} deleted but has no parent", processid);
+                                    debug!("Process id: {} deleted but has no parent", processid);
                                 }
                             }
                         }
@@ -275,14 +290,15 @@ impl DynDepTracker {
                                     canonicalize(open_path_buf).unwrap_or(PathBuf::from(open_path));
                                 // print!("Open path: {:?}: ", &open_path);
                                 if open_path.is_file() {
-                                    //debug!("Opcode: {} code:{}", opname, event.opcode());
                                     //print!("CreateOptions:{}", parser.try_parse::<u32>("CreateOptions").unwrap());
                                     let fo = parser.try_parse::<u64>("FileObject").unwrap_or(0);
                                     let pid = gen_proc(event.process_id());
+                                    let parent_process_id = *parent_ids.get(&pid).unwrap_or(&0);
+                                    //log::debug!("Opcode: {} code:{} for open_path:{} parentid:{}", opname, event.opcode(), open_path.as_path().display(), parent_process_id);
                                     ctx_io
                                         .send(EventHeader {
                                             process_id: pid,
-                                            parent_process_id: *parent_ids.get(&pid).unwrap_or(&0),
+                                            parent_process_id,
                                             event_type: EventType::Open,
                                             file_path: open_path.to_str().unwrap_or("").to_string(),
                                             child_count: 0,
@@ -345,9 +361,11 @@ impl DynDepTracker {
         Ok(())
     }
     pub fn stop(&mut self) {
+        println!("Stopping trace");
         self.kernel_trace.take().map(|kt| {
             kt.stop().expect("unable to stop trace");
         });
+        println!("Done!");
     }
 }
 

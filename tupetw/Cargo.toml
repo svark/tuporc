@@ -5,12 +5,23 @@ edition = "2021"
 license = "Apache 2.0"
 
 [dependencies]
-ferrisetw = "1.1.0" # This is the only dependency you need to add
-crossbeam-channel = "0.5.11"
-dunce = "1.0.4"
-log = "0.4.20"
-thiserror = "1.0.56"
+ferrisetw = "1.2.0" # This is the only dependency you need to add
+crossbeam-channel = "0.5.14"
+dunce = "1.0.5"
+log = "0.4.22"
+thiserror = "2.0.7"
+
+[[example]]
+name = "log_trace"
+path = "examples/traceproc.rs"
+
+[dev-dependencies]
+execute = "0.2.13"
+env_logger = "0.11.5"
+crossbeam = "0.8.4"
+pathdiff = "0.2.0"
+
 
 [dependencies.windows]
-version = "0.52.0"
+version = "0.58.0"
 features = ["Win32_System_Threading", "Win32_Foundation"] # This is needed for the Windows Runtime
