@@ -5,10 +5,6 @@ edition = "2021"
 authors = ["Arun Sivaramakrishnan <arun.sivaramakrishnan@gmail.com>"]
 license = "Apache 2.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[profile.release-with-debug]
-inherits = "release"
-debug = true
 
 [dependencies]
 clap = { version = "4.5.23", features = ["derive"] }
@@ -35,3 +31,9 @@ lazy_static = { version = "1.5.0", features = [] }
 fs2 = "0.4.3"
 ignore = "0.4.23"
 
+[profile.release]
+lto = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

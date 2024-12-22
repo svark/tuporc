@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::Component::Normal;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupparser::buffers::{
@@ -1192,26 +1193,21 @@ fn fetch_group_providers(
 fn find_by_path_inner<'a>(
     path: &'a Path,
     node_statements: &mut NodeStatements,
-    rtype: &RowType,
-) -> Result<(Node, i64)> {
-    let (parent, name) = split_path(path);
-    let (dir, parent_id) = node_statements.fetch_dirid_with_par(parent.as_ref())?;
-    let i = node_statements
-        .fetch_node(name.as_ref(), dir)
-        .unwrap_or_else(|e| {
-            log::warn!("Error while finding path: {:?}", e);
-            Node::unknown_with_dir(dir, name.as_ref(), rtype)
-        });
-    Ok((i, parent_id))
+) -> Result<Node> {
+    path.components().try_fold((Node::root(), PathBuf::new()), |acc, c| {
+        let (dir, path_so_far) = acc;
+        let name = c.as_os_str().to_string_lossy();
+        let node = node_statements.fetch_node(name.as_ref(),  dir.get_id())?;
+        Ok((node, path_so_far.join(name.as_ref())))
+    }).map(|(node, _)| node)
 }
 fn find_by_path<'a>(
     path: &'a Path,
     node_statements: &mut NodeStatements,
-    rtype: &RowType,
-) -> (Node, i64) {
-    find_by_path_inner(path, node_statements, rtype).unwrap_or_else(|e| {
+) -> Node {
+    find_by_path_inner(path, node_statements).unwrap_or_else(|e| {
         log::warn!("Error while finding path: {:?}", e);
-        (Default::default(), -1)
+        Default::default()
     })
 }
 
@@ -1221,15 +1217,15 @@ pub(crate) fn remove_path<P: AsRef<Path>>(
     add_ids_statements: &mut AddIdsStatements,
 ) -> Result<()> {
     // if the path is a file, add it to the deletelist table
-    let (node, _) = find_by_path(path.as_ref(), node_statements, &RowType::File);
+    let node = find_by_path(path.as_ref(), node_statements);
     let nodeid = node.get_id();
     if nodeid > 0 {
         add_ids_statements.add_to_delete(nodeid, *node.get_type())?;
-        if node.get_type() == &Dir {
-            node_statements.remove_dirpathbuf(nodeid)?;
+       /* if node.get_type() == &Dir {
+            buf_statements.remove_dirpathbuf(nodeid)?;
         } else if node.get_type() == &TupF {
-            node_statements.remove_tuppathbuf(nodeid)?;
-        }
+            buf_statements.remove_tuppathbuf(nodeid)?;
+        } */
     }
     Ok(())
 }
@@ -1238,55 +1234,50 @@ pub(crate) fn insert_path<P: AsRef<Path>>(
     path: P,
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
-    recurse: bool,
     rtype: RowType,
 ) -> Result<(i64, i64)> {
-    let (parent, name) = split_path(path.as_ref());
+    let (parent, _) = split_path(path.as_ref());
     if parent.as_os_str().is_empty() || parent.as_os_str().eq(".") {
         return Ok((0, 0));
     }
-    let (dir, _) =
-        ensure_parent_inserted(node_statements, add_ids_statements, recurse, &rtype, parent)?;
-
-    if dir.is_negative() {
-        return Ok((dir, -1));
-    }
-
-    let mut insert_in_dir = |name: Cow<str>,
-                             path: &Path,
-                             dir: i64,
-                             rtype: RowType|
-     -> Result<(i64, i64)> {
-        let pbuf = path.to_owned();
-        let hashed_path = crate::scan::HashedPath::from(pbuf);
-        let metadata = fs::metadata(path).ok();
-        if let Some(node_at_path) =
-            crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata, &rtype)
+    path.as_ref().components().try_fold((0i64, -1i64, PathBuf::new()), |acc, c|
+        -> Result<(i64, i64, PathBuf)>
         {
-            let in_node = node_at_path.get_prepared_node();
-            let node = find_upsert_node(node_statements, add_ids_statements, in_node)?;
-            // add to auxiliary tables : dirpathbuf if it is a directory and Tuppathbuf if it is a tupfile
-            if node.get_type() == &Dir || node.get_type() == &DirGen {
-                node_statements
-                    .add_to_dirpathbuf(node.get_id(), node_at_path.get_hashed_path().as_ref())?;
-            }
-            if node.get_type() == &TupF {
-                node_statements
-                    .add_to_tuppathbuf(node.get_id(), node_at_path.get_hashed_path().as_ref())?;
-            }
-            Ok((node.get_id(), dir))
+        let (dir, parid, path_so_far) = acc;
+        if let Normal(name) = c {
+            let (nid, dir) = insert_node_in_dir(node_statements, add_ids_statements,
+                                                name.to_string_lossy(), path_so_far.as_path(), dir, &rtype)?;
+            Ok((nid, dir, path_so_far.join(name)))
         } else {
-            log::warn!("Error while inserting path: {:?}", path);
-            Ok((-1, -1))
+            Ok((dir, parid, path_so_far))
         }
-    };
-    insert_in_dir(name, path.as_ref(), dir, rtype)
+    }).map(|(nid, dir, _)| (nid, dir))
+    //insert_in_dir(name, path.as_ref(), dir, rtype)
+}
+
+fn insert_node_in_dir(node_statements: &mut NodeStatements, add_ids_statements: &mut AddIdsStatements,
+                      name: Cow<str>, path: &Path, dir: i64, rtype: &RowType) -> Result<(i64, i64)> {
+    let pbuf = path.to_owned();
+    let hashed_path = crate::scan::HashedPath::from(pbuf);
+    let mut metadata = fs::metadata(path).ok();
+    if metadata.as_ref().map_or(false, |m| m.is_symlink()) {
+        metadata = fs::symlink_metadata(path).ok();
+    }
+    if let Some(node_at_path) =
+        crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata, &rtype)
+    {
+        let in_node = node_at_path.get_prepared_node();
+        let node = find_upsert_node(node_statements, add_ids_statements, in_node)?;
+        Ok((node.get_id(), dir))
+    } else {
+        log::warn!("Error while inserting path: {:?}", path);
+        Ok((-1, -1))
+    }
 }
 
 fn ensure_parent_inserted(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
-    recurse: bool,
     rtype: &RowType,
     parent: Cow<Path>,
 ) -> Result<(i64, i64), Report> {
@@ -1295,15 +1286,17 @@ fn ensure_parent_inserted(
         // make sure directory is physically present for generated files
         fs::create_dir_all(parent.as_ref()).map_err(|e| eyre!(e.to_string()))?;
     }
-    let (dir, pardir) = node_statements
-        .fetch_dirid_with_par(parent.as_ref())
+
+    // there is probably some more scope for optimization here.
+    // maybe this fn can accept crossrefmap to store previously inserted paths
+    let (dir, pardir) = find_by_path_inner(parent.as_ref(), node_statements)
+        .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
             // try adding parent directory if not in db
             let (dir, pardir) = insert_path(
                 parent.as_ref(),
                 node_statements,
                 add_ids_statements,
-                recurse,
                 pardir_type,
             )?;
             Ok((dir, pardir))
@@ -1407,14 +1400,15 @@ pub struct NodeStatements<'a> {
     update_display_str: SqlStatement<'a>,
     update_flags: SqlStatement<'a>,
     update_srcid: SqlStatement<'a>,
-    find_dir_id_with_par: SqlStatement<'a>,
-    //find_nodeid: SqlStatement<'a>,
-    add_to_dirpathbuf: SqlStatement<'a>,
     update_type: SqlStatement<'a>,
+}
+/*pub struct BufStatements<'a> {
+    add_to_dirpathbuf: SqlStatement<'a>,
     add_to_tuppathbuf: SqlStatement<'a>,
     remove_tuppathbuf: SqlStatement<'a>,
     remove_dirpathbuf: SqlStatement<'a>,
-}
+    find_dirid_dirpathbuf: SqlStatement<'a>,
+}*/
 pub(crate) struct AddIdsStatements<'a> {
     add_to_present: SqlStatement<'a>,
     add_to_modify: SqlStatement<'a>,
@@ -1656,18 +1650,17 @@ fn insert_nodes(
     let tx = conn.transaction()?;
     {
         let mut node_statements = NodeStatements::new(tx.deref())?;
+        //let mut buf_statements = BufStatements::new(tx.deref())?;
         let mut add_ids_statements = AddIdsStatements::new(tx.deref())?;
         let parent_descriptors = nodes
             .iter()
             .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
-        // make sure directories are inserted before files
-        //parent_descriptors.sort_by(|a, b| a.0.ancestors().count().cmp((&b.0));
+
         for (parent_desc, rowtype) in parent_descriptors {
             if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
                 let (parid, parparid) = ensure_parent_inserted(
                     &mut node_statements,
                     &mut add_ids_statements,
-                    true,
                     &rowtype,
                     Cow::from(parent_desc.get_path_ref().as_path()),
                 )?;
@@ -1713,9 +1706,9 @@ fn insert_nodes(
         for n in nodeids.iter() {
             tx.remove_id_from_delete_list(n.0)?;
         }
+        tx.prune_modified_list_basic()?; // removes deletelist entries from modified
         tx.enrich_modified_list()?;
         tx.prune_present_list()?; // removes deletelist entries from present
-        tx.prune_modified_list()?; // removes deletelist entries from modified
                                    //conn.remove_presents_prepare()?.remove_presents_exec()?;
     }
     tx.commit()?;
@@ -1768,13 +1761,9 @@ impl NodeStatements<'_> {
         let update_display_str = conn.update_display_str_prepare()?;
         let update_flags = conn.update_flags_prepare()?;
         let update_srcid = conn.update_srcid_prepare()?;
-        let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
+        //let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
         //let find_nodeid = conn.fetch_nodeid_prepare()?;
-        let add_to_dirpathbuf = conn.insert_dir_aux_prepare()?;
         let update_type = conn.update_type_prepare()?;
-        let add_to_tuppathbuf = conn.insert_tup_aux_prepare()?;
-        let remove_tuppathbuf = conn.remove_tup_aux_prepare()?;
-        let remove_dirpathbuf = conn.remove_dir_aux_prepare()?;
 
         Ok(NodeStatements {
             insert_node,
@@ -1783,12 +1772,8 @@ impl NodeStatements<'_> {
             update_display_str,
             update_flags,
             update_srcid,
-            find_dir_id_with_par,
-            add_to_dirpathbuf,
+         //   find_dir_id_with_par,
             update_type,
-            add_to_tuppathbuf,
-            remove_tuppathbuf,
-            remove_dirpathbuf,
         })
     }
     fn insert_node_exec(&mut self, n: &Node) -> crate::db::Result<i64> {
@@ -1820,22 +1805,9 @@ impl NodeStatements<'_> {
     fn fetch_node_id(&mut self, name: &str, dirid: i64) -> crate::db::Result<i64> {
         self.find_nodeid.fetch_node_id(name, dirid)
     }*/
-    fn fetch_dirid_with_par(&mut self, parent: &Path) -> crate::db::Result<(i64, i64)> {
-        self.find_dir_id_with_par.fetch_dirid_with_par(parent)
-    }
 
-    fn add_to_dirpathbuf(&mut self, nodeid: i64, dirp: &Path) -> crate::db::Result<()> {
-        self.add_to_dirpathbuf.insert_dir_aux_exec(nodeid, dirp)
-    }
-    fn add_to_tuppathbuf(&mut self, nodeid: i64, dirp: &Path) -> crate::db::Result<()> {
-        self.add_to_tuppathbuf.insert_tup_aux_exec(nodeid, dirp)
-    }
-    fn remove_tuppathbuf(&mut self, nodeid: i64) -> crate::db::Result<()> {
-        self.remove_tuppathbuf.remove_tup_aux_exec(nodeid)
-    }
-    fn remove_dirpathbuf(&mut self, nodeid: i64) -> crate::db::Result<()> {
-        self.remove_dirpathbuf.remove_dir_aux_exec(nodeid)
-    }
+
+
 }
 
 impl AddIdsStatements<'_> {

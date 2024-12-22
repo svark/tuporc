@@ -27,8 +27,8 @@ use crate::db::{MiscStatements, Node, RowType};
 use crate::parse::find_upsert_node;
 use crate::{db, is_tupfile, parse, TermProgress};
 
-const MAX_THRS_NODES: u8 = 4;
-pub const MAX_THRS_DIRS: usize = 10;
+const MAX_THRS_NODES: u8 = 6;
+pub const MAX_THRS_DIRS: usize = 22;
 
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
 pub(crate) fn scan_root(
@@ -57,12 +57,25 @@ struct DirE {
 }
 
 impl DirE {
+}
+
+impl DirE {
     fn from(de: DirEntry) -> DirE {
         DirE {
             file_name: de.file_name().to_owned(),
             metadata: de.metadata().ok(),
             hashed_path: Some(HashedPath::from(de.into_path())),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_symlink(&self) -> bool {
+        self.metadata.as_ref().map_or(false, |m| m.is_symlink())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ends_with(&self, s: &str) -> bool {
+        self.file_name.to_string_lossy().ends_with(s)
     }
 
     fn take_path(&mut self) -> HashedPath {
@@ -254,10 +267,11 @@ fn walkdir_from(
     dir_sender: &Sender<DirSender>,
     dir_entry_sender: Sender<DirChildren>,
     ign: &Gitignore,
+    follow_links: bool,
 ) {
     let mut children = Vec::new();
     WalkDir::new(root.as_ref())
-        .follow_links(true)
+        .follow_links(follow_links)
         .min_depth(1)
         .max_depth(1)
         .into_iter()
@@ -498,6 +512,7 @@ fn insert_direntries(
                 }));
             }
             let (dirs_sender, dirs_receiver) = crossbeam::channel::unbounded();
+            let root_hash_path_hash = root_hash_path.get_hash();
             dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
             drop(dirs_sender);
             for i in 0..MAX_THRS_DIRS {
@@ -517,11 +532,13 @@ fn insert_direntries(
                     // to send the children of the subdirectory.
 
                     for dir_sender in dir_receiver.iter() {
+                        let follow_links = dir_sender.parent_path.get_hash().eq(&root_hash_path_hash);
                         walkdir_from(
                             dir_sender.parent_path(),
                             dir_sender.sender(),
                             dir_child_sender.clone(),
                             &ign,
+                            follow_links
                         );
                     }
                     drop(dir_receiver);
@@ -590,8 +607,8 @@ fn add_modify_nodes(
     }
     tx.populate_delete_list()?;
     tx.enrich_modified_list_with_outside_mods()?;
+    tx.prune_modified_list_basic()?;
     tx.enrich_modified_list()?;
-    tx.prune_modified_list()?;
     tx.delete_nodes()?;
     tx.commit()?;
 

@@ -39,6 +39,7 @@ mod monitor;
 mod parse;
 mod scan;
 
+static APPNAME: &str = "tuporc";
 #[derive(Clone)]
 pub(crate) struct TermProgress {
     mb: MultiProgress,
@@ -371,7 +372,8 @@ fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
 
 fn change_root() -> Result<()> {
     let (_, parent) = locate_file(current_dir()?, ".tup/db", "root").ok_or(eyre!(
-        ".tup/db not found in current directory or any parent directory"
+        ".tup/db not found in current directory or any parent directory\n\
+        Please run `{APPNAME} init' to initialize the database"
     ))?;
     set_current_dir(parent.as_path()).map_err(|e| {
         eyre!(

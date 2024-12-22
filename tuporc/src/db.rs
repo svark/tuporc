@@ -192,6 +192,18 @@ impl Default for Node {
     }
 }
 impl Node {
+    pub fn root() -> Node {
+        Node {
+            id: 0,
+            dirid: 0,
+            mtime: 0,
+            name: "".to_string(),
+            rtype: RowType::Dir,
+            display_str: "".to_string(),
+            flags: "".to_string(),
+            srcid: -1,
+        }
+    }
     pub fn new(id: i64, dirid: i64, mtime: i64, name: String, rtype: RowType) -> Node {
         Node {
             id,
@@ -204,6 +216,7 @@ impl Node {
             srcid: -1,
         }
     }
+    #[allow(dead_code)]
     pub fn unknown_with_dir(dirid: i64, name: &str, rtype: &RowType) -> Node {
         Node {
             id: -1,
@@ -345,10 +358,10 @@ pub(crate) enum StatementType {
     #[allow(dead_code)]
     AddToTempIds,
     InsertDir,
-    InsertDirAux,
+    /*InsertDirAux,
     RemoveDirAux,
     InsertTupAux,
-    RemoveTupAux,
+    RemoveTupAux, */
     InsertFile,
     InsertEnv,
     InsertLink,
@@ -424,14 +437,16 @@ pub(crate) trait LibSqlPrepare {
     fn prune_modified_of_success_prepare(&self) -> Result<SqlStatement>;
     #[allow(dead_code)]
     fn insert_dir_prepare(&self) -> Result<SqlStatement>;
-    fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
+ /*   fn insert_dir_aux_prepare(&self) -> Result<SqlStatement>;
     fn remove_dir_aux_prepare(&self) -> Result<SqlStatement>;
     fn insert_tup_aux_prepare(&self) -> Result<SqlStatement>;
     fn remove_tup_aux_prepare(&self) -> Result<SqlStatement>;
+    */
     fn insert_link_prepare(&self) -> Result<SqlStatement>;
     fn insert_node_prepare(&self) -> Result<SqlStatement>;
     fn insert_env_prepare(&self) -> Result<SqlStatement>;
     fn fetch_dirid_prepare(&self) -> Result<SqlStatement>;
+    #[allow(dead_code)]
     fn fetch_dirid_with_par_prepare(&self) -> Result<SqlStatement>;
     #[allow(dead_code)]
     fn fetch_groupid_prepare(&self) -> Result<SqlStatement>;
@@ -500,10 +515,10 @@ pub(crate) trait LibSqlExec {
     #[allow(dead_code)]
     fn insert_dir_exec(&mut self, path_str: &str, dir: i64) -> Result<i64>;
     /// Insert a directory node into the database. This version is used to keep track of full paths of the dirs in an auxiliary table
-    fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
-    fn insert_tup_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
-    fn remove_tup_aux_exec(&mut self, id: i64) -> Result<()>;
-    fn remove_dir_aux_exec(&mut self, id: i64) -> Result<()>;
+    //fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
+    //fn insert_tup_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()>;
+    //fn remove_tup_aux_exec(&mut self, id: i64) -> Result<()>;
+    //fn remove_dir_aux_exec(&mut self, id: i64) -> Result<()>;
 
     /// Insert a link between two nodes into the database. This is used to keep track of the dependencies between nodes and build a graph
     fn insert_link(
@@ -522,6 +537,7 @@ pub(crate) trait LibSqlExec {
     /// fetch directory node id from its path.
     fn fetch_dirid<P: AsRef<Path>>(&mut self, p: P) -> Result<i64>;
     /// fetch directory node id from its path and its parent directory id.
+    #[allow(dead_code)]
     fn fetch_dirid_with_par<P: AsRef<Path>>(&mut self, p: P) -> Result<(i64, i64)>;
     /// fetch group id from its name and directory
     #[allow(dead_code)]
@@ -619,6 +635,7 @@ pub(crate) trait MiscStatements {
     fn prune_present_list(&self) -> Result<()>;
     /// Remove entries in modify list that are in successlist(rules that exectued successfuly) or deletelist
     fn prune_modified_list(&self) -> Result<()>;
+    fn prune_modified_list_basic(&self) -> Result<()>;
 
     /// Delete nodes marked in DeleteList
     fn delete_nodes(&self) -> Result<()>;
@@ -799,7 +816,7 @@ impl LibSqlPrepare for Connection {
             tok: InsertDir,
         })
     }
-    fn insert_dir_aux_prepare(&self) -> Result<SqlStatement> {
+   /* fn insert_dir_aux_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT into DirPathBuf (id, name) Values (?,?);")?;
         Ok(SqlStatement {
             stmt,
@@ -827,7 +844,7 @@ impl LibSqlPrepare for Connection {
             stmt,
             tok: RemoveTupAux,
         })
-    }
+    } */
 
     fn insert_link_prepare(&self) -> Result<SqlStatement> {
         let stmt = self.prepare("INSERT OR IGNORE into NormalLink (from_id, to_id, issticky, to_type) Values (?,?,?, ?)")?;
@@ -1245,7 +1262,7 @@ impl LibSqlExec for SqlStatement<'_> {
         Ok(id)
     }
 
-    fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()> {
+ /*   fn insert_dir_aux_exec<P: AsRef<Path>>(&mut self, id: i64, path: P) -> Result<()> {
         assert_eq!(
             self.tok, InsertDirAux,
             "wrong token for Insert Dir Into DirPathBuf"
@@ -1280,7 +1297,7 @@ impl LibSqlExec for SqlStatement<'_> {
         );
         self.stmt.execute([id])?;
         Ok(())
-    }
+    } */
 
     fn insert_link(
         &mut self,
@@ -2066,9 +2083,6 @@ LIMIT 1;
             let tupf = RowType::TupF as u8;
             //stmt.execute([])?;
             // delete entries in modify list if they appear in delete list
-            let mut stmt =
-                self.prepare("DELETE from ModifyList where id in (SELECT id from DeleteList)")?;
-            stmt.execute([])?;
             // mark glob patterns as modified if any of its inputs are in the deletelist or modified list
             // note that glob patterns are mapped to Tupfiles in  NormalLink table
             // which will then trigger parsing of these tupfiles
@@ -2163,12 +2177,21 @@ FROM NodeChain;"
         stmt.execute([])?;
         Ok(())
     }
+    fn prune_modified_list_basic(&self) -> Result<()> {
+        let mut stmt =
+            self.prepare_cached("DELETE FROM ModifyList WHERE id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        Ok(())
+    }
 
     fn delete_nodes(&self) -> Result<()> {
+        let  rtype = RowType::Rule as u8;
         let mut stmt =
             self.prepare_cached("DELETE FROM Node WHERE id in (SELECT id from DeleteList)")?;
         stmt.execute([])?;
         let mut stmt = self.prepare_cached("DELETE from NormalLink where from_id in (SELECT id from DeleteList) or to_id in (SELECT id from DeleteList)")?;
+        stmt.execute([])?;
+        let mut stmt = self.prepare_cached("DELETE from DeleteList")?;
         stmt.execute([])?;
         Ok(())
     }

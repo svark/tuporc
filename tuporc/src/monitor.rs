@@ -221,7 +221,6 @@ fn run_monitor(
                 &path,
                 &mut node_statements,
                 &mut add_ids_statements,
-                true,
                 RowType::File,
             )?;
         } else {
