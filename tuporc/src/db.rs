@@ -2109,8 +2109,23 @@ AND EXISTS (
 
             // remove rules in tupfile that was deleted.
             let mut stmt = self.prepare(&*format!(
-                "INSERT or IGNORE into DeleteList SELECT id, {rtype} from Node where type = {rtype} and id in \
+                "INSERT or IGNORE into DeleteList SELECT id, type from Node where type = {rtype} and id in \
                 (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {tupf} ) )")
+            )?;
+            stmt.execute([])?;
+
+            // remove outputs of rules in tupfile that was deleted.
+            let mut stmt = self.prepare(&*format!(
+                "INSERT or IGNORE into DeleteList SELECT id, type from Node where type = {gentype} and id in \
+                (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList where type = {rtype} ) )")
+            )?;
+
+            stmt.execute([])?;
+
+            // remove glob nodes whose origin in one of the deleted tupfiles
+            let mut stmt = self.prepare(&*format!(
+                "INSERT or IGNORE into DeleteList SELECT id, type from Node where type = {globtype} and srcid in \
+                (SELECT id from DeleteList where type = {rtype} ) ")
             )?;
             stmt.execute([])?;
 
@@ -2185,7 +2200,7 @@ FROM NodeChain;"
     }
 
     fn delete_nodes(&self) -> Result<()> {
-        let  rtype = RowType::Rule as u8;
+        //let  rtype = RowType::Rule as u8;
         let mut stmt =
             self.prepare_cached("DELETE FROM Node WHERE id in (SELECT id from DeleteList)")?;
         stmt.execute([])?;
