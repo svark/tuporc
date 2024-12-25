@@ -58,6 +58,12 @@ VALUES ('File', 0),
        ('Glob', 9);
 
 
+CREATE TABLE NODESHA256
+(
+    id INTEGER PRIMARY KEY  not null UNIQUE,
+    hash CHAR(256) not null
+)
+
 -- create a table containing a live list of files monitored under a root directory based on presence of keyword in the file
 CREATE TABLE MONITORED_FILES
 (
