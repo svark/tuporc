@@ -13,7 +13,7 @@ use std::path::Component::Normal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tupparser::buffers::{BufferObjects, EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers, PathDescriptor, RuleDescriptor, TaskDescriptor, TupPathDescriptor};
+use tupparser::buffers::{EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers, PathDescriptor, RuleDescriptor, TaskDescriptor, TupPathDescriptor};
 use tupparser::decode::{OutputHandler, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath};
