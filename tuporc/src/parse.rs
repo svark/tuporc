@@ -90,6 +90,13 @@ impl NodeToInsert {
         }
     }
 
+    fn get_input_file(&self) -> Option<PathDescriptor> {
+        match self {
+            NodeToInsert::InputFile(p) => Some(p.clone()),
+            _ => None
+        }
+    }
+
     pub fn get_id(&self) -> i64 {
         match self {
             NodeToInsert::Rule(r) => r.to_u64() as i64,
@@ -173,6 +180,14 @@ impl NodeToInsert {
         }
     }
 
+    pub fn compute_node_sha(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> Option<String> {
+        self.get_input_file().and_then(|p| {
+            let path = read_write_buffer_objects.get_path(&p);
+            let sha = tupparser::transform::compute_sha256(&path).ok();
+            log::debug!("sha for {:?} is {:?}", path, sha);
+            sha
+        })
+    }
     // use this only in the order of nodes returned by the parser
     // for example when inserting nodes in the database, rules should be inserted first before outputs.
     // that way the srcid of outputs can be resolved via crossref
@@ -582,59 +597,37 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     root: P,
     term_progress: &TermProgress,
 ) -> Result<()> {
-    let mut crossref = CrossRefMaps::default();
-    let (resolved_rules, rwbufs, outs) = {
-        let conn = connection;
+    let conn = connection;
 
-        let db = DbPathSearcher::new(conn, root.as_ref());
-        let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
-        let mut visited = BTreeSet::new();
+    let db = DbPathSearcher::new(conn, root.as_ref());
+    let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
+    let mut visited = BTreeSet::new();
+    {
+        let dbref = parser.get_mut_searcher();
+        let mut conn = dbref.conn.deref().lock();
+        let tx = conn.transaction()?;
         {
-            let dbref = parser.get_mut_searcher();
-            let mut conn = dbref.conn.deref().lock();
-            let tx = conn.transaction()?;
-            {
-                let mut del_normal_link = tx.delete_tup_rule_links_prepare()?;
-                let mut s = tx.fetch_rules_nodes_prepare_by_dirid()?;
-                let mut del_outputs = tx.mark_outputs_deleted_prepare()?;
-                //let mut fetch_rule_deps = tx.get_rule_deps_tupfiles_prepare()?;
-                let mut tupfile_to_process = VecDeque::from(tupfiles);
-                while let Some(tupfile) = tupfile_to_process.pop_front() {
-                    let dir = tupfile.get_dir();
-                    if visited.insert(tupfile) {
-                        let rules = s.fetch_rule_nodes_by_dirid(dir)?;
-                        for r in rules {
-                            del_normal_link.delete_normal_rule_links(r.get_id())?;
-                            del_outputs.mark_rule_outputs_deleted(r.get_id())?;
-                        }
+            let mut del_normal_link = tx.delete_tup_rule_links_prepare()?;
+            let mut s = tx.fetch_rules_nodes_prepare_by_dirid()?;
+            let mut del_outputs = tx.mark_outputs_deleted_prepare()?;
+            //let mut fetch_rule_deps = tx.get_rule_deps_tupfiles_prepare()?;
+            let mut tupfile_to_process = VecDeque::from(tupfiles);
+            while let Some(tupfile) = tupfile_to_process.pop_front() {
+                let dir = tupfile.get_dir();
+                if visited.insert(tupfile) {
+                    let rules = s.fetch_rule_nodes_by_dirid(dir)?;
+                    for r in rules {
+                        del_normal_link.delete_normal_rule_links(r.get_id())?;
+                        del_outputs.mark_rule_outputs_deleted(r.get_id())?;
                     }
-                    //pb.inc(1);
                 }
+                //pb.inc(1);
             }
-            tx.commit()?;
         }
-        let tupfiles: Vec<_> = visited.into_iter().collect();
-        let resolved_rules =
-            gather_rules_from_tupfiles(&mut parser, tupfiles.as_slice(), &term_progress)?;
-        let resolved_rules = parser.reresolve(resolved_rules)?;
-        for tup_node in tupfiles.iter() {
-            let tupid = parser
-                .read_write_buffers()
-                .add_tup_file(Path::new(tup_node.get_name()));
-            crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
-        }
-        (
-            resolved_rules,
-            parser.read_write_buffers(),
-            parser.get_outs().clone(),
-        )
-    };
-    let mut conn = Connection::open(".tup/db")
-        .expect("Connection to tup database in .tup/db could not be established");
-
-    let _ = insert_nodes(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
-    check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
-    let _ = insert_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
+        tx.commit()?;
+    }
+    let tupfiles: Vec<_> = visited.into_iter().collect();
+    parse_and_add_rules_to_db(&mut parser, tupfiles.as_slice(), &term_progress)?;
     Ok(())
 }
 
@@ -862,16 +855,22 @@ pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
     Ok(tupfiles)
 }
 
-fn gather_rules_from_tupfiles(
+fn parse_and_add_rules_to_db(
     p: &mut TupParser<DbPathSearcher>,
     tupfiles: &[Node],
     term_progress: &TermProgress,
-) -> Result<ResolvedRules> {
+) -> Result<()> {
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
-    let mut new_resolved_rules = ResolvedRules::new();
     let (sender, receiver) = crossbeam::channel::unbounded();
     term_progress.set_message("Parsing Tupfiles");
-    crossbeam::thread::scope(|s| -> Result<ResolvedRules> {
+    let mut crossref = CrossRefMaps::default();
+    for tup_node in tupfiles.iter() {
+        let tupid = p
+            .read_write_buffers()
+            .add_tup_file(Path::new(tup_node.get_name()));
+        crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
+    }
+    crossbeam::thread::scope(|s| -> Result<()> {
         let wg = WaitGroup::new();
         let poisoned = Arc::new(AtomicBool::new(false));
         let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
@@ -928,6 +927,23 @@ fn gather_rules_from_tupfiles(
         drop(sender);
 
         let pb = term_progress.get_main();
+        let mut conn = Connection::open(".tup/db")
+            .expect("Connection to tup database in .tup/db could not be established");
+        let rwbufs = p.read_write_buffers();
+        //let mut crossref = CrossRefMaps::default();
+        let outs = p.get_outs();
+        let mut insert_to_db = move |resolved_rules:ResolvedRules| -> Result<()>{
+            let _ = insert_nodes(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
+            check_uniqueness_of_parent_rule(&mut conn, &rwbufs, &outs, &mut crossref)?;
+            let _ = insert_links(&mut conn, &rwbufs, &resolved_rules, &mut crossref)?;
+            let (dbid, _) = crossref.get_tup_db_id(resolved_rules.get_tupid()).expect("tupfile dbid fetch failed");
+            conn.delete_parsed_tupfile_from_modified(dbid)?;
+            Ok(())
+        };
+        let mut insert_to_db_wrap_err = move |resolved_rules:ResolvedRules| -> Result<(), Error>{
+            insert_to_db(resolved_rules).map_err(|e| tupparser::errors::Error::CallBackError(e.to_string()))
+        };
+
         pb.set_message("Resolving statements..");
         for tupfile_lua in tupfiles
             .iter()
@@ -940,12 +956,13 @@ fn gather_rules_from_tupfiles(
                 term_progress.abandon(&pb, format!("Error parsing {path}"));
                 eyre!("Error: {}", p.read_write_buffers().display_str(e))
             })?;
-            new_resolved_rules.extend(resolved_rules);
+            //new_resolved_rules.push(resolved_rules);
+            insert_to_db_wrap_err(resolved_rules)?;
             term_progress.tick(&pb);
             pb.set_message(format!("Done parsing {}", path));
         }
         pb.set_message("Resolving statements..");
-        let resolved_rules = p.receive_resolved_statements(receiver).map_err(|error| {
+        p.receive_resolved_statements(receiver, insert_to_db_wrap_err).map_err(|error| {
             let read_write_buffers = p.read_write_buffers();
             let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor());
             let tup_node = tup_node.to_string();
@@ -957,14 +974,15 @@ fn gather_rules_from_tupfiles(
                 display_str,
             )
         })?;
-        new_resolved_rules.extend(resolved_rules);
+
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
         wg.wait();
         for join_handle in handles {
             join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
         }
-        Ok(new_resolved_rules)
+        Ok(())
+     //   Ok(new_resolved_rules)
     })
     .expect("Thread error while fetching resolved rules from tupfiles")
 }
@@ -1276,7 +1294,7 @@ fn insert_node_in_dir(node_statements: &mut NodeStatements, add_ids_statements: 
         crate::scan::prepare_node_at_path(dir, name, hashed_path, metadata, &rtype)
     {
         let in_node = node_at_path.get_prepared_node();
-        let node = find_upsert_node(node_statements, add_ids_statements, in_node)?;
+        let node = find_upsert_node(node_statements, add_ids_statements, in_node, path)?;
         Ok((node.get_id(), dir))
     } else {
         log::warn!("Error while inserting path: {:?}", path);
@@ -1322,6 +1340,7 @@ fn split_path(path: &Path) -> (Cow<Path>, Cow<'_, str>) {
 struct Collector {
     processed_globs: HashSet<PathDescriptor>,
     processed: HashSet<PathDescriptor>,
+    processed_groups: HashSet<GroupPathDescriptor>,
     processed_outputs: HashSet<PathDescriptor>,
     nodes_to_insert: Vec<NodeToInsert>,
     unique_rule_check: HashMap<String, u32>,
@@ -1410,7 +1429,9 @@ pub struct NodeStatements<'a> {
     update_flags: SqlStatement<'a>,
     update_srcid: SqlStatement<'a>,
     update_type: SqlStatement<'a>,
+    fetch_node_sha: SqlStatement<'a>,
 }
+
 /*pub struct BufStatements<'a> {
     add_to_dirpathbuf: SqlStatement<'a>,
     add_to_tuppathbuf: SqlStatement<'a>,
@@ -1429,6 +1450,7 @@ impl Collector {
         Ok(Collector {
             processed_globs: HashSet::new(),
             processed: HashSet::new(),
+            processed_groups: Default::default(),
             processed_outputs: Default::default(),
             nodes_to_insert: Vec::new(),
             processed_envs: HashSet::new(),
@@ -1503,6 +1525,11 @@ impl Collector {
         if let Some(p) = resolved_input.get_resolved_path_desc() {
             if self.processed.insert(p.clone()) {
                 self.collect_input(&p)?;
+            }
+        }
+        if let Some(g) = resolved_input.get_group_inputs() {
+            if self.processed_groups.insert(g.clone()) {
+                self.nodes_to_insert.push(NodeToInsert::Group(g.clone()));
             }
         }
         Ok(())
@@ -1584,6 +1611,7 @@ impl Collector {
     }
 }
 
+// nodes to insert after rules have been resolved
 fn insert_nodes(
     conn: &mut Connection,
     read_write_buf: &ReadWriteBufferObjects,
@@ -1651,6 +1679,7 @@ fn insert_nodes(
         }
         collector.nodes()
     };
+    // sort nodes by type and then by path for better performance (as parent directories are inserted first)
     nodes.sort_by(|a, b| {
         if a.get_type().eq(&b.get_type()) {
             a.get_path(&read_write_buf)
@@ -1663,7 +1692,6 @@ fn insert_nodes(
     let tx = conn.transaction()?;
     {
         let mut node_statements = NodeStatements::new(tx.deref())?;
-        //let mut buf_statements = BufStatements::new(tx.deref())?;
         let mut add_ids_statements = AddIdsStatements::new(tx.deref())?;
         let parent_descriptors = nodes
             .iter()
@@ -1683,15 +1711,24 @@ fn insert_nodes(
             }
         }
         for node_to_insert in &nodes {
+            log::info!("inserting node: {:?}", node_to_insert);
             let node = node_to_insert.get_node(&read_write_buf, crossref)?;
+            let path  = node_to_insert.get_path(&read_write_buf);
             let (db_id, db_par_id) = {
                 let upsnode =
-                    find_upsert_node(&mut node_statements, &mut add_ids_statements, &node)?;
+                    find_upsert_node(&mut node_statements, &mut add_ids_statements, &node, &Path::new(&path))?;
                 (upsnode.get_id(), upsnode.get_dir())
             };
             if !db_id.is_negative() {
                 nodeids.insert((db_id, *node.get_type()));
                 node_to_insert.update_crossref(crossref, db_id, db_par_id);
+                if let Some(sha) = node_to_insert.compute_node_sha(read_write_buf) {
+                    if !node_statements.fetch_sha(db_id).unwrap_or_default().eq(&sha) {
+                        tx.upsert_node_sha(db_id, &sha)?;
+                    }
+                }
+            }else {
+                log::warn!("Failed to insert node: {:?}", node);
             }
         }
         let mut inst_env_stmt = tx.insert_env_prepare()?;
@@ -1777,6 +1814,7 @@ impl NodeStatements<'_> {
         //let find_dir_id_with_par = conn.fetch_dirid_with_par_prepare()?;
         //let find_nodeid = conn.fetch_nodeid_prepare()?;
         let update_type = conn.update_type_prepare()?;
+        let fetch_node_sha = conn.fetch_node_sha_prepare()?;
 
         Ok(NodeStatements {
             insert_node,
@@ -1787,6 +1825,7 @@ impl NodeStatements<'_> {
             update_srcid,
          //   find_dir_id_with_par,
             update_type,
+            fetch_node_sha,
         })
     }
     fn insert_node_exec(&mut self, n: &Node) -> crate::db::Result<i64> {
@@ -1814,6 +1853,10 @@ impl NodeStatements<'_> {
         self.update_srcid.update_srcid_exec(nodeid, srcid)
     }
 
+     fn fetch_sha(&mut self, id: i64) -> Option<String> {
+         let sha_existing = self.fetch_node_sha.fetch_node_sha_exec(id).ok();
+         sha_existing
+     }
     /* #[allow(dead_code)]
     fn fetch_node_id(&mut self, name: &str, dirid: i64) -> crate::db::Result<i64> {
         self.find_nodeid.fetch_node_id(name, dirid)
@@ -1847,10 +1890,11 @@ impl AddIdsStatements<'_> {
 
 /// [find_upsert_node] pretends to be the sqlite upsert operation
 /// it also adds the node to the present list, modify list and updates nodes mtime
-pub(crate) fn find_upsert_node(
+pub(crate) fn find_upsert_node<P: AsRef<Path>>(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
     node: &Node,
+    node_path: P
 ) -> Result<Node> {
     /*debug!(
         "find_upsert_node:{} in dir:{}",
@@ -1860,7 +1904,7 @@ pub(crate) fn find_upsert_node(
     let db_node = node_statements
         .fetch_node(node.get_name(), node.get_dir())
         .and_then(|existing_node| {
-            update_columns(node_statements, add_ids_statements, node, &existing_node)?;
+            update_columns(node_statements, add_ids_statements, node, node_path, &existing_node)?;
             Ok(existing_node)
         })
         .or_else(|e| {
@@ -1879,10 +1923,11 @@ pub(crate) fn find_upsert_node(
 }
 
 /// Update the columns of the node table with newer values
-fn update_columns(
+fn update_columns<P: AsRef<Path>>(
     node_statements: &mut NodeStatements,
     add_ids_statements: &mut AddIdsStatements,
     node: &Node,
+    path: P,
     existing_node: &Node,
 ) -> Result<(), AnyError> {
     let mut modify = false;
@@ -1912,7 +1957,16 @@ fn update_columns(
             node.get_mtime()
         );
         node_statements.update_mtime_exec(existing_node.get_id(), node.get_mtime())?;
+        let sha =|| tupparser::transform::compute_sha256(path.as_ref()).unwrap_or_default();
         modify = true;
+        if let Some(existing_sha) =  node_statements.fetch_sha(existing_node.get_id()) {
+            if sha().eq(&existing_sha) {
+                modify = false;
+                debug!("sha matches for:{}, {}", existing_node.get_id(),  existing_node.get_name());
+            }else {
+                debug!("sha mismatch for:{}, {}", existing_node.get_id(), existing_node.get_name());
+            }
+        }
     }
     if existing_node.get_display_str() != node.get_display_str() {
         debug!(

@@ -165,8 +165,6 @@ pub struct Node {
     srcid: i64,
 }
 
-impl Node {}
-
 impl PartialEq<Self> for Node {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -399,6 +397,7 @@ pub(crate) enum StatementType {
     RestoreDeleted,
     #[allow(dead_code)]
     FetchIO,
+    FetchNodeSha,
     #[allow(dead_code)]
     FetchEnvsForRule,
     #[allow(dead_code)]
@@ -467,6 +466,7 @@ pub(crate) trait LibSqlPrepare {
     fn find_node_by_path_prepare(&self) -> Result<SqlStatement>;
     fn update_mtime_prepare(&self) -> Result<SqlStatement>;
     fn update_type_prepare(&self) -> Result<SqlStatement>;
+    fn fetch_node_sha_prepare(&self) -> Result<SqlStatement>;
     #[allow(dead_code)]
     fn update_dirid_prepare(&self) -> Result<SqlStatement>;
     fn update_display_str_prepare(&self) -> Result<SqlStatement>;
@@ -621,6 +621,8 @@ pub(crate) trait LibSqlExec {
     fn remove_monitored_by_path<P: AsRef<Path>>(&mut self, generation_id: i64) -> Result<()>;
     #[allow(dead_code)]
     fn remove_monitored_by_generation_id(&mut self, generation_id: i64) -> Result<()>;
+
+    fn fetch_node_sha_exec(&mut self, node_id: i64) -> Result<String>;
 }
 pub(crate) trait MiscStatements {
     /// Populate deletelist (DeleteList = ids of type file/dir Node  - ids in PresentList)
@@ -645,6 +647,9 @@ pub(crate) trait MiscStatements {
     fn write_message(&self, message: &str) -> Result<()>;
     #[allow(dead_code)]
     fn read_message(&self, last_id: i64) -> Result<String>;
+    fn delete_parsed_tupfile_from_modified(&self, tup_id: i64) -> Result<()>;
+    fn upsert_node_sha(&self, node_id: i64, sha: &str) -> Result<()>;
+
 }
 pub(crate) trait ForEachClauses {
     #[allow(dead_code)]
@@ -1018,6 +1023,14 @@ impl LibSqlPrepare for Connection {
         Ok(SqlStatement {
             stmt,
             tok: UpdateType,
+        })
+    }
+
+   fn fetch_node_sha_prepare(&self) -> Result<SqlStatement> {
+        let stmt = self.prepare("SELECT sha from NodeSha where id = ?")?;
+        Ok(SqlStatement {
+            stmt,
+            tok: FetchNodeSha,
         })
     }
 
@@ -1689,6 +1702,12 @@ impl LibSqlExec for SqlStatement<'_> {
         self.stmt.execute((id,)).unwrap();
         Ok(())
     }
+
+    fn fetch_node_sha_exec(&mut self, node_id: i64) -> Result<String> {
+        assert_eq!(self.tok, FetchNodeSha, "wrong token for fetch node sha");
+        let sha: String = self.stmt.query_row([node_id], |r| r.get(0))?;
+        Ok(sha)
+    }
 }
 
 pub(crate) fn db_path_str<P: AsRef<Path>>(p: P) -> String {
@@ -2014,6 +2033,11 @@ impl ForEachClauses for Connection {
 }
 
 impl MiscStatements for Connection {
+    fn delete_parsed_tupfile_from_modified(&self, tup_id: i64) -> Result<()> {
+        let mut stmt = self.prepare("DELETE from ModifyList where id = ?")?;
+        stmt.execute([tup_id])?;
+        Ok(())
+    }
     fn populate_delete_list(&self) -> Result<()> {
         let ftype = RowType::File as u8;
         let dtype = RowType::Dir as u8;
@@ -2239,6 +2263,14 @@ FROM NodeChain;"
                 }
             })
     }
+
+    fn upsert_node_sha(&self, node_id: i64, sha: &str) -> Result<()> {
+        let mut stmt = self.prepare_cached("INSERT INTO NODESHA (id, sha) VALUES (?, ?) \
+   ON CONFLICT(id) DO UPDATE SET sha = excluded.sha")?;
+        stmt.execute(( node_id, sha ))?;
+        Ok(())
+    }
+
 }
 
 fn make_tup_node(row: &Row) -> rusqlite::Result<Node> {

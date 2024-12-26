@@ -30,6 +30,7 @@ use crate::{db, is_tupfile, parse, TermProgress};
 const MAX_THRS_NODES: u8 = 6;
 pub const MAX_THRS_DIRS: usize = 22;
 
+static TUP_CONFIG: &str = "tup.config";
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
 pub(crate) fn scan_root(
     root: &Path,
@@ -338,13 +339,14 @@ fn insert_direntries(
             &mut node_statements,
             &mut add_ids_statements,
             &root_node.get_prepared_node(),
+            "."
         )?;
 
-        let mt = std::fs::metadata(root.join("tup.config")).ok();
+        let mt = std::fs::metadata(root.join("TUP_CONFIG")).ok();
         let tup_config_node = prepare_node_at_path(
             inserted.get_id(),
-            "tup.config",
-            HashedPath::from(root.join("tup.config")),
+            TUP_CONFIG,
+            HashedPath::from(root.join(TUP_CONFIG)),
             mt,
             &RowType::File,
         )
@@ -353,6 +355,7 @@ fn insert_direntries(
             &mut node_statements,
             &mut add_ids_statements,
             &tup_config_node.get_prepared_node(),
+            TUP_CONFIG
         )?;
     }
 
@@ -591,7 +594,7 @@ fn add_modify_nodes(
         let now = SystemTime::now();
         for node_at_path in nodereceiver.iter() {
             let node = node_at_path.get_prepared_node();
-            let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node)?;
+            let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node, node_at_path.pbuf.as_ref())?;
             if node.get_type() == &Dir {
                 let id = inserted.get_id();
                 dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;
