@@ -1711,7 +1711,7 @@ fn insert_nodes(
             }
         }
         for node_to_insert in &nodes {
-            log::info!("inserting node: {:?}", node_to_insert);
+            log::debug!("inserting node: {:?}", node_to_insert);
             let node = node_to_insert.get_node(&read_write_buf, crossref)?;
             let path  = node_to_insert.get_path(&read_write_buf);
             let (db_id, db_par_id) = {

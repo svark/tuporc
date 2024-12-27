@@ -1434,7 +1434,8 @@ impl LibSqlExec for SqlStatement<'_> {
         assert_eq!(self.tok, FindGlobNodes, "wrong token for fetch glob nodes");
         let mut path_str = db_path_str(base_path);
         if recursive {
-            path_str.push('*')
+            path_str.push('*');
+            log::info!("recursive glob:{:?}", path_str);
         }
         //debug!("query glob:{:?}", gname.as_ref());
         let mut rows = self
