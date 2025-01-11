@@ -6,13 +6,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::hash::{BuildHasher, Hash, Hasher};
 //use std::io::Error as IOError;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
+use crate::{is_tupfile, TermProgress};
 use crossbeam::channel::{never, tick, Receiver, Sender};
 use crossbeam::select;
 use crossbeam::sync::WaitGroup;
@@ -20,12 +20,12 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use rusqlite::Connection;
+use tupdb::db::{Node, RowType};
+use tupdb::inserts::LibSqlInserts;
+use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
-
-use crate::db::RowType::{Dir, TupF};
-use crate::db::{MiscStatements, Node, RowType};
-use crate::parse::find_upsert_node;
-use crate::{db, is_tupfile, parse, TermProgress};
+use tupdb::deletes::LibSqlDeletes;
+use crate::parse::compute_path_hash;
 
 const MAX_THRS_NODES: u8 = 6;
 pub const MAX_THRS_DIRS: usize = 22;
@@ -57,8 +57,7 @@ struct DirE {
     hashed_path: Option<HashedPath>, // this is an option to enable taking ownership of the path
 }
 
-impl DirE {
-}
+impl DirE {}
 
 impl DirE {
     fn from(de: DirEntry) -> DirE {
@@ -327,19 +326,18 @@ fn insert_direntries(
     running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
     log::debug!("Inserting/updating directory entries to db");
-    db::create_temptables(conn)?;
+    tupdb::db::create_temptables(conn)?;
     {
-        let mut node_statements = parse::NodeStatements::new(conn)?;
-        let mut add_ids_statements = parse::AddIdsStatements::new(conn)?;
         let mt = std::fs::metadata(root).ok();
         let root_node =
-            prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt, &Dir)
+            prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt, &RowType::Dir)
                 .expect("Unable to prepare root node for insertion");
-        let inserted = find_upsert_node(
-            &mut node_statements,
-            &mut add_ids_statements,
+
+        let compute_root_sha = || compute_dir_sha256(root).ok();
+
+        let inserted = conn.upsert_node(
             &root_node.get_prepared_node(),
-            "."
+            || compute_root_sha().unwrap_or_default(),
         )?;
 
         let mt = std::fs::metadata(root.join("TUP_CONFIG")).ok();
@@ -348,15 +346,12 @@ fn insert_direntries(
             TUP_CONFIG,
             HashedPath::from(root.join(TUP_CONFIG)),
             mt,
-            &RowType::File,
+            &File,
         )
         .expect("Unable to prepare tup.config node for insertion");
-        let _ = find_upsert_node(
-            &mut node_statements,
-            &mut add_ids_statements,
-            &tup_config_node.get_prepared_node(),
-            TUP_CONFIG
-        )?;
+        let pathbuf = root.join(TUP_CONFIG);
+        let tup_config_sha =  || compute_sha256(pathbuf.clone()).unwrap_or_default();
+        let _ = conn.upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
     }
 
     let pb = term_progress.pb_main.clone();
@@ -479,9 +474,9 @@ fn insert_direntries(
                             let metadata = p.take_metadata();
                             let file_name = p.get_file_name().to_string_lossy();
                             let rtype = if metadata.as_ref().map_or(false, |m| m.is_dir()) {
-                                Dir
+                                RowType::Dir
                             } else {
-                                if is_tupfile(file_name.as_ref()) { TupF } else { File }
+                                if is_tupfile(file_name.as_ref()) { RowType::TupF } else { File }
                             };
                             let node_at_path =
                                 prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype);
@@ -586,16 +581,21 @@ fn add_modify_nodes(
     dirid_sender: Sender<(HashedPath, i64)>,
     progressbar: &ProgressBar,
 ) -> eyre::Result<()> {
+    //let bo = BufferObjects::new(conn.path().map(|s| s.to_string()).unwrap_or_default());
     let tx = conn.transaction()?;
     {
-        let mut node_statements = parse::NodeStatements::new(tx.deref())?;
-        let mut add_ids_statements = parse::AddIdsStatements::new(tx.deref())?;
         let mut cnt = 0;
         let now = SystemTime::now();
         for node_at_path in nodereceiver.iter() {
             let node = node_at_path.get_prepared_node();
-            let inserted = find_upsert_node(&mut node_statements, &mut add_ids_statements, node, node_at_path.pbuf.as_ref())?;
-            if node.get_type() == &Dir {
+            let pbuf = node_at_path.get_hashed_path();
+            let is_dir = node.get_type() == &RowType::Dir;
+            let compute_node_sha = || compute_path_hash(is_dir, pbuf.clone());
+            let inserted = tx.upsert_node(
+                node,
+                compute_node_sha
+            )?;
+            if node.get_type() == &RowType::Dir {
                 let id = inserted.get_id();
                 dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;
             }
@@ -605,13 +605,10 @@ fn add_modify_nodes(
         log::debug!(
             "added/modified {} nodes in {} secs",
             cnt,
-            now.elapsed().unwrap().as_secs()
+            now.elapsed()?.as_secs()
         );
     }
-    tx.populate_delete_list()?;
-    tx.enrich_modified_list_with_outside_mods()?;
-    tx.prune_modified_list_basic()?;
-    tx.enrich_modified_list()?;
+    tx.add_not_present_to_delete_list()?;
     tx.delete_nodes()?;
     tx.commit()?;
 

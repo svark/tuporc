@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
+use tupdb::db::{RowType};
+use crate::parse::{CrossRefMaps};
+use crate::scan::scan_root;
+use crate::TermProgress;
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
 use fs2::FileExt;
@@ -16,11 +20,9 @@ use notify::{
     event, Config, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
 };
 use rusqlite::Connection;
-
-use crate::db::{LibSqlExec, LibSqlPrepare, RowType};
-use crate::parse::{AddIdsStatements, NodeStatements};
-use crate::scan::scan_root;
-use crate::TermProgress;
+use tupdb::inserts::LibSqlInserts;
+use tupdb::queries::LibSqlQueries;
+use tupparser::buffers::{BufferObjects, PathBuffers};
 
 pub(crate) struct WatchObject {
     root: PathBuf,
@@ -198,7 +200,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
 fn run_monitor(
     path_receiver: Receiver<(PathBuf, i32)>,
     root: PathBuf,
-    conn: &mut Connection,
+    conn: &Connection,
     term_progress: TermProgress,
     stop_receiver: Receiver<()>,
     mut generation_id: i64,
@@ -207,30 +209,28 @@ fn run_monitor(
 ) -> Result<()> {
     let current_id: i64 = 0;
     let mut build_in_progess = false;
-    let mut fetch_monitored_files = conn.fetch_monitored_prepare()?;
     pb_main.println("Full scan complete");
     let pb = term_progress.pb_main.clone();
     let pb = pb.with_message("Monitoring filesystem for changes");
-    crate::db::create_path_buf_temptable(&conn)?;
-    let mut node_statements = NodeStatements::new(&conn)?;
-    let mut add_ids_statements = AddIdsStatements::new(&conn)?;
-    let mut insert_monitored_prepare = conn.insert_monitored_prepare()?;
+    tupdb::db::create_path_buf_temptable(conn)?;
+    let bo = BufferObjects::new(root);
+    let mut cross_ref_maps = CrossRefMaps::default();
     let mut update_nodes = |path: &Path, added: bool| -> Result<()> {
         if added {
+            let pd = bo
+                .add_abs(path)
+                .expect("failed to add path to buffer objects");
             crate::parse::insert_path(
-                &path,
-                &mut node_statements,
-                &mut add_ids_statements,
+                conn,
+                &bo,
+                &pd,
+                &mut cross_ref_maps,
                 RowType::File,
             )?;
         } else {
-            crate::parse::remove_path(&path, &mut node_statements, &mut add_ids_statements)?;
+            crate::parse::remove_path(conn, &path)?;
         }
         Ok(())
-    };
-    let mut fetch_monitored = |generation_id: i64| -> Result<Vec<(String, bool)>> {
-        let monitored_files = fetch_monitored_files.fetch_monitored(generation_id)?;
-        Ok(monitored_files)
     };
     loop {
         sleep(Duration::from_secs(5));
@@ -242,14 +242,14 @@ fn run_monitor(
             poll_for_new_messages(conn, &term_progress, current_id, &pb)?
         };
         if end_watch {
-            watcher.unwatch(root.as_path())?;
+            watcher.unwatch(bo.get_root_dir())?;
             break;
         }
         let build_in_progess_new_stat =
             is_file_locked_for_write(".tup/build.lock").unwrap_or(false);
         if build_in_progess != build_in_progess_new_stat {
             if !build_in_progess_new_stat {
-                let monitored_files = fetch_monitored(generation_id)?;
+                let monitored_files = conn.fetch_monitored_files(generation_id)?;
                 conn.execute("DELETE from MONITORED_FILES", ())?;
                 for (path, added) in monitored_files {
                     update_nodes(&Path::new(path.as_str()), added)?;
@@ -260,8 +260,7 @@ fn run_monitor(
         }
         while let Ok((path, added)) = path_receiver.try_recv() {
             if build_in_progess_new_stat {
-                insert_monitored_prepare
-                    .insert_monitored(path, generation_id, added)
+                conn.insert_monitored(path.as_path().to_string_lossy().as_ref(), generation_id, added as _)
                     .expect("failed to add monitored file to db");
             } else {
                 update_nodes(&path, added == 1)?;
@@ -289,7 +288,7 @@ fn poll_for_new_messages(
         }
     }
     if !latest_ids.is_empty() {
-        conn.execute("DELETE from messages", ()).unwrap();
+        conn.execute("DELETE from messages", ())?;
     }
     Ok(end_watch)
 }

@@ -1,0 +1,11 @@
+[package]
+name = "tupdb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+include-sqlite-sql = "0.2.1"
+pathdiff = "0.2.3"
+log = "0.4.22"
+sha2 = "0.10.8"

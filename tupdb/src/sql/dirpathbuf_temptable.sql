@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS Node
 CREATE TABLE IF NOT EXISTS NodeType
 (
     id   INTEGER PRIMARY KEY not NULL,
-    type CHAR(4)
+    type CHAR(8),
+    class VARCHAR(16)
 );
 
 DROP TABLE IF EXISTS DIRPATHBUF;
@@ -23,25 +24,30 @@ CREATE TABLE DIRPATHBUF AS
 WITH RECURSIVE full_path(id, dir, name) AS
                    (VALUES (1, 0, '.')
                     UNION ALL
-                    SELECT node.id id, node.dir dir, full_path.name || '/' || node.name name
+                    SELECT node.id as id, node.dir as dir, full_path.name || '/' || node.name as name
                     FROM node
                              JOIN full_path ON node.dir = full_path.id
-                    where node.type = (SELECT id from NodeType N where N.type LIKE 'Dir%'))
+                    where node.type = (SELECT N.type_index from NodeType N where N.type LIKE 'Dir%'))
 SELECT id, dir, name
 from full_path;
+
+CREATE INDEX DIRPATHBUF  On DIRPATHBUF(name);
+CREATE INDEX DIRPATHBUF  On DIRPATHBUF(id);
+
 DROP TABLE IF EXISTS GRPPATHBUF;
 CREATE TABLE GRPPATHBUF AS
-SELECT node.id id, DIRPATHBUF.name || '/' || node.name Name
+SELECT node.id as id, DIRPATHBUF.name || '/' || node.name as Name
 from node
          inner join DIRPATHBUF on
-    (node.dir = DIRPATHBUF.id and node.type = (SELECT id from NodeType N where N.type = 'Grp'));
+    (node.dir = DIRPATHBUF.id and node.type = (SELECT N.type_index from NodeType N where N.type = 'Group'));
 
 DROP TABLE IF EXISTS TUPPATHBUF;
 CREATE TABLE TUPPATHBUF AS
-SELECT node.id id, node.dir dir, node.mtime_ns mtime_ns, DIRPATHBUF.name || '/' || node.name name
+SELECT node.id as id, node.dir as dir, node.mtime_ns as mtime_ns, DIRPATHBUF.name || '/' || node.name as name
 from Node
          inner join DIRPATHBUF ON
-    (NODE.dir = DIRPATHBUF.id and node.type = (SELECT id from NodeType N where N.type = 'TupF'));
+    (NODE.dir = DIRPATHBUF.id and node.type = (SELECT N.type_index from NodeType N where N.type = 'TupF'));
+
 
 DROP TABLE IF EXISTS PresentList;
 CREATE TABLE PresentList
@@ -49,14 +55,10 @@ CREATE TABLE PresentList
     id   INTEGER PRIMARY KEY not NULL,
     type INTEGER
 );
-Create Table IF NOT EXISTS ModifyList
+Create Table IF NOT EXISTS ChangeList
 (
     id   INTEGER PRIMARY KEY not NULL,
-    type INTEGER
-);
-Create Table IF NOT EXISTS DeleteList
-(
-    id   INTEGER PRIMARY KEY not NULL,
-    type INTEGER
+    type INTEGER,
+    change_type INTEGER
 );
 

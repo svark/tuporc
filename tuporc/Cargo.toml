@@ -7,7 +7,7 @@ license = "Apache 2.0"
 
 
 [dependencies]
-clap = { version = "4.5.23", features = ["derive"] }
+clap = { version = "4.5.26", features = ["derive"] }
 incremental-topo = "0.2.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tupparser = { path = "../tuprs" }
@@ -15,7 +15,7 @@ walkdir = "2.5.0"
 eyre = "0.6.12"
 bimap = "0.6.3"
 crossbeam = "0.8.4"
-env_logger = "0.11.5"
+env_logger = "0.11.6"
 log = "0.4.22"
 execute = "0.2.13"
 parking_lot = "0.12.3"
@@ -23,14 +23,14 @@ pathdiff = "0.2.3"
 ctrlc = "3.4.5"
 num_cpus = "1.16.0"
 tupetw = { path = "../tupetw" }
+tupdb = { path = "../tupdb" }
 regex = "1.11.1"
 indicatif = "0.17.9"
-console = "0.15.8"
+console = "0.15.10"
 notify = { version = "7.0.0", features = ["crossbeam-channel"] }
-lazy_static = { version = "1.5.0", features = [] }
 fs2 = "0.4.3"
 ignore = "0.4.23"
-
+scopeguard = "1.2.0"
 [profile.release]
 lto = true
 
