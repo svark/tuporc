@@ -18,17 +18,18 @@ use log::debug;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use rusqlite::Connection;
-
+use tupdb::db::{Node};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::TupPathDescriptor;
 use tupparser::decode::{decode_group_captures, TupLoc};
 use tupparser::statements::Loc;
 
-use crate::db::RowType::Excluded;
-use crate::db::{
-    AnyError, ConnWrapper, ForEachClauses, LibSqlExec, LibSqlPrepare, MiscStatements, Node,
-    RowType, SqlStatement,
-};
+use tupdb::db::RowType::Excluded;
+use tupdb::db::RowType;
+use tupdb::error::{AnyError, DbResult};
+use tupdb::inserts::LibSqlInserts;
+use tupdb::queries::LibSqlQueries;
+use crate::parse::ConnWrapper;
 use crate::TermProgress;
 
 #[derive(Debug, Clone)]
@@ -115,7 +116,7 @@ pub(crate) fn execute_targets(
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
     let conn_wrapper = ConnWrapper::new(&conn);
-    let f = |node: &Node| -> std::result::Result<Node, AnyError> {
+    let f = |node: Node| -> DbResult<Node> {
         let rule_id = node.get_id();
         let rule_ref = TupLoc::new(
             &TupPathDescriptor::default(),
@@ -139,7 +140,8 @@ pub(crate) fn execute_targets(
             node.get_srcid() as _,
         ))
     };
-    let rule_nodes = conn.rules_to_run_no_target(f)?;
+    let rule_nodes = conn.fetch_rules_to_run()?;
+    let rule_nodes = rule_nodes.into_iter().map(f).collect::<DbResult<Vec<Node>>>()?;
     if rule_nodes.is_empty() {
         println!("Nothing to do");
         return Ok(());
@@ -294,7 +296,7 @@ impl ProcReceivers {
         if self.end_completed_child_ids && index_child_ids != usize::MAX {
             return true;
         }
-        return false;
+        false
     }
     fn process_sel<'a>(
         &'a mut self,
@@ -353,22 +355,20 @@ fn get_target_ids(conn: &Connection, root: &Path, targets: &Vec<String>) -> Resu
         "Could not get relative path for:{:?}",
         dirc.as_path()
     )))?;
-    let mut fd = conn.fetch_dirid_prepare()?;
-    let mut fnode_stmt = conn.fetch_nodeid_prepare()?;
     let mut dirids = Vec::new();
     for t in targets {
         let path = dir.join(t.as_str());
-        if let Ok(id) = fd.fetch_dirid(dir.join(&targets[0])) {
+        if let Ok(id) = conn.fetch_dir_from_path(dir.join(&targets[0])) {
             dirids.push(id);
         } else {
             // get the parent dir id and fetch the node by its name
             let parent = path
                 .parent()
                 .ok_or(eyre!(format!("Could not get parent for:{:?}", path)))?;
-            if let Some(parent_id) = fd.fetch_dirid(parent).ok() {
-                if let Ok(nodeid) = fnode_stmt.fetch_node_id(
-                    &*path.file_name().unwrap().to_string_lossy().to_string(),
+            if let Some(parent_id) = conn.fetch_dir_from_path(parent).ok() {
+                if let Ok(nodeid) = conn.fetch_node_id_by_dir_and_name(
                     parent_id,
+                    &*path.file_name().unwrap().to_string_lossy().to_string(),
                 ) {
                     dirids.push(nodeid);
                 } else {
@@ -474,9 +474,8 @@ fn exec_rules_to_run(
     });
     let mut dirpaths = Vec::new();
     {
-        let mut dirpath = conn.fetch_node_path_prepare()?;
         for r in valid_rules.iter() {
-            let path = dirpath.fetch_node_dir_path(r.get_dir())?;
+            let path = conn.fetch_dirpath(r.get_dir())?;
             dirpaths.push(path);
         }
     }
@@ -500,10 +499,10 @@ fn exec_rules_to_run(
                 {
                     eprintln!("Error while listening to processes: {}", e);
                     poisoned.force_poisoned();
-                    conn.prune_modified_list()?;
+                    //conn.prune_modified_list()?;
                     return Err(e);
                 }
-                conn.prune_modified_list()?;
+                //conn.prune_modified_list()?;
                 Ok(())
             });
         }
@@ -665,17 +664,11 @@ fn wait_for_children(
 }
 
 struct ProcessIOChecker<'a> {
-    input_getter: SqlStatement<'a>,
-    output_getter: SqlStatement<'a>,
-    fetch_id_stmt: SqlStatement<'a>,
-    fetch_dirid_stmt: SqlStatement<'a>,
-    add_link_stmt: SqlStatement<'a>,
-    rule_succeeded_stmt: SqlStatement<'a>,
+  conn: &'a Connection
 }
 
 struct IoConn<'b> {
-    fetch_io_statement: SqlStatement<'b>,
-    insert_trace_statement: SqlStatement<'b>,
+    conn: &'b Connection
 }
 
 struct RulesToVerify {
@@ -703,47 +696,51 @@ impl RulesToVerify {
 impl<'a> ProcessIOChecker<'a> {
     fn new(conn: &'a mut Connection) -> Result<Self> {
         let s = Self {
-            input_getter: conn.fetch_inputs_for_rule_prepare()?,
-            output_getter: conn.fetch_outputs_for_rule_prepare()?,
-            fetch_id_stmt: conn.fetch_nodeid_prepare()?,
-            fetch_dirid_stmt: conn.fetch_dirid_prepare()?,
-            add_link_stmt: conn.insert_link_prepare()?,
-            rule_succeeded_stmt: conn.mark_rule_success_prepare()?,
+          conn
         };
         return Ok(s);
     }
 
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
-        let fetch_inputs = self.input_getter.fetch_inputs(rule_id)?;
-        Ok(fetch_inputs)
+        let mut nodes = Vec::new();
+        self.conn.for_each_rule_input(rule_id as _, |node| {
+            nodes.push(node);
+            Ok(())
+        })?;
+        Ok(nodes)
     }
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
-        let fetch_outputs = self.output_getter.fetch_outputs(rule_id)?;
-        Ok(fetch_outputs)
+        //let fetch_outputs = self.fetch_rule_outputs(rule_id)?;
+        let mut nodes = Vec::new();
+        self.conn.for_each_rule_output(rule_id as _, |node|{
+            nodes.push(node);
+            Ok(())
+        })?;
+        Ok(nodes)
     }
 
-    fn fetch_flags(&mut self, rule_id: i32) -> Result<Option<String>> {
-        let flags = self.output_getter.fetch_flags(rule_id)?;
+    fn fetch_flags(&mut self, rule_id: i32) -> Result<String> {
+        let flags = self.conn.fetch_flags(rule_id as _)?;
         Ok(flags)
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, node_path: P) -> Result<i64> {
-        let dirid = self.fetch_dirid_stmt.fetch_dirid(node_path)?;
+        let dirid = self.conn.fetch_dir_from_path(node_path)?;
         Ok(dirid)
     }
     fn fetch_node_id(&mut self, node_name: &str, dirid: i64) -> Result<i64> {
-        let nodeid = self.fetch_id_stmt.fetch_node_id(node_name, dirid)?;
+        let nodeid = self.conn.fetch_node_id_by_dir_and_name(dirid, node_name)?;
         Ok(nodeid)
     }
 
     fn mark_rule_succeeded(&mut self, rule_id: i64) -> Result<()> {
-        self.rule_succeeded_stmt.mark_rule_succeeded(rule_id)?;
+        self.conn.mark_rule_succeeded(rule_id)?;
         Ok(())
     }
 
     fn insert_link(&mut self, from_id: i64, rule_id: i64) -> Result<()> {
-        self.add_link_stmt
-            .insert_link(from_id, rule_id, false, RowType::Rule)?;
+        self.conn
+            .insert_link(from_id, rule_id, 0, RowType::Rule)?;
         Ok(())
     }
 }
@@ -751,14 +748,13 @@ impl<'a> ProcessIOChecker<'a> {
 impl<'b> IoConn<'b> {
     fn new(conn: &'b mut Connection) -> Result<Self> {
         let s = Self {
-            fetch_io_statement: conn.fetch_io_prepare()?,
-            insert_trace_statement: conn.insert_trace_prepare()?,
+            conn
         };
         return Ok(s);
     }
 
     fn fetch_io(&mut self, child_id: u32) -> Result<Vec<(String, u8)>> {
-        let fetch_io = self.fetch_io_statement.fetch_io(child_id as _)?;
+        let fetch_io = self.conn.fetch_io(child_id as _)?;
         Ok(fetch_io)
     }
 
@@ -771,13 +767,13 @@ impl<'b> IoConn<'b> {
         let child_cnt = evt_header.get_child_cnt() as i32;
         match event_type {
             EventType::ProcessCreation | EventType::ProcessDeletion => {
-                self.insert_trace_statement.insert_trace(
+                self.conn.insert_trace(
                     file_path.as_str(),
                     process_id as _,
-                    process_gen,
+                    process_gen as _,
                     event_type as u8,
-                    child_cnt,
-                )?
+                    child_cnt as _,
+                )?;
             }
 
             EventType::Open | EventType::Read | EventType::Write => {
@@ -794,12 +790,12 @@ impl<'b> IoConn<'b> {
                             );
                         }
 
-                        self.insert_trace_statement.insert_trace(
-                            rel_path.as_path(),
+                        self.conn.insert_trace(
+                            &rel_path.as_path().to_string_lossy().to_string(),
                             parent_process_id as _,
                             process_gen as _,
                             event_type as u8,
-                            child_cnt,
+                            child_cnt as _,
                         )?;
                     }
                 }
@@ -820,7 +816,7 @@ fn listen_to_processes(
 ) -> Result<()> {
     let mut io_conn =
         Connection::open(root.join(".tup/io.db")).expect("Failed to open in memory db");
-    crate::db::create_dyn_io_temp_tables(&mut io_conn)?;
+    tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();
 
@@ -897,8 +893,7 @@ fn verify_rule_io(
     let inps = process_checker.fetch_inputs(rule_id as _)?;
     let outs = process_checker.fetch_outputs(rule_id as _)?;
     let flags = process_checker
-        .fetch_flags(rule_id as _)?
-        .unwrap_or(String::new());
+        .fetch_flags(rule_id as _)?;
     let mut processed_io = std::collections::BTreeSet::new();
     for (fnode, ty) in io_vec.iter() {
         if !processed_io.insert((fnode.clone(), *ty)) {
@@ -1006,7 +1001,7 @@ fn link_input_to_rule(
 fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, fnode: &String) -> bool {
     for inp in inps.iter().chain(outs.iter()) {
         if *inp.get_type() == RowType::Dir
-            || *inp.get_type() == RowType::Grp
+            || *inp.get_type() == RowType::Group
             || *inp.get_type() == RowType::Env
             || *inp.get_type() == RowType::DirGen
         {

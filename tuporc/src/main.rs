@@ -13,6 +13,8 @@ extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
 extern crate regex;
+extern crate tupdb;
+extern crate scopeguard;
 
 use std::borrow::Cow;
 use std::env::{current_dir, set_current_dir};
@@ -27,13 +29,12 @@ use eyre::{eyre, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 
-use crate::db::{init_db, is_initialized, LibSqlPrepare};
+use tupdb::db::{init_db, is_initialized};
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
-use db::{Node, RowType};
+use tupdb::db::{Node, RowType};
 use tupparser::locate_file;
 use tupparser::paths::NormalPath;
 
-mod db;
 mod execute;
 mod monitor;
 mod parse;

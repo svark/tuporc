@@ -4,12 +4,9 @@ resolver = "2"
 members = [
     "tuprs",
     "tuporc",
-    "tuplua",
     "tupetw"
-]
+, "tupdb"]
 
-[patch.crates-io]
-lua-src = { git = "https://github.com/svark/lua-src-rs" }
 
 [profile.release]
 lto = true
