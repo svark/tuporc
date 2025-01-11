@@ -6,7 +6,7 @@ extern crate ctrlc;
 extern crate env_logger;
 extern crate execute as ex;
 extern crate eyre;
-extern crate fs2;
+extern crate fs4;
 extern crate ignore;
 extern crate incremental_topo;
 extern crate indicatif;
@@ -27,13 +27,13 @@ use std::time::Duration;
 use clap::Parser;
 use eyre::{eyre, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rusqlite::Connection;
 
-use tupdb::db::{init_db, is_initialized};
+use tupdb::db::{init_db, is_initialized, log_sqlite_version, start_connection, TupConnection};
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use tupdb::db::{Node, RowType};
 use tupparser::locate_file;
 use tupparser::paths::NormalPath;
+use fs4::fs_std::FileExt;
 
 mod execute;
 mod monitor;
@@ -211,7 +211,7 @@ fn is_tupfile<S: AsRef<str>>(s: S) -> bool {
 fn main() -> Result<()> {
     let args = Args::parse();
     env_logger::init();
-    log::info!("Sqlite version: {}\n", rusqlite::version());
+    log_sqlite_version();
     if let Some(act) = args.command.or_else(|| {
         Some(Action::Upd {
             target: Vec::new(),
@@ -224,13 +224,7 @@ fn main() -> Result<()> {
             }
             Action::Scan => {
                 change_root()?;
-                let mut conn = Connection::open(".tup/db")
-                    .expect("Connection to tup database in .tup/db could not be established");
-                if !is_initialized(&conn, "Node") {
-                    return Err(eyre!(
-                        "Tup database is not initialized, use `tup init' to initialize",
-                    ));
-                }
+                let mut conn =  start_connection()?;
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
@@ -245,7 +239,7 @@ fn main() -> Result<()> {
                 keep_going: _keep_going,
             } => {
                 let root = change_root_update_targets(&mut target)?;
-                let mut connection = Connection::open(".tup/db")
+                let mut connection =  start_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = monitor::is_monitor_running();
@@ -275,7 +269,7 @@ fn main() -> Result<()> {
                 println!("Updating db {}", target.join(" "));
                 let term_progress = TermProgress::new("Building ");
                 {
-                    let mut conn = Connection::open(".tup/db")
+                    let mut conn = start_connection()
                         .expect("Connection to tup database in .tup/db could not be established");
                     let skip_scan = monitor::is_monitor_running();
                     let tupfiles = scan_and_get_tupfiles(
@@ -312,7 +306,7 @@ fn main() -> Result<()> {
             Action::DumpVars { var, skip_scan, .. } => {
                 change_root()?;
                 let root = current_dir()?;
-                let mut connection = Connection::open(".tup/db")
+                let mut connection = start_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let tupfiles =
@@ -341,8 +335,8 @@ fn main() -> Result<()> {
                     let mut writer = BufWriter::new(vars_file);
                     use std::io::Write;
                     for (tupfile, val) in tupfiles_with_vars {
-                        writeln!(&mut writer, "Tupfile: {}", tupfile).unwrap();
-                        writeln!(&mut writer, "{}:= {}", var, val).unwrap();
+                        writeln!(&mut writer, "Tupfile: {}", tupfile)?;
+                        writeln!(&mut writer, "{}:= {}", var, val)?;
                     }
                     println!("wrote to vars.txt");
                 }
@@ -353,13 +347,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+
+
 fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
     let curdir = current_dir()?;
     change_root()?;
     let root = current_dir()?;
     if root.ne(&curdir) {
         println!("Changed root to {}", root.display());
-        let prefix = curdir.strip_prefix(&root).unwrap();
+        let prefix = curdir.strip_prefix(&root)?;
         // adjust the target paths to be relative to the new root
         let mut new_targets = Vec::new();
         for t in target.iter() {
@@ -387,19 +383,13 @@ fn change_root() -> Result<()> {
 
 fn scan_and_get_tupfiles(
     root: &PathBuf,
-    connection: &mut Connection,
+    connection: &mut TupConnection,
     term_progress: &TermProgress,
     skip_scan: bool,
     targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
     let mut conn = connection;
     let running = std::sync::Arc::new(AtomicBool::new(true));
-    if !is_initialized(&conn, "Node") {
-        return Err(eyre!(
-            "Tup database is not initialized, use `tup init' to initialize",
-        ));
-    }
-    use fs2::FileExt;
 
     let lock_file_path = root.join(".tup/build_lock");
     let file = OpenOptions::new()
@@ -420,7 +410,7 @@ fn scan_and_get_tupfiles(
 
 fn scan_and_get_all_tupfiles(
     root: &PathBuf,
-    connection: &mut Connection,
+    connection: &mut TupConnection,
     term_progress: &TermProgress,
     skip_scan: bool,
 ) -> Result<Vec<Node>> {
@@ -430,7 +420,6 @@ fn scan_and_get_all_tupfiles(
             "Tup database is not initialized, use `tup init' to initialize",
         ));
     }
-    use fs2::FileExt;
 
     let lock_file_path = root.join(".tup/build_lock");
     let file = OpenOptions::new()
@@ -447,5 +436,5 @@ fn scan_and_get_all_tupfiles(
         scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
     }
     term_progress.clear();
-    crate::parse::gather_tupfiles(&mut conn)
+    parse::gather_tupfiles(&mut conn)
 }

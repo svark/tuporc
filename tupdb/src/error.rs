@@ -30,6 +30,11 @@ impl Display for AnyError {
     }
 }
 
+impl AnyError {
+    pub fn query_returned_no_rows() -> Self {
+        AnyError::Db(Arc::new(rusqlite::Error::QueryReturnedNoRows))
+    }
+}
 impl std::error::Error for AnyError {}
 
 impl From<CallBackError> for AnyError {

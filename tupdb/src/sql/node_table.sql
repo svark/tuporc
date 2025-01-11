@@ -68,7 +68,6 @@ Create Table IF NOT EXISTS ChangeList
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ChangeList_id ON ChangeList(id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_PresentList_id ON PresentList(id);
 
 CREATE TABLE NODESHA
 (

@@ -7,19 +7,19 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use tupdb::db::{RowType};
+use tupdb::db::{start_connection, RowType, TupConnection};
 use crate::parse::{CrossRefMaps};
 use crate::scan::scan_root;
 use crate::TermProgress;
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
-use fs2::FileExt;
+//use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
 use indicatif::ProgressBar;
 use notify::{
     event, Config, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
 };
-use rusqlite::Connection;
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::{BufferObjects, PathBuffers};
@@ -46,7 +46,7 @@ impl WatchObject {
     }
 }
 
-fn fetch_latest_id(conn: &Connection, table: &str, id: &str) -> Result<i64> {
+fn fetch_latest_id(conn: &TupConnection, table: &str, id: &str) -> Result<i64> {
     let sql = format!("SELECT MAX({}) from {}", id, table);
     let mut stmt = conn.prepare(sql.as_str())?;
     let mut rows = stmt.query([])?;
@@ -55,7 +55,7 @@ fn fetch_latest_id(conn: &Connection, table: &str, id: &str) -> Result<i64> {
     Ok(id)
 }
 
-fn fetch_latest_ids(conn: &Connection, table: &str, id: &str, current_id: i64) -> Result<Vec<i64>> {
+fn fetch_latest_ids(conn: &TupConnection, table: &str, id: &str, current_id: i64) -> Result<Vec<i64>> {
     let sql = format!("SELECT {id} from {table} where {id} > {current_id}");
     let mut stmt = conn.prepare(sql.as_str())?;
     let mut rows = stmt.query([])?;
@@ -68,7 +68,7 @@ fn fetch_latest_ids(conn: &Connection, table: &str, id: &str, current_id: i64) -
     Ok(ids)
 }
 
-fn fetch_message(conn: &Connection, message_id: i64) -> Result<String> {
+fn fetch_message(conn: &TupConnection, message_id: i64) -> Result<String> {
     let message: String = conn.query_row(
         "SELECT message from Messages where id = ? ",
         [message_id],
@@ -82,7 +82,7 @@ fn is_file_locked_for_write<P: AsRef<Path>>(path: P) -> Result<bool> {
     Ok(file.try_lock_exclusive().is_err())
 }
 
-fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
+fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
     let config = Config::default().with_poll_interval(Duration::from_millis(1000));
     let lock_file_path = root.join(".tup/mon_lock");
     let mut file = OpenOptions::new()
@@ -167,7 +167,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
             log::error!("Failed to set handler: {}", e);
         });
     }
-    let mut conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
+    let mut conn = start_connection()?;
     let term_progress = TermProgress::new("Full scan underway..");
     scan_root(root.as_path(), &mut conn, &term_progress, running.clone())?;
     crossbeam::scope(|s| -> Result<()> {
@@ -200,7 +200,7 @@ fn monitor(root: &Path, ign: ignore::gitignore::Gitignore) -> Result<()> {
 fn run_monitor(
     path_receiver: Receiver<(PathBuf, i32)>,
     root: PathBuf,
-    conn: &Connection,
+    conn: &TupConnection,
     term_progress: TermProgress,
     stop_receiver: Receiver<()>,
     mut generation_id: i64,
@@ -220,8 +220,9 @@ fn run_monitor(
             let pd = bo
                 .add_abs(path)
                 .expect("failed to add path to buffer objects");
+            let tup_connection_ref = conn.as_ref();
             crate::parse::insert_path(
-                conn,
+                &tup_connection_ref,
                 &bo,
                 &pd,
                 &mut cross_ref_maps,
@@ -271,7 +272,7 @@ fn run_monitor(
 }
 
 fn poll_for_new_messages(
-    conn: &Connection,
+    conn: &TupConnection,
     term_progress: &TermProgress,
     mut current_id: i64,
     pb: &ProgressBar,
@@ -293,13 +294,12 @@ fn poll_for_new_messages(
     Ok(end_watch)
 }
 
-fn is_ignorable<P: AsRef<Path>>(path: P, ign: &ignore::gitignore::Gitignore, is_dir: bool) -> bool {
-    return ign.matched(path.as_ref(), is_dir).is_ignore();
+fn is_ignorable<P: AsRef<Path>>(path: P, ign: &Gitignore, is_dir: bool) -> bool {
+    ign.matched(path.as_ref(), is_dir).is_ignore()
 }
 
 fn stop_monitor() -> Result<()> {
-    let conn =
-        Connection::open(".tup/db").expect("Failed to connect to .tup/db. Are you in a tup root?");
+    let conn = start_connection()?;
     conn.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())
 }

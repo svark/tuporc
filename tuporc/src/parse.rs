@@ -5,7 +5,6 @@ use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, OptionExt, Report, Result};
 use log::debug;
 use parking_lot::Mutex;
-use rusqlite::Connection;
 use scopeguard::defer;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -15,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
-use tupdb::db::{create_path_buf_temptable, db_path_str, MiscStatements, Node, RowType};
+use tupdb::db::{create_path_buf_temptable, db_path_str, start_connection, MiscStatements, Node, RowType, TupConnection, TupConnectionRef};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
@@ -24,7 +23,7 @@ use tupparser::buffers::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
     PathDescriptor, RuleDescriptor, TaskDescriptor, TupPathDescriptor,
 };
-use tupparser::decode::{OutputHandler, PathSearcher, PathSearcherLite};
+use tupparser::decode::{OutputHandler, PathSearcher, PathDiscovery};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
@@ -69,7 +68,7 @@ pub(crate) enum NodeToInsert {
     DirGen(PathDescriptor),
 }
 
-impl PathSearcherLite for ConnWrapper<'_> {
+impl PathDiscovery for ConnWrapper<'_, '_> {
     fn discover_paths_with_cb(
         &self,
         path_buffers: &impl PathBuffers,
@@ -77,8 +76,7 @@ impl PathSearcherLite for ConnWrapper<'_> {
         cb: impl FnMut(MatchingPath),
         sel: SelOptions,
     ) -> std::result::Result<usize, Error> {
-        let conn = self.deref();
-        let sz = DbPathSearcher::fetch_glob_globs_cb(conn, path_buffers, glob_path, cb, sel)
+        let sz = DbPathSearcher::fetch_glob_globs_cb(&self.conn, path_buffers, glob_path, cb, sel)
             .map_err(|e| Error::new_callback_error(e.to_string()))?;
         Ok(sz)
     }
@@ -229,7 +227,7 @@ impl NodeToInsert {
 
     pub fn compute_node_sha(
         &self,
-        conn: &Connection,
+        conn: &TupConnectionRef,
         path_buffers: &impl PathBuffers,
     ) -> Option<String> {
         let compute_sha_for = |p: &PathDescriptor| {
@@ -430,15 +428,15 @@ fn into_any_error(e: Error) -> AnyError {
 }
 /// Path searcher that scans the sqlite database for matching paths
 /// It is used by the parser to resolve paths and globs. Resolved outputs are dumped in OutputHolder
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DbPathSearcher {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<Mutex<TupConnection>>,
     psx: OutputHolder,
     root: PathBuf,
 }
 
 impl DbPathSearcher {
-    pub fn new<P: AsRef<Path>>(conn: Arc<Mutex<Connection>>, root: P) -> DbPathSearcher {
+    pub fn new<P: AsRef<Path>>(conn: Arc<Mutex<TupConnection>>, root: P) -> DbPathSearcher {
         DbPathSearcher {
             conn,
             psx: OutputHolder::new(),
@@ -453,7 +451,7 @@ impl DbPathSearcher {
     }
 
     pub fn fetch_glob_globs_cb<F>(
-        conn: &Connection,
+        conn: &TupConnectionRef,
         ph: &impl PathBuffers,
         glob_paths: &[GlobPath],
         ref mut f: F,
@@ -529,13 +527,11 @@ impl DbPathSearcher {
             return Ok(num_matches);
         }
         log::warn!("no rows found for any glob pattern: {:?}", glob_paths);
-        Err(AnyError::Db(Arc::from(
-            rusqlite::Error::QueryReturnedNoRows,
-        )))
+        Err(AnyError::query_returned_no_rows())
     }
 }
 
-impl PathSearcherLite for DbPathSearcher {
+impl PathDiscovery for DbPathSearcher {
     fn discover_paths_with_cb(
         &self,
         path_buffers: &impl PathBuffers,
@@ -544,8 +540,9 @@ impl PathSearcherLite for DbPathSearcher {
         sel: SelOptions,
     ) -> Result<usize, Error> {
         let conn = self.conn.deref().lock();
+        let tup_connection_ref = conn.as_ref();
         let mut match_count =
-            Self::fetch_glob_globs_cb(conn.deref(), path_buffers, glob_paths, &mut cb, sel)
+            Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_paths, &mut cb, sel)
                 .map_err(|e| Error::new_callback_error(e.to_string()))?;
         if match_count == 0 {
             let mps = self
@@ -640,7 +637,7 @@ impl PathSearcher for DbPathSearcher {
 }
 
 pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
-    connection: Connection,
+    connection: TupConnection,
     tupfiles: Vec<Node>,
     root: P,
     term_progress: &TermProgress,
@@ -673,7 +670,7 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
 }
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
 pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
-    connection: Connection,
+    connection: TupConnection,
     tupfiles: Vec<Node>,
     root: P,
     term_progress: &TermProgress,
@@ -702,7 +699,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 }
 
 fn insert_links(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
@@ -843,7 +840,7 @@ fn add_links_from_to_rules_and_groups(
 }
 
 fn add_links_from_to_globs(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
     link_collector: &mut LinkCollector,
@@ -879,7 +876,7 @@ fn add_links_from_to_globs(
 /// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a re-iterations parsing phase of Tupfile which the glob pattern links to
 #[allow(dead_code)]
 fn add_link_glob_dir_to_rules(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     rw_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
@@ -918,7 +915,7 @@ fn add_link_glob_dir_to_rules(
     Ok(())
 }
 
-pub fn gather_modified_tupfiles(conn: &mut Connection, targets: &Vec<String>) -> Result<Vec<Node>> {
+pub fn gather_modified_tupfiles(conn: &mut TupConnection, targets: &Vec<String>) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
     create_path_buf_temptable(conn)?;
     conn.create_tupfile_entries_table()?;
@@ -949,7 +946,7 @@ pub fn gather_modified_tupfiles(conn: &mut Connection, targets: &Vec<String>) ->
     Ok(tupfiles)
 }
 
-pub fn gather_tupfiles(conn: &mut Connection) -> Result<Vec<Node>> {
+pub fn gather_tupfiles(conn: &mut TupConnection) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
     create_path_buf_temptable(conn)?;
 
@@ -1033,7 +1030,7 @@ fn parse_and_add_rules_to_db(
         drop(sender);
 
         let pb = term_progress.get_main();
-        let mut conn = Connection::open(".tup/db")
+        let mut conn =  start_connection()
             .expect("Connection to tup database in .tup/db could not be established");
         let rwbufs = p.read_write_buffers();
         //let mut crossref = CrossRefMaps::default();
@@ -1101,7 +1098,7 @@ fn parse_and_add_rules_to_db(
 
 /// checks that in  parsed tup files, no two rules produce the same output
 fn check_uniqueness_of_parent_rule(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     read_buf: &ReadWriteBufferObjects,
     outs: &impl OutputHandler,
     crossref: &mut CrossRefMaps,
@@ -1135,7 +1132,7 @@ fn check_uniqueness_of_parent_rule(
     Ok(())
 }
 
-fn find_by_path_inner(path: &Path, conn: &Connection) -> Result<Node> {
+fn find_by_path_inner(path: &Path, conn: &TupConnectionRef) -> Result<Node> {
     path.components()
         .try_fold((Node::root(), PathBuf::new()), |acc, c| {
             let (dir, path_so_far) = acc;
@@ -1145,16 +1142,17 @@ fn find_by_path_inner(path: &Path, conn: &Connection) -> Result<Node> {
         })
         .map(|(node, _)| node)
 }
-fn find_by_path(path: &Path, node_statements: &Connection) -> Node {
-    find_by_path_inner(path, node_statements).unwrap_or_else(|e| {
+fn find_by_path(path: &Path, conn_ref: &TupConnectionRef) -> Node {
+    find_by_path_inner(path, conn_ref).unwrap_or_else(|e| {
         log::warn!("Error while finding path: {:?}", e);
         Default::default()
     })
 }
 
-pub(crate) fn remove_path<P: AsRef<Path>>(conn: &Connection, path: P) -> Result<()> {
+pub(crate) fn remove_path<P: AsRef<Path>>(conn: &TupConnection, path: P) -> Result<()> {
     // if the path is a file, add it to the deletelist table
-    let node = find_by_path(path.as_ref(), conn);
+    let connection_ref = conn.as_ref();
+    let node = find_by_path(path.as_ref(), &connection_ref);
     let nodeid = node.get_id();
     if nodeid > 0 {
         //add_ids_statements.add_to_delete(nodeid, *node.get_type())?;
@@ -1169,7 +1167,7 @@ pub(crate) fn remove_path<P: AsRef<Path>>(conn: &Connection, path: P) -> Result<
 }
 
 pub(crate) fn insert_path(
-    conn: &Connection,
+    conn: &TupConnectionRef,
     path_buffers: &impl PathBuffers,
     pd: &PathDescriptor,
     cross_ref_maps: &mut CrossRefMaps,
@@ -1215,7 +1213,7 @@ pub(crate) fn insert_path(
 }
 
 fn insert_node_in_dir(
-    conn: &Connection,
+    conn: &TupConnectionRef,
     name: Cow<str>,
     path: &Path,
     dir: i64,
@@ -1250,7 +1248,7 @@ pub(crate) fn compute_path_hash(is_dir: bool, pbuf: HashedPath) -> String {
 }
 
 fn ensure_parent_inserted(
-    conn: &Connection,
+    conn: &TupConnectionRef,
     path_buffers: &impl PathBuffers,
     cross_ref_maps: &mut CrossRefMaps,
     rtype: &RowType,
@@ -1541,7 +1539,7 @@ impl Collector {
 
 // nodes to insert after rules have been resolved
 fn insert_nodes(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     read_write_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
@@ -1623,8 +1621,9 @@ fn insert_nodes(
 
         for (parent_desc, rowtype) in parent_descriptors {
             if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
+                let connection_ref = tx.connection();
                 let (parid, parparid) = ensure_parent_inserted(
-                    tx.deref(),
+                    &connection_ref,
                     read_write_buf.get(),
                     crossref,
                     &rowtype,
@@ -1639,8 +1638,9 @@ fn insert_nodes(
             debug!("inserting node: {:?}", node_to_insert);
             let node = node_to_insert.get_node(&read_write_buf, crossref)?;
             let compute_sha = || {
+                let tup_connection_ref = tx.connection();
                 node_to_insert
-                    .compute_node_sha(tx.deref(), read_write_buf.get())
+                    .compute_node_sha(&tup_connection_ref, read_write_buf.get())
                     .unwrap_or_default()
             };
             let (db_id, db_par_id) = {
@@ -1717,24 +1717,18 @@ fn insert_nodes(
     Ok(())
 }
 
-pub(crate) struct ConnWrapper<'a> {
-    conn: &'a Connection,
+pub(crate) struct ConnWrapper<'a, 'b>  {
+    conn: &'b TupConnectionRef<'a>,
 }
 
-impl<'a> ConnWrapper<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+impl<'a, 'b> ConnWrapper<'a, 'b> {
+    pub fn new(conn: &'b TupConnectionRef<'a>) -> Self {
         Self { conn }
     }
 }
 
-impl<'a> Deref for ConnWrapper<'a> {
-    type Target = Connection;
-    fn deref(&self) -> &Self::Target {
-        self.conn
-    }
-}
 
-impl<'a> tupparser::decode::GroupInputs for ConnWrapper<'a> {
+impl<'a, 'b> tupparser::decode::GroupInputs for ConnWrapper<'a, 'b> {
     fn get_group_paths(&self, group_name: &str, rule_id: i64, rule_dir: i64) -> Option<String>
     where
         Self: Sized,

@@ -17,8 +17,7 @@ use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
-use rusqlite::Connection;
-use tupdb::db::{Node};
+use tupdb::db::{start_connection, Node, TupConnection};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::TupPathDescriptor;
 use tupparser::decode::{decode_group_captures, TupLoc};
@@ -66,7 +65,7 @@ impl PoisonedState {
 }
 
 fn prepare_for_execution(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     term_progress: &TermProgress,
 ) -> Result<(IncrementalTopo, BiHashMap<i32, incremental_topo::Node>)> {
     let mut dag = IncrementalTopo::new();
@@ -109,13 +108,14 @@ pub(crate) fn execute_targets(
     root: PathBuf,
     term_progress: &TermProgress,
 ) -> Result<()> {
-    let mut conn = Connection::open(".tup/db")
+    let mut conn = start_connection()
         .expect("Connection to tup database in .tup/db could not be established");
     let (dag, node_bimap) = prepare_for_execution(&mut conn, &term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
-    let conn_wrapper = ConnWrapper::new(&conn);
+    let tup_connection_ref = conn.as_ref();
+    let conn_wrapper = ConnWrapper::new(&tup_connection_ref);
     let f = |node: Node| -> DbResult<Node> {
         let rule_id = node.get_id();
         let rule_ref = TupLoc::new(
@@ -348,8 +348,8 @@ impl ProcReceivers {
     }
 }
 
-fn get_target_ids(conn: &Connection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
-    let dir = std::env::current_dir().unwrap();
+fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
+    let dir = std::env::current_dir()?;
     let dirc = dir.clone();
     let dir = pathdiff::diff_paths(dir, root).ok_or(eyre!(format!(
         "Could not get relative path for:{:?}",
@@ -381,7 +381,7 @@ fn get_target_ids(conn: &Connection, root: &Path, targets: &Vec<String>) -> Resu
 }
 
 fn exec_rules_to_run(
-    mut conn: Connection,
+    mut conn: TupConnection,
     mut rule_nodes: Vec<Node>,
     fwd_refs: &BiMap<i32, incremental_topo::Node>,
     dag: &IncrementalTopo,
@@ -653,7 +653,7 @@ fn wait_for_children(
         yield_now();
         if !children.is_empty() {
             thread::sleep(std::time::Duration::from_nanos(100));
-            // kill the remaining children..
+            // kill the remaining children
             if poisoned.should_stop() {
                 failed.extend(kill_poisoned(&children).drain(..));
                 break;
@@ -664,11 +664,11 @@ fn wait_for_children(
 }
 
 struct ProcessIOChecker<'a> {
-  conn: &'a Connection
+  conn: &'a TupConnection
 }
 
 struct IoConn<'b> {
-    conn: &'b Connection
+    conn: &'b TupConnection
 }
 
 struct RulesToVerify {
@@ -694,11 +694,11 @@ impl RulesToVerify {
 }
 
 impl<'a> ProcessIOChecker<'a> {
-    fn new(conn: &'a mut Connection) -> Result<Self> {
+    fn new(conn: &'a mut TupConnection) -> Result<Self> {
         let s = Self {
           conn
         };
-        return Ok(s);
+        Ok(s)
     }
 
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
@@ -746,11 +746,11 @@ impl<'a> ProcessIOChecker<'a> {
 }
 
 impl<'b> IoConn<'b> {
-    fn new(conn: &'b mut Connection) -> Result<Self> {
+    fn new(conn: &'b mut TupConnection) -> Result<Self> {
         let s = Self {
             conn
         };
-        return Ok(s);
+        Ok(s)
     }
 
     fn fetch_io(&mut self, child_id: u32) -> Result<Vec<(String, u8)>> {
@@ -808,14 +808,14 @@ impl<'b> IoConn<'b> {
 // Then use this function like this:
 
 fn listen_to_processes(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     root: &Path,
     mut tracker: DynDepTracker,
     poisoned: PoisonedState,
     mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
-    let mut io_conn =
-        Connection::open(root.join(".tup/io.db")).expect("Failed to open in memory db");
+    let mut io_conn = start_connection()
+            .expect("Failed to open in memory db");
     tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();
@@ -840,10 +840,10 @@ fn listen_to_processes(
             tracker.stop();
         }
         if !rules_to_verify.is_empty() {
-            let mut reverify = Vec::new();
+            let mut re_verify = Vec::new();
             for (child_id, rule_id, rule_name) in rules_to_verify.iter() {
                 if !deleted_child_procs.contains(&child_id) {
-                    reverify.push((*child_id, *rule_id, rule_name.clone()));
+                    re_verify.push((*child_id, *rule_id, rule_name.clone()));
                     continue;
                 }
                 deleted_child_procs.remove(&child_id);
@@ -869,7 +869,7 @@ fn listen_to_processes(
                         });
                 }
             }
-            rules_to_verify.verify_again(reverify);
+            rules_to_verify.verify_again(re_verify);
         }
         if poisoned.should_stop() {
             break;
@@ -926,7 +926,6 @@ fn verify_rule_io(
                 ch_id, fname, rule_name
             );
         }
-        //return Err(eyre!("File {} was not read by rule {}", fname, rule_name));
     }
     for out in outs.iter() {
         let fname = match declared_matches_output(&io_vec, out) {

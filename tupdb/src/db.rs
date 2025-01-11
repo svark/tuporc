@@ -1,12 +1,13 @@
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, Row, Transaction};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, MAIN_SEPARATOR};
 
 use crate::db::RowType::{DirGen, GenF};
 use crate::deletes::LibSqlDeletes;
-use crate::error::{DbResult, SqlResult};
+use crate::error::{AnyError, DbResult, SqlResult};
 use crate::inserts::LibSqlInserts;
 use crate::queries::LibSqlQueries;
 
@@ -87,7 +88,7 @@ impl Display for RowType {
 
 impl TryFrom<u8> for RowType {
     type Error = u8;
-    fn try_from(value: u8) -> std::result::Result<Self, u8> {
+    fn try_from(value: u8) -> Result<Self, u8> {
         if value == 0 {
             Ok(Self::File)
         } else if value == 1 {
@@ -97,13 +98,13 @@ impl TryFrom<u8> for RowType {
         } else if value == 3 {
             Ok(Self::Env)
         } else if value == 4 {
-            Ok(Self::GenF)
+            Ok(GenF)
         } else if value == 5 {
             Ok(Self::TupF)
         } else if value == 6 {
             Ok(Self::Group)
         } else if value == 7 {
-            Ok(Self::DirGen)
+            Ok(DirGen)
         } else if value == 8 {
             Ok(Self::Excluded)
         } else if value == 9 {
@@ -115,10 +116,10 @@ impl TryFrom<u8> for RowType {
 }
 impl RowType {
     pub fn is_dir(&self) -> bool {
-        self.eq(&RowType::Dir) || self.eq(&RowType::DirGen)
+        self.eq(&RowType::Dir) || self.eq(&DirGen)
     }
     pub fn is_file(&self) -> bool {
-        self.eq(&RowType::File) || self.eq(&RowType::GenF) || self.eq(&RowType::TupF)
+        self.eq(&RowType::File) || self.eq(&GenF) || self.eq(&RowType::TupF)
     }
     pub fn is_generated(&self) -> bool {
         self.eq(&GenF) || self.eq(&DirGen)
@@ -364,8 +365,90 @@ pub fn init_db() {
     println!("Finished creating tables");
 }
 
+pub struct TupConnection(Connection);
+pub struct TupConnectionRef<'a>(&'a Connection);
+
+pub struct TupTransaction<'a>(Transaction<'a>);
+
+impl<'a> TupTransaction<'a> {
+    fn new(t: Transaction) -> TupTransaction {
+        TupTransaction(t)
+    }
+    pub fn commit(self) -> DbResult<()> {
+        self.0.commit()?;
+        Ok(())
+    }
+    pub fn rollback(self) -> DbResult<()> {
+        self.0.rollback()?;
+        Ok(())
+    }
+    
+    pub fn connection(&self) -> TupConnectionRef {
+        TupConnectionRef(self.0.deref())
+    }
+    
+   
+    
+}
+
+impl <'a> Deref for TupTransaction<'a> {
+    type Target = Transaction<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+
+
+impl TupConnection {
+    fn new(conn: Connection) -> Self {
+        TupConnection(conn)
+    }
+    
+    pub fn transaction(&mut self) -> DbResult<TupTransaction<'_>> {
+        Ok(TupTransaction::new(self.0.transaction()?))
+    }
+    
+    pub fn as_ref(&self) -> TupConnectionRef {
+        TupConnectionRef(&self.0)
+    }
+    
+}
+
+impl Deref for TupConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Deref for TupConnectionRef<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Log sqlite version
+pub fn log_sqlite_version()
+{
+    log::info!("Sqlite version: {}\n", rusqlite::version());
+}
+impl DerefMut for TupConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+pub fn start_connection() -> DbResult<TupConnection> {
+    let conn = Connection::open(".tup/db")
+        .expect("Connection to tup database in .tup/db could not be established");
+    if !is_initialized(&conn, "Node") {
+        return Err(AnyError::from(String::from("Node table not found in .tup/db")));
+    }
+    Ok(TupConnection::new(conn))
+}
+
 // create a temp table from directories paths to their node ids
-pub fn create_path_buf_temptable(conn: &Connection) -> SqlResult<()> {
+pub fn create_path_buf_temptable(conn: &TupConnection) -> SqlResult<()> {
     // https://gist.github.com/jbrown123/b65004fd4e8327748b650c77383bf553
     //let dir : u8 = RowType::Dir as u8;
     let s = include_str!("sql/dirpathbuf_temptable.sql");
@@ -373,13 +456,13 @@ pub fn create_path_buf_temptable(conn: &Connection) -> SqlResult<()> {
     Ok(())
 }
 
-pub fn create_dyn_io_temp_tables(conn: &Connection) -> SqlResult<()> {
+pub fn create_dyn_io_temp_tables(conn: &TupConnection) -> SqlResult<()> {
     conn.execute_batch(include_str!("sql/dynio.sql"))?;
     Ok(())
 }
 
 //creates a temp table
-pub fn create_temptables(conn: &Connection) -> SqlResult<()> {
+pub fn create_temptables(conn: &TupConnection) -> SqlResult<()> {
     let stmt = include_str!("sql/temptables.sql");
     conn.execute_batch(stmt)?;
     Ok(())
@@ -406,7 +489,7 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
         .to_string()
 }
 
-impl MiscStatements for Connection {
+impl MiscStatements for TupConnection {
     // add all directories a glob has to watch for changes
 
     fn enrich_modified_list(&self) -> DbResult<()> {

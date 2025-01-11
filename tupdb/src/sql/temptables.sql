@@ -4,6 +4,7 @@ CREATE TABLE PresentList
     id   INTEGER PRIMARY KEY not NULL,
     type INTEGER
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_PresentList_id ON PresentList(id);
 
 DROP TABLE IF EXISTS SuccessList;
 Create Table SuccessList

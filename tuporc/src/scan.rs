@@ -19,8 +19,7 @@ use crossbeam::sync::WaitGroup;
 use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
-use rusqlite::Connection;
-use tupdb::db::{Node, RowType};
+use tupdb::db::{Node, RowType, TupConnection};
 use tupdb::inserts::LibSqlInserts;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -34,7 +33,7 @@ static TUP_CONFIG: &str = "tup.config";
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
 pub(crate) fn scan_root(
     root: &Path,
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     term_progress: &TermProgress,
     running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
@@ -321,7 +320,7 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
     root: &Path,
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     term_progress: &TermProgress,
     running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
@@ -576,7 +575,7 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
 /// For the received nodes which are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
 /// Those not in database will be inserted.
 fn add_modify_nodes(
-    conn: &mut Connection,
+    conn: &mut TupConnection,
     nodereceiver: Receiver<NodeAtPath>,
     dirid_sender: Sender<(HashedPath, i64)>,
     progressbar: &ProgressBar,
