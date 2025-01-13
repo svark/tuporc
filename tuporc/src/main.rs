@@ -28,12 +28,13 @@ use clap::Parser;
 use eyre::{eyre, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use tupdb::db::{init_db, is_initialized, log_sqlite_version, start_connection, TupConnection};
+use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnection};
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use tupdb::db::{Node, RowType};
 use tupparser::locate_file;
 use tupparser::paths::NormalPath;
 use fs4::fs_std::FileExt;
+use tupdb::queries::LibSqlQueries;
 
 mod execute;
 mod monitor;
@@ -170,6 +171,9 @@ enum Action {
     #[clap(about = "Creates a tup database")]
     Init,
 
+    #[clap(about = "Clean and initialize database again")]
+    ReInit,
+
     #[clap(about = "Scans the file system for changes since the last scan")]
     Scan,
 
@@ -220,7 +224,27 @@ fn main() -> Result<()> {
     }) {
         match act {
             Action::Init => {
-                init_db();
+                init_db()?;
+            }
+            Action::ReInit => {
+                {
+                    let conn = start_connection()?;
+                    conn.for_each_gen_file(|node| {
+                        if node.get_type().eq(&RowType::GenF) {
+                            std::fs::remove_file(node.get_name()).unwrap();
+                        }
+                        Ok(())
+                    })?;
+                    conn.for_each_gen_file(|node| {
+                        if node.get_type().eq(&RowType::DirGen) {
+                            std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e|
+                                eprintln!("Failed to remove dir {} due to {}", node.get_name(), e));
+                        }
+                        Ok(())
+                    })?;
+                }
+                delete_db()?;
+                init_db()?;
             }
             Action::Scan => {
                 change_root()?;

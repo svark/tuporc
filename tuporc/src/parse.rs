@@ -605,7 +605,7 @@ impl PathSearcher for DbPathSearcher {
         let tuprs = ["tuprules.tup", "tuprules.lua"];
         let mut add_rules = |dirid| {
             for tupr in tuprs {
-                if let Ok((name, dirid_)) = conn
+                if let Ok((dirid_, name)) = conn
                     .fetch_closest_parent(tupr, dirid)
                     .inspect_err(|e| eprintln!("Error while looking for tuprules: {}", e))
                 {

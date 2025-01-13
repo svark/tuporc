@@ -21,7 +21,7 @@ use notify::{
     event, Config, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
 };
 use tupdb::inserts::LibSqlInserts;
-use tupdb::queries::LibSqlQueries;
+use tupdb::queries::{LibSqlQueries};
 use tupparser::buffers::{BufferObjects, PathBuffers};
 
 pub(crate) struct WatchObject {

@@ -352,17 +352,24 @@ pub fn is_initialized(conn: &Connection, table_name: &str) -> bool {
     }
 }
 
+pub fn delete_db() -> DbResult<()> {
+    std::fs::remove_dir_all(".tup").map_err(|e| AnyError::from(e.to_string()))?;
+    Ok(())
+}
 // Handle the tup init subcommand. This creates the file .tup\db and adds the tables
-pub fn init_db() {
+pub fn init_db() -> DbResult<()> {
     println!("Creating a new db.");
     //use std::fs;
     std::fs::create_dir_all(".tup").expect("Unable to access .tup dir");
     let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
-    conn.execute_batch(include_str!("sql/node_table.sql"))
-        .expect("failed to create tables in tup database.");
+    if is_initialized(&conn, "Node") {
+        return Err(AnyError::from(String::from("Node table already exists in .tup/db")));
+    }
+    conn.execute_batch(include_str!("sql/node_table.sql"))?;
 
-    let _ = File::create("Tupfile.ini").expect("could not open Tupfile.ini for write");
-    println!("Finished creating tables");
+    let _ = File::create("Tupfile.ini").map_err(|e| AnyError::from(e.to_string()))?;
+    println!("Database created successfully.");
+    Ok(())
 }
 
 pub struct TupConnection(Connection);
@@ -382,13 +389,13 @@ impl<'a> TupTransaction<'a> {
         self.0.rollback()?;
         Ok(())
     }
-    
+
     pub fn connection(&self) -> TupConnectionRef {
         TupConnectionRef(self.0.deref())
     }
-    
-   
-    
+
+
+
 }
 
 impl <'a> Deref for TupTransaction<'a> {
@@ -404,15 +411,15 @@ impl TupConnection {
     fn new(conn: Connection) -> Self {
         TupConnection(conn)
     }
-    
+
     pub fn transaction(&mut self) -> DbResult<TupTransaction<'_>> {
         Ok(TupTransaction::new(self.0.transaction()?))
     }
-    
+
     pub fn as_ref(&self) -> TupConnectionRef {
         TupConnectionRef(&self.0)
     }
-    
+
 }
 
 impl Deref for TupConnection {

@@ -1,11 +1,24 @@
+use rusqlite::{params};
 use crate::db::{Node, RowType};
 use crate::error::{AnyError, DbResult};
 use crate::queries::LibSqlQueries;
-use include_sqlite_sql::{impl_sql, include_sql};
+use tupdb_sql_macro::generate_prepared_statements;
 use rusqlite::{Connection, Result};
 
-include_sql!("src/sql/inserts.sql");
+/*
+Format for sql statements:
+-- name: <function_name> [!?->]
+-- # Parameters:
+-- param: param_name1: type1
+-- param: param_name2: type2
+<sql statements>
+...
+! -> return type is () is used for insert/update/delete statements
+? -> takes a closure as a parameter to process each row returned by the query
+-> -> insert returns the id of the inserted row
+*/
 
+generate_prepared_statements!("sql/inserts.sql");
 pub trait LibSqlInserts {
     fn insert_node(&self, n: &Node) -> DbResult<i64>;
     fn upsert_env_var(&self, name: &str, value: &str) -> DbResult<UpsertStatus>;
@@ -20,13 +33,13 @@ pub trait LibSqlInserts {
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_deleted(&self, id: i64, rtype: &RowType) -> Result<()>;
-    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<usize>;
-    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<usize>;
-    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<usize>;
-    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<usize>;
-    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<usize>;
-    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<usize>;
-    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<usize>;
+    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<()>;
+    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<()>;
+    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<()>;
+    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<()>;
+    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<()>;
+    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<()>;
+    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()>;
     fn insert_trace(
         &self,
         path: &str,
@@ -34,10 +47,9 @@ pub trait LibSqlInserts {
         gen: i64,
         typ: u8,
         childcnt: i64,
-    ) -> DbResult<usize>;
+    ) -> DbResult<()>;
     fn mark_tupfile_entries(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
     fn create_tupfile_entries_table(&self) -> DbResult<()>;
-    fn drop_tupfile_entries_table(&self) -> DbResult<()>;
     fn add_not_present_to_delete_list(&self) -> DbResult<()>;
     fn add_rules_with_changed_io_to_modify_list(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_groups(&self) -> DbResult<()>;
@@ -45,7 +57,7 @@ pub trait LibSqlInserts {
     fn delete_tupfile_entries_not_in_present_list(&self) -> DbResult<()>;
     fn delete_tupentries_in_deleted_tupfiles(&self) -> DbResult<()>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
-    fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<usize>;
+    fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
 }
 
 pub enum UpsertStatus {
@@ -79,7 +91,6 @@ impl LibSqlInserts for Connection {
             n.get_display_str(),
             n.get_flags(),
             n.get_srcid(),
-            |row| -> Result<i64> { row.get(0) },
         )?;
         Ok(r)
     }
@@ -91,7 +102,7 @@ impl LibSqlInserts for Connection {
             self.update_env_var(value, id)?;
             return Ok(UpsertStatus::Updated(id));
         }
-        let new_id = self.insert_env_var_inner(name, value, |row| -> Result<i64> { row.get(0) })?;
+        let new_id = self.insert_env_var_inner(name, value)?;
         Ok(UpsertStatus::Inserted(new_id))
     }
     fn update_columns(
@@ -220,32 +231,35 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<usize> {
-        self.update_mtime_ns(nodeid, mtime).map_err(|e| e.into())
+    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<()> {
+        self.update_mtime_ns(nodeid, mtime)?;
+        Ok(())
     }
 
-    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<usize> {
-        self.update_type(row_type as u8, nodeid)
-            .map_err(|e| e.into())
+    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<()> {
+        self.update_type(row_type as u8, nodeid)?;
+        Ok(())
     }
 
-    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<usize> {
-        self.update_node_display_str(display_str, nodeid)
-            .map_err(|e| e.into())
+    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<()> {
+        self.update_node_display_str(display_str, nodeid)?;
+        Ok(())
     }
-    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<usize> {
-        self.update_node_flags(flags, nodeid).map_err(|e| e.into())
+    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<()> {
+        self.update_node_flags(flags, nodeid)?;
+        Ok(())
     }
-    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<usize> {
-        self.update_node_srcid(nodeid, srcid).map_err(|e| e.into())
+    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<()> {
+        self.update_node_srcid(nodeid, srcid)?;
+        Ok(())
     }
-    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<usize> {
-        self.insert_or_replace_node_sha(nodeid, sha)
-            .map_err(|e| e.into())
+    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<()> {
+        self.insert_or_replace_node_sha(nodeid, sha)?;
+        Ok(())
     }
-    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<usize> {
-        self.insert_link_inner(src, dst, is_sticky, dst_type as u8)
-            .map_err(|e| e.into())
+    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()> {
+        self.insert_link_inner(src, dst, is_sticky, dst_type as u8)?;
+        Ok(())
     }
 
     fn insert_trace(
@@ -255,21 +269,19 @@ impl LibSqlInserts for Connection {
         gen: i64,
         typ: u8,
         childcnt: i64,
-    ) -> DbResult<usize> {
-        self.insert_trace_inner(path, pid, gen, typ, childcnt)
-            .map_err(|e| e.into())
+    ) -> DbResult<()> {
+        self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
+        Ok(())
     }
     fn mark_tupfile_entries(&self, tupfile_ids: &Vec<i64>) -> DbResult<()> {
-        self.add_rules_and_outputs_of_tupfile_entities(tupfile_ids.as_slice())?;
+        for tupfile_id in tupfile_ids {
+            self.add_rules_and_outputs_of_tupfile_entities(*tupfile_id)?;
+        }
         Ok(())
     }
 
     fn create_tupfile_entries_table(&self) -> DbResult<()> {
         self.create_tupfile_entities_table_inner()?;
-        Ok(())
-    }
-    fn drop_tupfile_entries_table(&self) -> DbResult<()> {
-        self.drop_tupfile_entities_table_inner()?;
         Ok(())
     }
 
@@ -310,7 +322,8 @@ impl LibSqlInserts for Connection {
             Ok(UpsertStatus::Unchanged(node_id))
         }
     }
-    fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<usize> {
-        self.insert_monitored_inner(path, gen_id, event).map_err(|e| e.into())
+    fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()> {
+        let _ = self.insert_monitored_inner(path, gen_id, event)?;
+        Ok(())
     }
 }

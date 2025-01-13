@@ -339,18 +339,20 @@ fn insert_direntries(
             || compute_root_sha().unwrap_or_default(),
         )?;
 
-        let mt = std::fs::metadata(root.join("TUP_CONFIG")).ok();
-        let tup_config_node = prepare_node_at_path(
-            inserted.get_id(),
-            TUP_CONFIG,
-            HashedPath::from(root.join(TUP_CONFIG)),
-            mt,
-            &File,
-        )
-        .expect("Unable to prepare tup.config node for insertion");
-        let pathbuf = root.join(TUP_CONFIG);
-        let tup_config_sha =  || compute_sha256(pathbuf.clone()).unwrap_or_default();
-        let _ = conn.upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
+        let mt = std::fs::metadata(root.join(TUP_CONFIG)).ok();
+        if mt.is_some() {
+            let tup_config_node = prepare_node_at_path(
+                inserted.get_id(),
+                TUP_CONFIG,
+                HashedPath::from(root.join(TUP_CONFIG)),
+                mt,
+                &File,
+            )
+                .expect("Unable to prepare tup.config node for insertion");
+            let pathbuf = root.join(TUP_CONFIG);
+            let tup_config_sha = || compute_sha256(pathbuf.clone()).unwrap_or_default();
+            let _ = conn.upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
+        }
     }
 
     let pb = term_progress.pb_main.clone();

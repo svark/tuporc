@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
 use quote::{quote, format_ident};
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 enum SqlFunctionType {
+    QueryMap, // ends with &
     Query,      // ends with ?
     Mutation,   // ends with !
     InsertId,   // ends with ->
@@ -14,21 +16,21 @@ struct SqlQuery {
     name: String,
     query: String,
     params: Vec<(String, String)>,
+    #[allow(unused)]
+    query_returns: String,
     fn_type: SqlFunctionType,
 }
 
 fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
     let mut queries = Vec::new();
-    let blocks = content.lines()
-    .collect::<Vec<_>>()
-    .split(|line| line.trim() == "/")
-    .filter(|block| !block.is_empty())
-    .map(|block| block.join("\n"));
+    let blocks = content.split("-- <eos>")
+    .filter(|block| !block.is_empty());
 
     for block in blocks {
         let mut lines = block.lines().filter(|l| !l.trim().is_empty());
         let mut name = String::new();
         let mut params = Vec::new();
+        let mut query_returns = String::new();
         let mut in_params = false;
         let mut query = String::new();
 
@@ -36,7 +38,7 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
             let line = line.trim();
             if line.starts_with("-- name:") {
                 name = line.trim_start_matches("-- name:").trim().to_string();
-            } else if line == "-- # Parameters" {
+            } else if line.starts_with("-- # Parameters") {
                 in_params = true;
             } else if line.starts_with("-- param:") && in_params {
                 let param_str = line.trim_start_matches("-- param:").trim();
@@ -44,6 +46,9 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
                 if parts.len() == 2 {
                     params.push((parts[0].trim().to_string(), parts[1].trim().to_string()));
                 }
+            } else if line.starts_with("-- returns:") && in_params {
+                let param_str = line.trim_start_matches("-- returns:").trim();
+                query_returns = param_str.to_string();
             } else if !line.starts_with("--") {
                 in_params = false;
                 query.push_str(line);
@@ -58,7 +63,9 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
                 SqlFunctionType::InsertId
             } else if name.ends_with('!') {
                 SqlFunctionType::Mutation
-            } else {
+            } else if name.ends_with("&") {
+                SqlFunctionType::QueryMap
+            }else{
                 SqlFunctionType::Mutation // default to mutation if no suffix
             };
 
@@ -66,6 +73,7 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
             name = name.trim_end_matches('?')
                       .trim_end_matches("->")
                       .trim_end_matches('!')
+                .trim_end_matches("&")
                       .trim()
                       .to_string();
 
@@ -73,6 +81,7 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
                 name,
                 query: query.trim().to_string(),
                 params,
+                query_returns,
                 fn_type,
             });
         }
@@ -82,13 +91,20 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
 
 #[proc_macro]
 pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
-    let sql_path = input.to_string().trim().trim_matches('"').to_string();
-    let content = fs::read_to_string(&sql_path).unwrap_or_else(|_| {
-        panic!("Failed to read SQL file: {}", sql_path)
-    });
+    let sql_file = input.to_string().trim_matches('"').to_string();
+    
+    // Get the path to Cargo.toml
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR not set");
+    
+    // Combine manifest dir with the provided path
+    let full_path = PathBuf::from(manifest_dir).join("src").join(&sql_file);
+    
+    let content = fs::read_to_string(&full_path)
+        .unwrap_or_else(|_| panic!("Failed to read SQL file: {}", full_path.display()));
     
     // Extract filename without extension for trait name
-    let file_name = std::path::Path::new(&sql_path)
+    let file_name = std::path::Path::new(&sql_file)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown")
@@ -103,6 +119,11 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
     for query in queries {
         let fn_name = format_ident!("{}", query.name);
         let query_str = query.query.clone();
+        let return_str = if query.query_returns.is_empty()  {"()".to_string()} else {query.query_returns.clone()};
+        use syn::parse_str;
+
+        let return_type: syn::Type = parse_str(&return_str).expect("Failed to parse return type");
+
         
         // Generate parameter types for trait
         let param_types: Vec<_> = query.params.iter()
@@ -127,21 +148,44 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
         match query.fn_type {
             SqlFunctionType::Query => {
                 trait_functions.push(quote! {
-                    fn #fn_name<T, F>(&self, #(#param_types,)* f: F) -> rusqlite::Result<T>
+                    fn #fn_name<F>(&self, #(#param_types,)* f: F) -> rusqlite::Result<#return_type>
                     where
-                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<#return_type>;
                 });
 
                 impl_functions.push(quote! {
-                    fn #fn_name<T, F>(&self, #(#param_types,)* mut f: F) -> rusqlite::Result<T>
+                    fn #fn_name<F>(&self, #(#param_types,)* mut f: F) -> rusqlite::Result<#return_type>
                     where
-                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<#return_type>,
                     {
                         let mut stmt = self.prepare(#query_str)?;
                         stmt.query_row(params![#(#param_names),*], f)
                     }
                 });
             },
+             
+            SqlFunctionType::QueryMap => {
+                trait_functions.push(quote! {
+                    fn #fn_name<F>(&self, #(#param_types,)* f: F) -> rusqlite::Result<()>
+                    where
+                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>;
+                });
+
+                impl_functions.push(quote! {
+                    fn #fn_name<F>(&self, #(#param_types,)* mut f: F) -> rusqlite::Result<()>
+                    where
+                        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+                    {
+                        let mut stmt = self.prepare(#query_str)?;
+                        let mut rows = stmt.query(params![#(#param_names),*])?;
+                        while let Some(row) = rows.next()? {
+                            f(&row)?;
+                        }
+                        Ok(())
+                    }
+                });
+            },
+            
             SqlFunctionType::InsertId => {
                 trait_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<i64>;
@@ -150,21 +194,21 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                 impl_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<i64> {
                         let mut stmt = self.prepare(#query_str)?;
-                        stmt.execute(params![#(#param_names),*])?;
+                        stmt.insert(params![#(#param_names),*])?;
                         Ok(self.last_insert_rowid())
                     }
                 });
             },
             SqlFunctionType::Mutation => {
                 trait_functions.push(quote! {
-                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<()>;
+                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize>;
                 });
 
                 impl_functions.push(quote! {
-                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<()> {
+                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize> {
                         let mut stmt = self.prepare(#query_str)?;
-                        stmt.execute(params![#(#param_names),*])?;
-                        Ok(())
+                        let sz: usize = stmt.execute(params![#(#param_names),*])?;
+                        Ok(sz)
                     }
                 });
             },

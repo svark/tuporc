@@ -87,10 +87,14 @@ CREATE TABLE MONITORED_FILES
     generation_id INTEGER not NULL
 );
 
-CREATE TABLE MESSAGES (id INTEGER PRIMARY KEY not NULL, message CHAR(8) not NULL);
+CREATE TABLE MESSAGES (id INTEGER PRIMARY KEY AUTOINCREMENT not NULL, message CHAR(8) not NULL);
 --- following is so that some statements can be prepared in NodeStatement's constructor, even though they are not used
 --- Actual construction of the table happens with with_recursive statement in ./dirpathbuf_temptable.sql
 CREATE TABLE IF NOT EXISTS DIRPATHBUF (id INTEGER, dir INTEGER, name VARCHAR(4096));
+CREATE VIEW ModifyList AS
+    SELECT id, type from ChangeList where is_delete = 0;
+CREATE VIEW DeleteList AS
+    SELECT id, type from ChangeList where is_delete = 1;
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;

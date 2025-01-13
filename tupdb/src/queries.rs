@@ -1,11 +1,12 @@
 use crate::db::{db_path_str, make_node, make_rule_node, make_tup_node, IOClass, Node, RowType};
 use crate::error::{AnyError, DbResult, SqlResult};
-use include_sqlite_sql::{impl_sql, include_sql};
-use rusqlite::{ffi, Row};
+use rusqlite::ffi;
+use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use tupdb_sql_macro::generate_prepared_statements;
 
-include_sql!("src/sql/queries.sql");
+generate_prepared_statements!("sql/queries.sql");
 
 fn internal_sqlite_error(e: AnyError) -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(ffi::Error::new(21), Some(e.to_string()))
@@ -19,13 +20,18 @@ pub trait LibSqlQueries {
     where
         F: FnMut(Node) -> SqlResult<()>;
 
+    fn for_each_gen_file<F>(&self, f: F) -> DbResult<()>
+    where
+        F: FnMut(Node) -> SqlResult<()>;
+
+
     /// Find a node by its path and name
-    fn find_node_by_path<P: AsRef<Path>>(
+    fn fetch_node_by_path<P: AsRef<Path>>(
         &mut self,
         dir_path: P,
         name: &str,
     ) -> DbResult<(i64, i64)>;
-    
+
     /// Fetch all rule nodes in a tupfile directory
     fn fetch_rule_nodes_by_dir(&self, dir: i64) -> DbResult<Vec<Node>>;
     /// Fetch a node by its id
@@ -51,7 +57,7 @@ pub trait LibSqlQueries {
     fn for_each_rule_to_run_no_targets<F>(&self, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
-    
+
     fn for_each_glob_dir<F>(&self, dir_id: i64, depth: i32, f: F) -> DbResult<()>
     where
         F: FnMut(String) -> DbResult<()>;
@@ -62,9 +68,13 @@ pub trait LibSqlQueries {
         rule_id: i64,
         name: &str,
     ) -> DbResult<Option<i64>>;
+
     fn fetch_dir_from_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64>;
+
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf>;
+
     fn fetch_env(&self, env: &str) -> DbResult<(i64, String)>;
+
     fn fetch_saved_nodesha256(&self, glob_id: i64) -> DbResult<String>;
 
     fn fetch_glob_matches<F, P>(
@@ -77,108 +87,120 @@ pub trait LibSqlQueries {
     where
         F: FnMut(Node) -> DbResult<()>,
         P: AsRef<Path>;
+
     fn compute_glob_sha(&self, glob_id: i64) -> DbResult<String>;
+
     fn fetch_maybe_changed_globs<F: FnMut(i64) -> DbResult<()>>(&self, f: F) -> DbResult<()>;
+
     fn fetch_modified_globs(&self) -> DbResult<Vec<(i64, String)>>;
+
     fn fetch_io(&self, proc_id: i32) -> DbResult<Vec<(String, u8)>>;
+
     fn fetch_node_id_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<i64>;
+
     fn fetch_parent_rule(&self, node_id: i64) -> DbResult<i64>;
+
     fn fetch_node_name(&self, node_id: i64) -> DbResult<String>;
-    fn fetch_closest_parent(&self, name: &str, dir: i64) -> DbResult<(String, i64)>;
+
+    fn fetch_closest_parent(&self, name: &str, dir: i64) -> DbResult<(i64, String)>;
+
     fn fetch_rules_by_dirid(&self, dir_id: i64) -> DbResult<Vec<Node>>;
+
     fn fetch_rules_by_dirid_cb<F>(&self, dir_id: i64, f: F) -> DbResult<()>
     where
         F: FnMut(i64) -> DbResult<()>;
+
     fn for_each_link<F>(&self, f: F) -> DbResult<()>
     where
         F: FnMut(i32, i32) -> DbResult<()>;
+
     fn fetch_flags(&self, rule_id: i64) -> DbResult<String>;
+
     fn fetch_monitored_files(&self, gen_id: i64) -> DbResult<Vec<(String, bool)>>;
 }
 impl LibSqlQueries for rusqlite::Connection {
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node> {
-        let mut result = None;
-        self.fetch_node_by_dirid_and_name(dir, name, |row| {
-            result = Some(make_node(row)?);
-            Ok(())
-        })?;
-        result
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+        self.fetch_node_by_dir_and_name_inner(dir, name, |row| Ok(make_node(row)?))
             .map_err(Into::into)
     }
+
     fn for_each_tupnode<F>(&self, mut f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>,
     {
-        self.fetch_all_tup_files(|row| {
+        self.for_each_tupnode_inner(|row| {
             let node = make_tup_node(row)?;
-            f(node)?;
-            Ok(())
-        })?;
-        Ok(())
+            f(node)
+        })
+        .map_err(Into::into)
     }
-    fn find_node_by_path<P: AsRef<Path>>(
+
+    fn for_each_gen_file<F>(&self, mut f: F) -> DbResult<()>
+    where
+        F: FnMut(Node) -> SqlResult<()>,
+    {
+        self.for_each_gen_file_inner(|row| {
+            let node = make_node(row)?;
+            f(node)
+        })
+        .map_err(Into::into)
+    }
+
+    fn fetch_node_by_path<P: AsRef<Path>>(
         &mut self,
         dir_path: P,
         name: &str,
     ) -> DbResult<(i64, i64)> {
-        let dp = db_path_str(dir_path);
-        let mut id: i64 = -1;
-        let mut dirid: i64 = -1;
-        self.fetch_node_by_path_inner(name, dp.as_str(), |r: &Row| {
-            (id, dirid) = (r.get(0)?, r.get(1)?);
-            Ok(())
-        })?;
-        Ok((id, dirid))
+        let dir_path_str: String = db_path_str(dir_path.as_ref());
+        self.fetch_node_by_path_inner(&dir_path_str, name, |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(Into::into)
     }
 
     fn fetch_rule_nodes_by_dir(&self, dir: i64) -> DbResult<Vec<Node>> {
         let mut nodes = Vec::new();
-        self.fetch_rules_by_dirid_inner(dir, |row| {
-            nodes.push(make_rule_node(row)?);
+        self.fetch_rule_nodes_by_dir_inner(dir, |row| {
+            let node = make_rule_node(row)?;
+            nodes.push(node);
             Ok(())
         })?;
         Ok(nodes)
     }
+
     fn fetch_node_by_id(&self, id: i64) -> DbResult<Option<Node>> {
-        let mut result = None;
-        self.fetch_node_by_id_inner(id, |row| {
-            result = Some(make_node(row)?);
-            Ok(())
-        })?;
-        Ok(result)
+        let rows = self.fetch_node_by_id_inner(id, |row| Ok(make_node(row)?));
+        match rows {
+            Ok(node) => Ok(Some(node)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    fn for_node_with_id<F: FnMut(Node) -> DbResult<()>>(&self, id: i64, mut f: F) -> DbResult<()> {
-        self.fetch_node_by_id_inner(id, |row| {
-            let result = make_node(row)?;
-            f(result).map_err(internal_sqlite_error)
-        })?;
-        Ok(())
+    fn for_node_with_id<F: FnMut(Node) -> DbResult<()>>(&self, id: i64, f: F) -> DbResult<()> {
+        self.fetch_node_by_id(id)?.map(f).unwrap_or(Ok(()))
     }
 
     fn for_each_rule_output<F>(&self, rule_id: i64, mut f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>,
     {
-        self.fetch_rule_outputs(rule_id, |row| {
+        self.for_each_rule_output_inner(rule_id, |row| {
             let node = make_node(row)?;
-            f(node)?;
-            Ok(())
+            f(node)
         })?;
         Ok(())
     }
+
     fn for_each_rule_input<F>(&self, rule_id: i64, mut f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>,
     {
-        self.fetch_node_input_files(rule_id, |row| {
+        self.for_each_rule_input_inner(rule_id, |row| {
             let node = make_node(row)?;
-            f(node)?;
-            Ok(())
+            f(node)
         })?;
         Ok(())
     }
+
     fn for_each_group_inputs<F>(&self, group_id: i64, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>,
@@ -191,10 +213,9 @@ impl LibSqlQueries for rusqlite::Connection {
     where
         F: FnMut(Node) -> SqlResult<()>,
     {
-        self.fetch_modified_tup_files(|row| {
+        self.for_each_modified_tupfile_inner(|row| {
             let node = make_tup_node(row)?;
-            f(node)?;
-            Ok(())
+            f(node)
         })?;
         Ok(())
     }
@@ -203,10 +224,9 @@ impl LibSqlQueries for rusqlite::Connection {
     where
         F: FnMut(Node) -> SqlResult<()>,
     {
-        self.fetch_rules_to_run_no_targets(|row| {
+        self.for_each_rule_to_run_no_targets_inner(|row| {
             let node = make_rule_node(row)?;
-            f(node)?;
-            Ok(())
+            f(node)
         })?;
         Ok(())
     }
@@ -215,18 +235,18 @@ impl LibSqlQueries for rusqlite::Connection {
     where
         F: FnMut(String) -> DbResult<()>,
     {
-        self.fetch_glob_dirs_deep(dir_id, depth, |row| {
-            let dir_path : String = row.get(0)?;
-            f(dir_path).map_err(internal_sqlite_error)?;
-            Ok(())
+        self.for_each_glob_dir_inner(dir_id, depth, |row| {
+            let path: String = row.get(0)?;
+            f(path).map_err(internal_sqlite_error)
         })?;
         Ok(())
     }
 
     fn fetch_rules_to_run(&self) -> DbResult<Vec<Node>> {
         let mut nodes = Vec::new();
-        self.fetch_rules_to_run_no_targets(|row| {
-            nodes.push(make_rule_node(row)?);
+        self.for_each_rule_to_run_no_targets_inner(|row| {
+            let node = make_rule_node(row)?;
+            nodes.push(node);
             Ok(())
         })?;
         Ok(nodes)
@@ -237,50 +257,47 @@ impl LibSqlQueries for rusqlite::Connection {
         rule_id: i64,
         name: &str,
     ) -> DbResult<Option<i64>> {
-        let mut result = None;
-        self.fetch_group_inputs_of_rule_matching(rule_id, name, |row| {
-            let id = row.get(0)?;
-            result = Some(id);
-            Ok(())
-        })?;
-        Ok(result)
+        let out = self.fetch_rule_input_matching_group_name_inner(rule_id, name, |r| {
+            let id: i64 = r.get(0)?;
+            Ok(id)
+        });
+        match out {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+            Ok(o) => Ok(Some(o)),
+        }
     }
 
     fn fetch_dir_from_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64> {
-        let mut dir_id = 0;
         let path = db_path_str(path.as_ref());
-        self.fetch_dirid_by_path(path.as_str(), |row| {
-            dir_id = row.get(0)?;
-            Ok(())
+        let dir_id = self.fetch_dirid_by_path(path.as_str(), |row| {
+            let dir_id = row.get(0)?;
+            Ok(dir_id)
         })?;
         Ok(dir_id)
     }
+
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf> {
-        let mut dirpath = PathBuf::new();
-        self.fetch_dirpath_by_dirid(dir_id, |row| {
+        let dirpath = self.fetch_dirpath_by_dirid(dir_id, |row| {
             let path: String = row.get(0)?;
-            dirpath = PathBuf::from(path);
-            Ok(())
+            Ok(path)
         })?;
-        Ok(dirpath)
+        Ok(dirpath.into())
     }
 
     fn fetch_env(&self, env: &str) -> DbResult<(i64, String)> {
-        let mut env_value = String::new();
-        let mut env_id = 0i64;
-        self.fetch_env_value(env, |row| {
-            env_id = row.get(0)?;
-            env_value = row.get(1)?;
-            Ok(())
+        let (env_id, env_value) = self.fetch_env_value(env, |row| {
+            let env_id: i64 = row.get(0)?;
+            let env_value: String = row.get(1)?;
+            Ok((env_id, env_value))
         })?;
         Ok((env_id, env_value))
     }
 
     fn fetch_saved_nodesha256(&self, id: i64) -> DbResult<String> {
-        let mut sha256 = String::new();
-        self.fetch_node_sha_by_id(id, |row| {
-            sha256 = row.get(0)?;
-            Ok(())
+        let sha256 = self.fetch_node_sha_by_id(id, |row| {
+            let sha256: String = row.get(0)?;
+            Ok(sha256)
         })?;
         Ok(sha256)
     }
@@ -305,7 +322,7 @@ impl LibSqlQueries for rusqlite::Connection {
         if depth > 1 {
             let glob_file_pattern = path.file_name().unwrap().to_string_lossy();
             let glob_dir_pattern = path.parent().unwrap().to_string_lossy();
-            self.fetch_glob_matches_deep(
+            self.for_each_glob_match_inner(
                 glob_dirid,
                 depth as i64,
                 glob_file_pattern.as_ref(),
@@ -324,7 +341,7 @@ impl LibSqlQueries for rusqlite::Connection {
                 },
             )?;
         } else {
-            self.fetch_glob_matches_shallow(glob_dirid, glob_pattern, |row| {
+            self.for_each_shallow_glob_match_inner(glob_dirid, glob_pattern, |row| {
                 let node = make_node(row)?;
                 f(node).map_err(internal_sqlite_error)?;
                 Ok(())
@@ -360,7 +377,7 @@ impl LibSqlQueries for rusqlite::Connection {
         Ok(sha)
     }
     fn fetch_maybe_changed_globs<F: FnMut(i64) -> DbResult<()>>(&self, mut f: F) -> DbResult<()> {
-        self.fetch_globs_with_modified_search_dirs(|row| {
+        self.fetch_maybe_changed_globs_inner(|row| {
             f(row.get(0)?).map_err(internal_sqlite_error)?;
             Ok(())
         })?;
@@ -397,49 +414,40 @@ impl LibSqlQueries for rusqlite::Connection {
     }
 
     fn fetch_node_id_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<i64> {
-        let mut result: Option<i64> = None;
-        self.fetch_node_id(dir, name, |row| {
-            result = Some(row.get(0)?);
-            Ok(())
+        let id = self.fetch_node_id_by_dir_and_name_inner(dir, name, |row| {
+            let id: i64 = row.get(0)?;
+            Ok(id)
         })?;
-        result
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
-            .map_err(Into::into)
+        Ok(id)
     }
     fn fetch_parent_rule(&self, node_id: i64) -> DbResult<i64> {
-        let mut rule_id = None;
-        self.fetch_parent_rule_of_node_inner(node_id, |row| {
-            rule_id = Some(row.get(0)?);
-            Ok(())
+        let rule_id = self.fetch_parent_rule_of_node_inner(node_id, |row| {
+            let rule_id = row.get(0)?;
+            Ok(rule_id)
         })?;
-        rule_id
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
-            .map_err(Into::into)
+        Ok(rule_id)
     }
 
     fn fetch_node_name(&self, node_id: i64) -> DbResult<String> {
-        let mut name = String::new();
-        self.fetch_node_name_by_id_inner(node_id, |row| {
-            name = row.get(0)?;
-            Ok(())
+        let name = self.fetch_node_name_by_id_inner(node_id, |row| {
+            let name = row.get(0)?;
+            Ok(name)
         })?;
         Ok(name)
     }
 
-    fn fetch_closest_parent(&self, inname: &str, indir: i64) -> DbResult<(String, i64)> {
-        let mut name = String::new();
-        let mut dir = 0;
-        self.fetch_closest_parent_inner(&inname, indir, |row| {
-            name = row.get(0)?;
-            dir = row.get(1)?;
-            Ok(())
+    fn fetch_closest_parent(&self, inname: &str, indir: i64) -> DbResult<(i64, String)> {
+        let (dir, name) = self.fetch_closest_parent_inner(inname, indir, |row| {
+            let name = row.get(0)?;
+            let dir: i64 = row.get(1)?;
+            Ok((dir, name))
         })?;
-        Ok((name.clone(), dir))
+        Ok((dir, name))
     }
 
     fn fetch_rules_by_dirid(&self, dir_id: i64) -> DbResult<Vec<Node>> {
         let mut nodes = Vec::new();
-        self.fetch_rules_by_dirid_inner(dir_id, |row| {
+        self.fetch_rule_nodes_by_dir_inner(dir_id, |row| {
             nodes.push(make_rule_node(row)?);
             Ok(())
         })?;
@@ -449,7 +457,7 @@ impl LibSqlQueries for rusqlite::Connection {
     where
         F: FnMut(i64) -> DbResult<()>,
     {
-        self.fetch_rules_by_dirid_inner(dir_id, |row| {
+        self.fetch_rule_nodes_by_dir_inner(dir_id, |row| {
             f(row.get(0)?).map_err(internal_sqlite_error)?;
             Ok(())
         })?;
@@ -460,7 +468,7 @@ impl LibSqlQueries for rusqlite::Connection {
     where
         F: FnMut(i32, i32) -> DbResult<()>,
     {
-        self.fetch_all_links(|row| {
+        self.for_each_link_inner(|row| {
             let from: i32 = row.get(0)?;
             let to: i32 = row.get(1)?;
             f(from, to).map_err(internal_sqlite_error)?;
@@ -468,16 +476,15 @@ impl LibSqlQueries for rusqlite::Connection {
         })?;
         Ok(())
     }
-    
+
     fn fetch_flags(&self, rule_id: i64) -> DbResult<String> {
-        let mut flags = String::new();
-        self.fetch_node_flags_inner(rule_id, |row| {
-            flags = row.get(0)?;
-            Ok(())
+        let flags = self.fetch_node_flags_inner(rule_id, |row| {
+            let flags: String = row.get(0)?;
+            Ok(flags)
         })?;
         Ok(flags)
     }
-    
+
     fn fetch_monitored_files(&self, gen_id: i64) -> DbResult<Vec<(String, bool)>> {
         let mut files = Vec::new();
         self.fetch_monitored_files_inner(gen_id, |row| {
