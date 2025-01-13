@@ -3,7 +3,6 @@ extern crate sha2;
 
 pub mod db;
 pub mod deletes;
+pub mod error;
 pub mod inserts;
 pub mod queries;
-pub mod error;
-

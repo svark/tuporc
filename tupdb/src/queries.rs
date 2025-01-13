@@ -24,7 +24,6 @@ pub trait LibSqlQueries {
     where
         F: FnMut(Node) -> SqlResult<()>;
 
-
     /// Find a node by its path and name
     fn fetch_node_by_path<P: AsRef<Path>>(
         &mut self,

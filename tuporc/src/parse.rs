@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
-use tupdb::db::{create_path_buf_temptable, db_path_str, start_connection, MiscStatements, Node, RowType, TupConnection, TupConnectionRef};
+use tupdb::db::{
+    create_path_buf_temptable, db_path_str, start_connection, MiscStatements, Node, RowType,
+    TupConnection, TupConnectionRef,
+};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
@@ -23,7 +26,7 @@ use tupparser::buffers::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
     PathDescriptor, RuleDescriptor, TaskDescriptor, TupPathDescriptor,
 };
-use tupparser::decode::{OutputHandler, PathSearcher, PathDiscovery};
+use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
@@ -915,7 +918,10 @@ fn add_link_glob_dir_to_rules(
     Ok(())
 }
 
-pub fn gather_modified_tupfiles(conn: &mut TupConnection, targets: &Vec<String>) -> Result<Vec<Node>> {
+pub fn gather_modified_tupfiles(
+    conn: &mut TupConnection,
+    targets: &Vec<String>,
+) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
     create_path_buf_temptable(conn)?;
     conn.create_tupfile_entries_table()?;
@@ -1030,7 +1036,7 @@ fn parse_and_add_rules_to_db(
         drop(sender);
 
         let pb = term_progress.get_main();
-        let mut conn =  start_connection()
+        let mut conn = start_connection()
             .expect("Connection to tup database in .tup/db could not be established");
         let rwbufs = p.read_write_buffers();
         //let mut crossref = CrossRefMaps::default();
@@ -1717,7 +1723,7 @@ fn insert_nodes(
     Ok(())
 }
 
-pub(crate) struct ConnWrapper<'a, 'b>  {
+pub(crate) struct ConnWrapper<'a, 'b> {
     conn: &'b TupConnectionRef<'a>,
 }
 
@@ -1726,7 +1732,6 @@ impl<'a, 'b> ConnWrapper<'a, 'b> {
         Self { conn }
     }
 }
-
 
 impl<'a, 'b> tupparser::decode::GroupInputs for ConnWrapper<'a, 'b> {
     fn get_group_paths(&self, group_name: &str, rule_id: i64, rule_dir: i64) -> Option<String>

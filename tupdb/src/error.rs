@@ -49,7 +49,6 @@ impl From<String> for AnyError {
     }
 }
 
-
 impl From<rusqlite::Error> for AnyError {
     fn from(value: rusqlite::Error) -> Self {
         AnyError::Db(Arc::new(value))

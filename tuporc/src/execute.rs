@@ -23,13 +23,13 @@ use tupparser::buffers::TupPathDescriptor;
 use tupparser::decode::{decode_group_captures, TupLoc};
 use tupparser::statements::Loc;
 
-use tupdb::db::RowType::Excluded;
+use crate::parse::ConnWrapper;
+use crate::TermProgress;
 use tupdb::db::RowType;
+use tupdb::db::RowType::Excluded;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
-use crate::parse::ConnWrapper;
-use crate::TermProgress;
 
 #[derive(Debug, Clone)]
 struct PoisonedState {
@@ -108,8 +108,8 @@ pub(crate) fn execute_targets(
     root: PathBuf,
     term_progress: &TermProgress,
 ) -> Result<()> {
-    let mut conn = start_connection()
-        .expect("Connection to tup database in .tup/db could not be established");
+    let mut conn =
+        start_connection().expect("Connection to tup database in .tup/db could not be established");
     let (dag, node_bimap) = prepare_for_execution(&mut conn, &term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
@@ -141,7 +141,10 @@ pub(crate) fn execute_targets(
         ))
     };
     let rule_nodes = conn.fetch_rules_to_run()?;
-    let rule_nodes = rule_nodes.into_iter().map(f).collect::<DbResult<Vec<Node>>>()?;
+    let rule_nodes = rule_nodes
+        .into_iter()
+        .map(f)
+        .collect::<DbResult<Vec<Node>>>()?;
     if rule_nodes.is_empty() {
         println!("Nothing to do");
         return Ok(());
@@ -664,11 +667,11 @@ fn wait_for_children(
 }
 
 struct ProcessIOChecker<'a> {
-  conn: &'a TupConnection
+    conn: &'a TupConnection,
 }
 
 struct IoConn<'b> {
-    conn: &'b TupConnection
+    conn: &'b TupConnection,
 }
 
 struct RulesToVerify {
@@ -695,9 +698,7 @@ impl RulesToVerify {
 
 impl<'a> ProcessIOChecker<'a> {
     fn new(conn: &'a mut TupConnection) -> Result<Self> {
-        let s = Self {
-          conn
-        };
+        let s = Self { conn };
         Ok(s)
     }
 
@@ -712,7 +713,7 @@ impl<'a> ProcessIOChecker<'a> {
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
         //let fetch_outputs = self.fetch_rule_outputs(rule_id)?;
         let mut nodes = Vec::new();
-        self.conn.for_each_rule_output(rule_id as _, |node|{
+        self.conn.for_each_rule_output(rule_id as _, |node| {
             nodes.push(node);
             Ok(())
         })?;
@@ -739,17 +740,14 @@ impl<'a> ProcessIOChecker<'a> {
     }
 
     fn insert_link(&mut self, from_id: i64, rule_id: i64) -> Result<()> {
-        self.conn
-            .insert_link(from_id, rule_id, 0, RowType::Rule)?;
+        self.conn.insert_link(from_id, rule_id, 0, RowType::Rule)?;
         Ok(())
     }
 }
 
 impl<'b> IoConn<'b> {
     fn new(conn: &'b mut TupConnection) -> Result<Self> {
-        let s = Self {
-            conn
-        };
+        let s = Self { conn };
         Ok(s)
     }
 
@@ -814,8 +812,7 @@ fn listen_to_processes(
     poisoned: PoisonedState,
     mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
-    let mut io_conn = start_connection()
-            .expect("Failed to open in memory db");
+    let mut io_conn = start_connection().expect("Failed to open in memory db");
     tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();
@@ -892,8 +889,7 @@ fn verify_rule_io(
     let io_vec = io_conn.fetch_io(ch_id)?;
     let inps = process_checker.fetch_inputs(rule_id as _)?;
     let outs = process_checker.fetch_outputs(rule_id as _)?;
-    let flags = process_checker
-        .fetch_flags(rule_id as _)?;
+    let flags = process_checker.fetch_flags(rule_id as _)?;
     let mut processed_io = std::collections::BTreeSet::new();
     for (fnode, ty) in io_vec.iter() {
         if !processed_io.insert((fnode.clone(), *ty)) {

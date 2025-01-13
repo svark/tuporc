@@ -13,8 +13,8 @@ extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
 extern crate regex;
-extern crate tupdb;
 extern crate scopeguard;
+extern crate tupdb;
 
 use std::borrow::Cow;
 use std::env::{current_dir, set_current_dir};
@@ -28,13 +28,15 @@ use clap::Parser;
 use eyre::{eyre, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnection};
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
+use fs4::fs_std::FileExt;
+use tupdb::db::{
+    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnection,
+};
 use tupdb::db::{Node, RowType};
+use tupdb::queries::LibSqlQueries;
 use tupparser::locate_file;
 use tupparser::paths::NormalPath;
-use fs4::fs_std::FileExt;
-use tupdb::queries::LibSqlQueries;
 
 mod execute;
 mod monitor;
@@ -237,8 +239,9 @@ fn main() -> Result<()> {
                     })?;
                     conn.for_each_gen_file(|node| {
                         if node.get_type().eq(&RowType::DirGen) {
-                            std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e|
-                                eprintln!("Failed to remove dir {} due to {}", node.get_name(), e));
+                            std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e| {
+                                eprintln!("Failed to remove dir {} due to {}", node.get_name(), e)
+                            });
                         }
                         Ok(())
                     })?;
@@ -248,7 +251,7 @@ fn main() -> Result<()> {
             }
             Action::Scan => {
                 change_root()?;
-                let mut conn =  start_connection()?;
+                let mut conn = start_connection()?;
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
@@ -263,7 +266,7 @@ fn main() -> Result<()> {
                 keep_going: _keep_going,
             } => {
                 let root = change_root_update_targets(&mut target)?;
-                let mut connection =  start_connection()
+                let mut connection = start_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = monitor::is_monitor_running();
@@ -370,8 +373,6 @@ fn main() -> Result<()> {
     println!("Done");
     Ok(())
 }
-
-
 
 fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
     let curdir = current_dir()?;

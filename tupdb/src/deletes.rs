@@ -1,6 +1,6 @@
 use rusqlite::params;
-use tupdb_sql_macro::generate_prepared_statements;
 use rusqlite::{Connection, Result};
+use tupdb_sql_macro::generate_prepared_statements;
 
 generate_prepared_statements!("sql/deletes.sql");
 
@@ -14,9 +14,8 @@ pub trait LibSqlDeletes {
     fn delete_nodes(&self) -> Result<usize>;
     fn prune_delete_list_of_present(&self) -> Result<usize>;
     fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize>;
-    
+
     fn drop_tupfile_entries_table(&self) -> Result<()>;
-    
 }
 
 impl LibSqlDeletes for Connection {
@@ -78,5 +77,4 @@ impl LibSqlDeletes for Connection {
         log::debug!("Dropped tupfile_entries table");
         Ok(())
     }
-    
 }

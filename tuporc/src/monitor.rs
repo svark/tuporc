@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use tupdb::db::{start_connection, RowType, TupConnection};
-use crate::parse::{CrossRefMaps};
+use crate::parse::CrossRefMaps;
 use crate::scan::scan_root;
 use crate::TermProgress;
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
+use tupdb::db::{start_connection, RowType, TupConnection};
 //use fs2::FileExt;
 use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
@@ -21,7 +21,7 @@ use notify::{
     event, Config, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
 };
 use tupdb::inserts::LibSqlInserts;
-use tupdb::queries::{LibSqlQueries};
+use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::{BufferObjects, PathBuffers};
 
 pub(crate) struct WatchObject {
@@ -55,7 +55,12 @@ fn fetch_latest_id(conn: &TupConnection, table: &str, id: &str) -> Result<i64> {
     Ok(id)
 }
 
-fn fetch_latest_ids(conn: &TupConnection, table: &str, id: &str, current_id: i64) -> Result<Vec<i64>> {
+fn fetch_latest_ids(
+    conn: &TupConnection,
+    table: &str,
+    id: &str,
+    current_id: i64,
+) -> Result<Vec<i64>> {
     let sql = format!("SELECT {id} from {table} where {id} > {current_id}");
     let mut stmt = conn.prepare(sql.as_str())?;
     let mut rows = stmt.query([])?;
@@ -261,8 +266,12 @@ fn run_monitor(
         }
         while let Ok((path, added)) = path_receiver.try_recv() {
             if build_in_progess_new_stat {
-                conn.insert_monitored(path.as_path().to_string_lossy().as_ref(), generation_id, added as _)
-                    .expect("failed to add monitored file to db");
+                conn.insert_monitored(
+                    path.as_path().to_string_lossy().as_ref(),
+                    generation_id,
+                    added as _,
+                )
+                .expect("failed to add monitored file to db");
             } else {
                 update_nodes(&path, added == 1)?;
             }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
+use crate::parse::compute_path_hash;
 use crate::{is_tupfile, TermProgress};
 use crossbeam::channel::{never, tick, Receiver, Sender};
 use crossbeam::select;
@@ -20,11 +21,10 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use tupdb::db::{Node, RowType, TupConnection};
+use tupdb::deletes::LibSqlDeletes;
 use tupdb::inserts::LibSqlInserts;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
-use tupdb::deletes::LibSqlDeletes;
-use crate::parse::compute_path_hash;
 
 const MAX_THRS_NODES: u8 = 6;
 pub const MAX_THRS_DIRS: usize = 22;
@@ -328,16 +328,20 @@ fn insert_direntries(
     tupdb::db::create_temptables(conn)?;
     {
         let mt = std::fs::metadata(root).ok();
-        let root_node =
-            prepare_node_at_path(0, ".", HashedPath::from(root.to_path_buf()), mt, &RowType::Dir)
-                .expect("Unable to prepare root node for insertion");
+        let root_node = prepare_node_at_path(
+            0,
+            ".",
+            HashedPath::from(root.to_path_buf()),
+            mt,
+            &RowType::Dir,
+        )
+        .expect("Unable to prepare root node for insertion");
 
         let compute_root_sha = || compute_dir_sha256(root).ok();
 
-        let inserted = conn.upsert_node(
-            &root_node.get_prepared_node(),
-            || compute_root_sha().unwrap_or_default(),
-        )?;
+        let inserted = conn.upsert_node(&root_node.get_prepared_node(), || {
+            compute_root_sha().unwrap_or_default()
+        })?;
 
         let mt = std::fs::metadata(root.join(TUP_CONFIG)).ok();
         if mt.is_some() {
@@ -348,7 +352,7 @@ fn insert_direntries(
                 mt,
                 &File,
             )
-                .expect("Unable to prepare tup.config node for insertion");
+            .expect("Unable to prepare tup.config node for insertion");
             let pathbuf = root.join(TUP_CONFIG);
             let tup_config_sha = || compute_sha256(pathbuf.clone()).unwrap_or_default();
             let _ = conn.upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
@@ -592,10 +596,7 @@ fn add_modify_nodes(
             let pbuf = node_at_path.get_hashed_path();
             let is_dir = node.get_type() == &RowType::Dir;
             let compute_node_sha = || compute_path_hash(is_dir, pbuf.clone());
-            let inserted = tx.upsert_node(
-                node,
-                compute_node_sha
-            )?;
+            let inserted = tx.upsert_node(node, compute_node_sha)?;
             if node.get_type() == &RowType::Dir {
                 let id = inserted.get_id();
                 dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;

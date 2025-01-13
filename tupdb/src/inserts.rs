@@ -1,9 +1,9 @@
-use rusqlite::{params};
 use crate::db::{Node, RowType};
 use crate::error::{AnyError, DbResult};
 use crate::queries::LibSqlQueries;
-use tupdb_sql_macro::generate_prepared_statements;
+use rusqlite::params;
 use rusqlite::{Connection, Result};
+use tupdb_sql_macro::generate_prepared_statements;
 
 /*
 Format for sql statements:
@@ -40,14 +40,7 @@ pub trait LibSqlInserts {
     fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<()>;
     fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<()>;
     fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()>;
-    fn insert_trace(
-        &self,
-        path: &str,
-        pid: i64,
-        gen: i64,
-        typ: u8,
-        childcnt: i64,
-    ) -> DbResult<()>;
+    fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
     fn mark_tupfile_entries(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
     fn create_tupfile_entries_table(&self) -> DbResult<()>;
     fn add_not_present_to_delete_list(&self) -> DbResult<()>;
@@ -262,14 +255,7 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn insert_trace(
-        &self,
-        path: &str,
-        pid: i64,
-        gen: i64,
-        typ: u8,
-        childcnt: i64,
-    ) -> DbResult<()> {
+    fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()> {
         self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
         Ok(())
     }

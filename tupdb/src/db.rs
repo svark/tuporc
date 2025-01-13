@@ -363,7 +363,9 @@ pub fn init_db() -> DbResult<()> {
     std::fs::create_dir_all(".tup").expect("Unable to access .tup dir");
     let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
     if is_initialized(&conn, "Node") {
-        return Err(AnyError::from(String::from("Node table already exists in .tup/db")));
+        return Err(AnyError::from(String::from(
+            "Node table already exists in .tup/db",
+        )));
     }
     conn.execute_batch(include_str!("sql/node_table.sql"))?;
 
@@ -393,19 +395,14 @@ impl<'a> TupTransaction<'a> {
     pub fn connection(&self) -> TupConnectionRef {
         TupConnectionRef(self.0.deref())
     }
-
-
-
 }
 
-impl <'a> Deref for TupTransaction<'a> {
+impl<'a> Deref for TupTransaction<'a> {
     type Target = Transaction<'a>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-
-
 
 impl TupConnection {
     fn new(conn: Connection) -> Self {
@@ -419,7 +416,6 @@ impl TupConnection {
     pub fn as_ref(&self) -> TupConnectionRef {
         TupConnectionRef(&self.0)
     }
-
 }
 
 impl Deref for TupConnection {
@@ -436,8 +432,7 @@ impl Deref for TupConnectionRef<'_> {
 }
 
 /// Log sqlite version
-pub fn log_sqlite_version()
-{
+pub fn log_sqlite_version() {
     log::info!("Sqlite version: {}\n", rusqlite::version());
 }
 impl DerefMut for TupConnection {
@@ -449,7 +444,9 @@ pub fn start_connection() -> DbResult<TupConnection> {
     let conn = Connection::open(".tup/db")
         .expect("Connection to tup database in .tup/db could not be established");
     if !is_initialized(&conn, "Node") {
-        return Err(AnyError::from(String::from("Node table not found in .tup/db")));
+        return Err(AnyError::from(String::from(
+            "Node table not found in .tup/db",
+        )));
     }
     Ok(TupConnection::new(conn))
 }

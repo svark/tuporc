@@ -1,14 +1,14 @@
 use proc_macro::TokenStream;
-use quote::{quote, format_ident};
+use quote::{format_ident, quote};
 use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug)]
 enum SqlFunctionType {
     QueryMap, // ends with &
-    Query,      // ends with ?
-    Mutation,   // ends with !
-    InsertId,   // ends with ->
+    Query,    // ends with ?
+    Mutation, // ends with !
+    InsertId, // ends with ->
 }
 
 #[derive(Debug)]
@@ -23,8 +23,7 @@ struct SqlQuery {
 
 fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
     let mut queries = Vec::new();
-    let blocks = content.split("-- <eos>")
-    .filter(|block| !block.is_empty());
+    let blocks = content.split("-- <eos>").filter(|block| !block.is_empty());
 
     for block in blocks {
         let mut lines = block.lines().filter(|l| !l.trim().is_empty());
@@ -65,17 +64,18 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
                 SqlFunctionType::Mutation
             } else if name.ends_with("&") {
                 SqlFunctionType::QueryMap
-            }else{
+            } else {
                 SqlFunctionType::Mutation // default to mutation if no suffix
             };
 
             // Remove the suffix from the name and any whitespace
-            name = name.trim_end_matches('?')
-                      .trim_end_matches("->")
-                      .trim_end_matches('!')
+            name = name
+                .trim_end_matches('?')
+                .trim_end_matches("->")
+                .trim_end_matches('!')
                 .trim_end_matches("&")
-                      .trim()
-                      .to_string();
+                .trim()
+                .to_string();
 
             queries.push(SqlQuery {
                 name,
@@ -92,41 +92,45 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
 #[proc_macro]
 pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
     let sql_file = input.to_string().trim_matches('"').to_string();
-    
+
     // Get the path to Cargo.toml
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set");
-    
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
     // Combine manifest dir with the provided path
     let full_path = PathBuf::from(manifest_dir).join("src").join(&sql_file);
-    
+
     let content = fs::read_to_string(&full_path)
         .unwrap_or_else(|_| panic!("Failed to read SQL file: {}", full_path.display()));
-    
+
     // Extract filename without extension for trait name
     let file_name = std::path::Path::new(&sql_file)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown")
         .to_string();
-    
+
     let trait_name = format_ident!("Tup{}Sql", file_name);
     let queries = parse_sql_file(&content);
-    
+
     let mut trait_functions = Vec::new();
     let mut impl_functions = Vec::new();
 
     for query in queries {
         let fn_name = format_ident!("{}", query.name);
         let query_str = query.query.clone();
-        let return_str = if query.query_returns.is_empty()  {"()".to_string()} else {query.query_returns.clone()};
+        let return_str = if query.query_returns.is_empty() {
+            "()".to_string()
+        } else {
+            query.query_returns.clone()
+        };
         use syn::parse_str;
 
         let return_type: syn::Type = parse_str(&return_str).expect("Failed to parse return type");
 
-        
         // Generate parameter types for trait
-        let param_types: Vec<_> = query.params.iter()
+        let param_types: Vec<_> = query
+            .params
+            .iter()
             .map(|(name, type_str)| {
                 let param_name = format_ident!("{}", name);
                 let param_type = match type_str.trim() {
@@ -140,7 +144,9 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
             })
             .collect();
 
-        let param_names: Vec<_> = query.params.iter()
+        let param_names: Vec<_> = query
+            .params
+            .iter()
             .map(|(name, _)| format_ident!("{}", name))
             .collect();
 
@@ -162,8 +168,8 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         stmt.query_row(params![#(#param_names),*], f)
                     }
                 });
-            },
-             
+            }
+
             SqlFunctionType::QueryMap => {
                 trait_functions.push(quote! {
                     fn #fn_name<F>(&self, #(#param_types,)* f: F) -> rusqlite::Result<()>
@@ -184,8 +190,8 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         Ok(())
                     }
                 });
-            },
-            
+            }
+
             SqlFunctionType::InsertId => {
                 trait_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<i64>;
@@ -198,7 +204,7 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         Ok(self.last_insert_rowid())
                     }
                 });
-            },
+            }
             SqlFunctionType::Mutation => {
                 trait_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize>;
@@ -211,7 +217,7 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         Ok(sz)
                     }
                 });
-            },
+            }
         }
     }
 
