@@ -1,7 +1,7 @@
 extern crate crossbeam_channel;
 extern crate dunce;
 extern crate ferrisetw;
-extern crate windows;
+//extern crate windows;
 
 use std::collections::HashMap;
 use std::collections::HashSet;

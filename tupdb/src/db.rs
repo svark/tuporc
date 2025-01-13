@@ -494,69 +494,18 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
 }
 
 impl MiscStatements for TupConnection {
-    // add all directories a glob has to watch for changes
 
     fn enrich_modified_list(&self) -> DbResult<()> {
-        // add parent dirs to modify list if children of that directory are already in it
-        //let rtype = RowType::Rule as u8;
-        //let grptype = RowType::Grp as u8;
-        {
-            // add parent dirs/glob to modify list if any child of that directory with matched glob pattern is in the delete list/modify list
+        self.delete_tupentries_in_deleted_tupfiles()?;
+        self.add_rules_with_changed_io_to_modify_list()?;
 
-            // delete entries in modify list if they appear in delete list
-            // mark glob patterns as modified if any of its inputs are in the deletelist or modified list
-            // note that glob patterns are mapped to Tupfiles in  NormalLink table
-            // which will then trigger parsing of these tupfiles
-
-            self.delete_tupentries_in_deleted_tupfiles()?;
-            self.add_rules_with_changed_io_to_modify_list()?;
-
-            for (i, sha) in self.fetch_modified_globs()?.into_iter() {
-                self.update_node_sha_exec(i, sha.as_str())?;
-                //   self.mark_modified(i, &Glob)?;
-                self.mark_dependent_tupfiles_of_glob(i)?;
-            }
-            self.mark_dependent_tupfiles_groups()?;
-            self.prune_modify_list_of_inputs_and_outputs()?;
-            self.delete_nodes()?;
-
-            //self.mark_globs_modified(compute_node_sha)?;
-
-            // delete rules that are no longer in any tupfile
-
-            // mark node as Modified if any of its inputs are in the deletelist or modified list
-            /*let mut stmt = self.prepare(
-                "Insert or IGNORE into ModifyList SELECT id, type from Node where id in \
-            (SELECT to_id from NormalLink where from_id in (SELECT id from DeleteList  UNION SELECT id from ModifyList) )"
-            )?;
-            stmt.execute([])?; */
-
-            // delete normal links with from / to id in deletelist
-            // let mut stmt = self.prepare("DELETE from NormalLink where from_id in (SELECT id from DeleteList) or to_id in (SELECT id from DeleteList)")?;
-            // stmt.execute([])?;
-
-            // recursively mark all rules as modified if any of the parent rules are marked as modified
-            // this is the closure operation.
-            /* let mut stmt = self
-                            .prepare(&*format!(
-                                "WITH RECURSIVE NodeChain(id, type) AS (
-              -- Step 1: Get the initial set of nodes (selected list of node ids) along with their types
-              SELECT id, type
-              FROM Node
-              WHERE id IN (SELECT id from ModifyList where type = {rtype})
-              UNION ALL
-              -- Step 2: Recursively select connected nodes along with their types
-              SELECT nl.to_id, nl.to_type
-              FROM NodeChain nc
-              JOIN NormalLink nl ON nc.id = nl.from_id
-            )
-            INSERT or IGNORE INTO ModifyList(id, type)
-            SELECT DISTINCT id, type
-            FROM NodeChain;"
-                            ))
-                            .unwrap();
-                        stmt.execute([])?; */
+        for (i, sha) in self.fetch_modified_globs()?.into_iter() {
+            self.update_node_sha_exec(i, sha.as_str())?;
+            self.mark_dependent_tupfiles_of_glob(i)?;
         }
+        self.mark_dependent_tupfiles_groups()?;
+        self.prune_modify_list_of_inputs_and_outputs()?;
+        self.delete_nodes()?;
 
         Ok(())
     }

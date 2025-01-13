@@ -1,31 +1,35 @@
 -- name: add_to_modify_list!
 -- Add a node to the modify list
+-- when node is already in delete list, keep it in delete list
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype : u8 - type of the node to add
-INSERT or IGNORE into ChangeList(id, type, is_delete) Values (:id,:rtype, 0);
+INSERT or REPLACE into ChangeList(id, type, is_delete) Values (:id,:rtype, 0)
+ON CONFLICT (id, type)  DO UPDATE SET is_delete =  MAX(0, ChangeList.is_delete);
+;
 -- <eos>
 -- name: add_rules_with_changed_io_to_modify_list_inner!
 -- Add all rules with modified (outside of build system) outputs to the modify list
 BEGIN TRANSACTION;
-Insert or IGNORE into ChangeList SELECT n.srcid,1 ,  -- rule
-                                         1  -- change type 1 - ModifyList
+Insert or REPLACE into ChangeList SELECT n.srcid,1 ,  -- rule
+                                         0  -- change type 1 - ModifyList
                                   from Node n
 join ChangeList c on n.id = c.id
-where n.type = (SELECT type_index from NodeType where NodeType.type='GenF');
+where n.type = (SELECT type_index from NodeType where NodeType.type='GenF')
+ON CONFLICT (id, type, is_delete) DO UPDATE  SET is_delete = MAX(0, ChangeList.is_delete);
 
 
 INSERT or ignore  into ChangeList
-SELECT nl.to_id, nl.to_type, 2  -- DeleteList sticky links trigger a delete on target rule if input to rule is in deletelist
+SELECT nl.to_id, nl.to_type, 1  -- DeleteList sticky links trigger a delete on target rule if input to rule is in deletelist
 from NormalLink  nl
 JOIN ChangeList dl on dl.id = nl.from_id
 WHERE
 dl.is_delete = 1 and -- input is deleted
- nl.to_type = 1 -- rule
+ nl.to_type = (SELECT  type_index from NodeType where type='Rule') -- rule
  and nl.issticky = 1;
 
 INSERT or ignore  into ChangeList
-SELECT nl.to_id, nl.to_type, 1 -- ModifyList non-sticky links trigger only a modify on target rule
+SELECT nl.to_id, nl.to_type, 0 -- ModifyList non-sticky links trigger only a modify on target rule
 from NormalLink  nl
 JOIN ChangeList cl on cl.id = nl.from_id
 WHERE
@@ -34,7 +38,6 @@ WHERE
 COMMIT ;
 -- <eos>
 
-
 -- name: add_to_present_list!
 -- Add a node to the present list
 -- # Parameters
@@ -42,6 +45,7 @@ COMMIT ;
 -- param: rtype: u8 - type of the node to add
 INSERT or IGNORE into PresentList(id, type) Values (:id,:rtype);
 -- <eos>
+
 -- name: insert_link_inner!
 -- Insert a link between two nodes
 -- # Parameters
@@ -49,8 +53,9 @@ INSERT or IGNORE into PresentList(id, type) Values (:id,:rtype);
 -- param: to_id : i64 - id of the node to which the link points
 -- param: issticky : u8 - whether the link is sticky
 -- param: to_type : u8 - type of the node to which the link points
-INSERT OR IGNORE into NormalLink (from_id, to_id, issticky, to_type)
-    Values (:from_id,:to_id,:issticky, :to_type);
+INSERT OR REPLACE into NormalLink (from_id, to_id, issticky, to_type)
+    Values (:from_id,:to_id,:issticky, :to_type)
+ON CONFLICT (from_id, to_id, issticky, to_type) DO NOTHING;
 -- <eos>
 -- name: insert_node_inner ->
 -- Insert a node into the database
@@ -151,7 +156,8 @@ INSERT or IGNORE into SuccessList (id) SELECT :rule_id UNION ALL SELECT from_id 
 -- # Parameters
 -- param: dir_id : i64 - id of the directory to insert
 -- param: glob_id : i64 - id of the glob to insert
-INSERT INTO NormalLink (from_id, to_id, issticky, to_type) VALUES (:dir_id, :glob_id, 0,9);
+INSERT or REPLACE INTO NormalLink (from_id, to_id, issticky, to_type) VALUES (:dir_id, :glob_id, 0,9)
+ON CONFLICT (from_id, to_id, issticky, to_type) DO NOTHING;
 
 -- <eos>
 
@@ -160,34 +166,38 @@ INSERT INTO NormalLink (from_id, to_id, issticky, to_type) VALUES (:dir_id, :glo
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype: u8 - type of the node to add
-INSERT or IGNORE into ChangeList(id, type, is_delete) Values (:id,:rtype, 1);
-
+INSERT or REPLACE into ChangeList(id, type, is_delete) Values (:id,:rtype, 1)
+ON CONFLICT (id, type, is_delete) DO NOTHING;
 -- <eos>
 -- name: delete_tupentries_in_deleted_tupfiles_inner!
 -- Delete all nodes that are defined by tupfiles in delete list
 -- # Parameters
-INSERT or IGNORE into ChangeList(id, type, is_delete)
+insert or REPLACE into ChangeList(id, type, is_delete)
 SELECT n.id, n.type, 1 from Node  n
 JOIN DeleteList dl on  n.srcid = dl.id
 where n.type = (SELECT type_index from NodeType where type='Rule')  and
-dl.type = (SELECT type_index from NodeType where type='TupF');
+dl.type = (SELECT type_index from NodeType where type='TupF')
+ON CONFLICT (id, type, is_delete) DO NOTHING;
 
-INSERT or IGNORE into ChangeList(id, type, is_delete)
+INSERT or REPLACE into ChangeList(id, type, is_delete)
 SELECT n.id, n.type, 1
 from Node n
 JOIN DeleteList dl on dl.id = n.srcid
 where n.type = (SELECT type_index from NodeTYpe where type='GenF')
-and dl.type = (SELECT type_index from NodeType where type='Rule');
+and dl.type = (SELECT type_index from NodeType where type='Rule')
+ON CONFLICT (id, type) DO NOTHING;
+
 -- <eos>
 -- name: add_not_present_to_delete_list_inner!
 -- Add all deleted files and folders and env vars to the delete list
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
 SELECT Node.id, Node.type, 1
 FROM Node
 LEFT JOIN PresentList ON Node.id = PresentList.id
 INNER JOIN NodeType ON Node.type = NodeType.type_index
 WHERE PresentList.id IS NULL
-  AND (NodeType.class = 'FILE_SYS');
+  AND (NodeType.class = 'FILE_SYS')
+ON CONFLICT (id, type) DO NOTHING;
 -- <eos>
 -- name: create_tupfile_entities_table_inner!
 -- Create a temporary table to store tupfile entities
@@ -241,11 +251,12 @@ INSERT INTO DYNIO (path, pid, gen, typ, childcnt) VALUES (:path, :pid, :gen, :ty
 
 -- name: mark_dependent_tupfiles_inner!
 -- Enrich the modify list with tupfiles that use modified globs
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
 SELECT nl.to_id, nl.to_type, 0
 from ChangeList cl
 INNER JOIN NormalLink nl on nl.from_id = cl.id
-WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
+WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF')
+ON CONFLICT (id, type) DO NOTHING;
 
 -- <eos>
 
