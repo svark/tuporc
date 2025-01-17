@@ -16,7 +16,7 @@ eyre = "0.6.12"
 bimap = "0.6.3"
 crossbeam = "0.8.4"
 env_logger = "0.11.6"
-log = "0.4.22"
+log = "0.4.25"
 execute = "0.2.13"
 parking_lot = "0.12.3"
 pathdiff = "0.2.3"
@@ -27,10 +27,9 @@ tupdb = { path = "../tupdb" }
 regex = "1.11.1"
 indicatif = "0.17.9"
 console = "0.15.10"
-notify = { version = "7.0.0", features = ["crossbeam-channel"] }
+notify = { version = "8.0.0", features = ["crossbeam-channel"] }
 fs4 = {version = "0.12.0", features = ["sync"]}
 ignore = "0.4.23"
-scopeguard = "1.2.0"
 [profile.release]
 lto = true
 
