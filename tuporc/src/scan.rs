@@ -29,7 +29,7 @@ use walkdir::{DirEntry, WalkDir};
 const MAX_THRS_NODES: u8 = 6;
 pub const MAX_THRS_DIRS: usize = 22;
 
-static TUP_CONFIG: &str = "tup.config";
+pub static TUP_CONFIG: &str = "tup.config";
 /// handle the tup scan command by walking the directory tree and adding dirs and files into node table.
 pub(crate) fn scan_root(
     root: &Path,
@@ -282,6 +282,9 @@ fn walkdir_from(
                 if !ign.matched(pp.get_path().as_path(), true).is_ignore() {
                     let pdir = DirSender::new(pp, dir_sender.clone());
                     dir_sender.send(pdir).unwrap(); // unwrap is safe here as we are not expecting the receiver to be closed within scope
+                }else {
+                    log::debug!("ignoring path:{}", pp.get_path().as_path().display());
+                    return;
                 }
             }
             children.push(dir_entry);

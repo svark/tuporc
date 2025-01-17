@@ -20,8 +20,8 @@ use regex::Regex;
 use tupdb::db::{start_connection, Node, TupConnection};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::TupPathDescriptor;
-use tupparser::decode::{decode_group_captures, TupLoc};
-use tupparser::statements::Loc;
+use tupparser::decode::{decode_group_captures};
+use tupparser::statements::{Loc, TupLoc};
 
 use crate::parse::ConnWrapper;
 use crate::TermProgress;
