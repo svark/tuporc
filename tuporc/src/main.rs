@@ -13,7 +13,6 @@ extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
 extern crate regex;
-extern crate scopeguard;
 extern crate tupdb;
 
 use std::borrow::Cow;
