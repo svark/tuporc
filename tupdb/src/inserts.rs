@@ -184,12 +184,12 @@ impl LibSqlInserts for Connection {
     /// [upsert_node] is akin to the sqlite upsert operation
     /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
     /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
-    fn upsert_node(&self, node: &Node, f: impl FnMut() -> String) -> Result<Node, AnyError> {
+    fn upsert_node(&self, node: &Node, compute_sha: impl FnMut() -> String) -> Result<Node, AnyError> {
         let db_node = self
             .fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
             .map_err(|e| e.into())
             .and_then(|existing_node| {
-                self.update_columns(node, &existing_node, f)
+                self.update_columns(node, &existing_node, compute_sha)
                     .map(|_| existing_node)
             });
         match db_node {
