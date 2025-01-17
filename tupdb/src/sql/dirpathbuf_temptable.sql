@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS Node
 
 CREATE TABLE IF NOT EXISTS NodeType
 (
-    id   INTEGER PRIMARY KEY not NULL,
-    type CHAR(8),
+    id    INTEGER PRIMARY KEY not NULL,
+    type  CHAR(8),
     class VARCHAR(16)
 );
 
@@ -31,8 +31,8 @@ WITH RECURSIVE full_path(id, dir, name) AS
 SELECT id, dir, name
 from full_path;
 
-CREATE INDEX DIRPATHBUF  On DIRPATHBUF(name);
-CREATE INDEX DIRPATHBUF  On DIRPATHBUF(id);
+CREATE INDEX DIRPATHBUFNameIndex On DIRPATHBUF (name);
+CREATE INDEX DIRPATHBUFIdIndex On DIRPATHBUF (id);
 
 DROP TABLE IF EXISTS GRPPATHBUF;
 CREATE TABLE GRPPATHBUF AS
@@ -57,8 +57,8 @@ CREATE TABLE PresentList
 );
 Create Table IF NOT EXISTS ChangeList
 (
-    id   INTEGER PRIMARY KEY not NULL,
-    type INTEGER,
+    id          INTEGER PRIMARY KEY not NULL,
+    type        INTEGER,
     change_type INTEGER
 );
 

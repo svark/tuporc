@@ -1,4 +1,3 @@
-
 -- Node table queries
 -- name: fetch_node_id_by_dir_and_name_inner?
 -- Fetch the id of a node
@@ -6,7 +5,10 @@
 -- param: dir : i64 - directory of the node as id
 -- param: name : &str - name of the node
 -- returns: i64
-SELECT id FROM Node where dir=:dir and name=:name;
+SELECT id
+FROM Node
+where dir = :dir
+  and name = :name;
 -- <eos>
 
 -- name: fetch_node_by_id_inner?
@@ -14,14 +16,20 @@ SELECT id FROM Node where dir=:dir and name=:name;
 -- # Parameters
 -- param: id : i64 - id of the node
 -- returns: Node
-SELECT * FROM Node where id=:id LIMIT 1;
+SELECT *
+FROM Node
+where id = :id
+LIMIT 1;
 -- <eos>
 -- name: fetch_node_name_by_id_inner?
 -- Fetch a node by id
 -- # Parameters
 -- param: id : i64 - id of the node
 -- returns: String
-SELECT name FROM Node where id=:id LIMIT 1;
+SELECT name
+FROM Node
+where id = :id
+LIMIT 1;
 -- <eos>
 
 -- name: fetch_node_by_dir_and_name_inner?
@@ -30,20 +38,28 @@ SELECT name FROM Node where id=:id LIMIT 1;
 -- param: dir : i64 - directory id
 -- param: name : &str - name of the node
 -- returns: Node
-SELECT * FROM Node where dir=:dir and name=:name;
+SELECT *
+FROM Node
+where dir = :dir
+  and name = :name;
 -- <eos>
 
 -- name: fetch_rule_nodes_by_dir_inner&
 -- Fetch the rule nodes by directory id
 -- # Parameters
 -- param: dir : i64 - directory id
-SELECT id FROM Node where dir=:dir and type = (SELECT type_index from NodeType where type='Rule');
+SELECT id
+FROM Node
+where dir = :dir
+  and type = (SELECT type_index from NodeType where type = 'Rule');
 -- <eos>
 
 -- name: for_each_gen_file_inner&
 -- Fetch all the nodes
-SELECT  n.id, n.dir, n.type, dpb.name || '/' || n.name, mtime_ns from Node n
-JOIN DirPathBuf dpb on n.dir = dpb.id where n.type = (SELECT type_index from NodeType where type='GenF');
+SELECT n.id, n.dir, n.type, dpb.name || '/' || n.name, mtime_ns
+from Node n
+         JOIN DirPathBuf dpb on n.dir = dpb.id
+where n.type = (SELECT type_index from NodeType where type = 'GenF');
 -- <eos>
 
 -- name: fetch_node_flags_inner?
@@ -51,7 +67,9 @@ JOIN DirPathBuf dpb on n.dir = dpb.id where n.type = (SELECT type_index from Nod
 -- # Parameters
 -- param: node_id : i64 - id of the node
 -- returns: String
-SELECT flags from Node where id=:node_id;
+SELECT flags
+from Node
+where id = :node_id;
 -- <eos>
 
 -- name: fetch_parent_rule_of_node_inner?
@@ -59,7 +77,9 @@ SELECT flags from Node where id=:node_id;
 -- # Parameters
 -- param: node_id : i64 - id of the node
 -- returns: i64
-SELECT srcid from Node where id=:node_id;
+SELECT srcid
+from Node
+where id = :node_id;
 -- <eos>
 
 -- name: find_globs_at_dir?
@@ -67,7 +87,10 @@ SELECT srcid from Node where id=:node_id;
 -- # Parameters
 -- param: dir_id : i64 - id of the directory
 -- returns: i64
-SELECT id from Node where type = (SELECT type_index from NodeType where type='Glob') and dir = :dir_id;
+SELECT id
+from Node
+where type = (SELECT type_index from NodeType where type = 'Glob')
+  and dir = :dir_id;
 -- <eos>
 
 -- DirPathBuf table queries
@@ -76,7 +99,9 @@ SELECT id from Node where type = (SELECT type_index from NodeType where type='Gl
 -- # Parameters
 -- param: path : &str - path of the directory
 -- returns: i64
-SELECT id FROM DirPathBuf where name=:path;
+SELECT id
+FROM DirPathBuf
+where name = :path;
 -- <eos>
 
 -- name: fetch_dirid_and_parent_by_path?
@@ -84,7 +109,10 @@ SELECT id FROM DirPathBuf where name=:path;
 -- # Parameters
 -- param: path : &str - path of the directory
 -- returns: (i64, i64)
-SELECT id, dir FROM DirPathBuf where name=:path LIMIT 1;
+SELECT id, dir
+FROM DirPathBuf
+where name = :path
+LIMIT 1;
 -- <eos>
 
 -- name: fetch_node_by_path_inner?
@@ -93,41 +121,55 @@ SELECT id, dir FROM DirPathBuf where name=:path LIMIT 1;
 -- param: filename: &str  - name of the node
 -- param: dir_path : &str - dir path of the node
 -- returns: (i64, i64)
-SELECT Node.id, Node.dir from Node join DIRPATHBUF on Node.dir = DIRPATHBUF.id where DIRPATHBUF.name  = :dir_path and Node.name =:filename;
+SELECT Node.id, Node.dir
+from Node
+         join DIRPATHBUF on Node.dir = DIRPATHBUF.id
+where DIRPATHBUF.name = :dir_path
+  and Node.name = :filename;
 -- <eos>
 -- name: fetch_dirpath_by_dirid?
 -- Fetch the directory path buffer by directory id
 -- # Parameters
 -- param: dir_id : i64 - directory id
 -- returns: String
-SELECT name FROM DirPathBuf where id=:dir_id;
+SELECT name
+FROM DirPathBuf
+where id = :dir_id;
 -- <eos>
 
 -- TupPathBuf table queries
 -- name: for_each_modified_tupfile_inner&
 -- Fetch the modified tup files
-SELECT tpb.id, tpb.dir, tpb.name from TupPathBuf tpb
-join  ModifyList on tpb.id = ModifyList.id
-where type = (SELECT type_index from NodeType where type='TupF');
+SELECT tpb.id, tpb.dir, tpb.name
+from TupPathBuf tpb
+         join ModifyList on tpb.id = ModifyList.id
+where type = (SELECT type_index from NodeType where type = 'TupF');
 -- <eos>
 
 -- name: for_each_tupnode_inner&
 -- Fetch all the tup files
-SELECT id, dir, name from TupPathBuf;
+SELECT id, dir, name
+from TupPathBuf;
 -- <eos>
 
 -- name: fetch_dependent_tup_files_by_rule_id&
 -- Fetch the dependent tup file ids from rule_id
 -- # Parameters
 -- param: rule_id : i64 - id of the rule
-SELECT id, dir, name from TUPPATHBUF where dir in
-             (SELECT dir from Node where type = (SELECT type_index from NodeType where type='Rule') and id in
-            (WITH RECURSIVE dependents(x) AS (
-   SELECT :rule_id
-   UNION
-  SELECT to_id FROM NormalLink JOIN dependents ON NormalLink.from_id=x
-)
-SELECT DISTINCT x FROM dependents));
+SELECT id, dir, name
+from TUPPATHBUF
+where dir in
+      (SELECT dir
+       from Node
+       where type = (SELECT type_index from NodeType where type = 'Rule')
+         and id in
+             (WITH RECURSIVE dependents(x) AS (SELECT :rule_id
+                                               UNION
+                                               SELECT to_id
+                                               FROM NormalLink
+                                                        JOIN dependents ON NormalLink.from_id = x)
+              SELECT DISTINCT x
+              FROM dependents));
 -- <eos>
 
 -- NodeSha table queries
@@ -136,7 +178,9 @@ SELECT DISTINCT x FROM dependents));
 -- # Parameters
 -- param: id : i64 - id of the node
 -- returns: String
-SELECT sha from NodeSha where id=:id;
+SELECT sha
+from NodeSha
+where id = :id;
 -- <eos>
 
 -- Rule related queries (joins)
@@ -144,23 +188,31 @@ SELECT sha from NodeSha where id=:id;
 -- Fetch the outputs of a rule
 -- # Parameters
 -- param: rule_id : i64 - id of the rule
-SELECT Node.id , Node.dir, Node.type,
-         (DirPathBuf.name || '/' || Node.name) name, Node.mtime_ns mtime_ns from NODE
+SELECT Node.id,
+       Node.dir,
+       Node.type,
+       (DirPathBuf.name || '/' || Node.name) name,
+       Node.mtime_ns                         mtime_ns
+from NODE
          inner join DirPathBuf on (Node.dir = DirPathBuf.id)
-         where  Node.srcid = :rule_id and Node.type = (SELECT type_index from NodeType where type='GenF');
+where Node.srcid = :rule_id
+  and Node.type = (SELECT type_index from NodeType where type = 'GenF');
 -- <eos>
 
 -- name: for_each_rule_input_inner&
 -- Fetch the file inputs of a rule or a group
 -- # Parameters
 -- param: node_id : i64 - id of the rule
-SELECT Node.id as id, Node.dir as dir, Node.type as type,
-        (DirPathBuf.name || '/' || Node.name) name, Node.mtime_ns mtime_ns
-        from NODE 
-        join DirPathBuf on (Node.dir = DirPathBuf.id) 
-        join NormalLink nl on (Node.id = nl.from_id)
-        where (Node.type in (SELECT type_index from NodeType where class='FILE_SYS'))
-        and nl.to_id = :node_id;
+SELECT Node.id   as                          id,
+       Node.dir  as                          dir,
+       Node.type as                          type,
+       (DirPathBuf.name || '/' || Node.name) name,
+       Node.mtime_ns                         mtime_ns
+from NODE
+         join DirPathBuf on (Node.dir = DirPathBuf.id)
+         join NormalLink nl on (Node.id = nl.from_id)
+where (Node.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
+  and nl.to_id = :node_id;
 -- <eos>
 
 -- name: fetch_rule_input_matching_group_name_inner?
@@ -169,10 +221,13 @@ SELECT Node.id as id, Node.dir as dir, Node.type as type,
 -- param: rule_id : i64 - id of the rule
 -- param: group: &str - name of the group
 -- returns: i64
-SELECT id from Node n
-JOIN NormalLink nl on (n.id = nl.from_id)
-where n.type in (SELECT type_index from NodeType where type='Group') 
-and nl.to_id = :rule_id and n.name = :group LIMIT 1;
+SELECT id
+from Node n
+         JOIN NormalLink nl on (n.id = nl.from_id)
+where n.type in (SELECT type_index from NodeType where type = 'Group')
+  and nl.to_id = :rule_id
+  and n.name = :group
+LIMIT 1;
 -- <eos>
 
 -- Complex queries with multiple joins
@@ -180,13 +235,15 @@ and nl.to_id = :rule_id and n.name = :group LIMIT 1;
 -- Fetch the nodes matching a glob node by tracking matches in the file system paths with dirs in GlobWatchDirs
 -- # Parameters
 -- param: glob_id : i64 - id of the glob node
-SELECT n.id FROM Node as n
-        JOIN DirPathBuf as dpb ON n.dir = dpb.id
-        JOIN NormalLink as gwd ON dpb.id = gwd.from_id
-        JOIN Node as n2 ON gwd.from_id = n2.id
-        WHERE n.name GLOB n2.name AND dpb.name GLOB n2.display_str
-        AND gwd.to_id = :glob_id
-        AND (n.type in (SELECT type_index from NodeType where class='FILE_SYS'));
+SELECT n.id
+FROM Node as n
+         JOIN DirPathBuf as dpb ON n.dir = dpb.id
+         JOIN NormalLink as gwd ON dpb.id = gwd.from_id
+         JOIN Node as n2 ON gwd.from_id = n2.id
+WHERE n.name GLOB n2.name
+  AND dpb.name GLOB n2.display_str
+  AND gwd.to_id = :glob_id
+  AND (n.type in (SELECT type_index from NodeType where class = 'FILE_SYS'));
 -- <eos>
 
 -- name: fetch_node_by_name_and_dirpath?
@@ -195,9 +252,12 @@ SELECT n.id FROM Node as n
 -- param: name : &str - name of the node
 -- param: dirpath : &str - path of the directory
 -- returns: Node
-SELECT * FROM Node n
+SELECT *
+FROM Node n
          JOIN DirPathBuf dpb on dpb.id = n.dir
-         where n.name=:name and dpb.name=:dirpath LIMIT 1;
+where n.name = :name
+  and dpb.name = :dirpath
+LIMIT 1;
 -- <eos>
 
 -- Other table queries
@@ -205,7 +265,9 @@ SELECT * FROM Node n
 -- Fetch the io entries
 -- # Parameters
 -- param: pid : i32 - process id
-SELECT path, pid, gen, typ from DynIO where pid = :pid;
+SELECT path, pid, gen, typ
+from DynIO
+where pid = :pid;
 -- <eos>
 
 -- name: fetch_env_value?
@@ -213,30 +275,41 @@ SELECT path, pid, gen, typ from DynIO where pid = :pid;
 -- # Parameters
 -- param: name: &str - env variable name
 -- returns: (i64, String)
-Select id, display_str from Node where name=:name and dir=-2 LIMIT 1;
+Select id, display_str
+from Node
+where name = :name
+  and dir = -2
+LIMIT 1;
 -- <eos>
 
 -- name: fetch_env_deps?
 -- Fetch the environment dependencies (as defined by export statements) of a rule  
 -- # Parameters
 -- param: rule_id : i64 - id of the rule
-SELECT name from Node  as n
-join NormalLink as nl on n.id = nl.to_id
-where nl.from_id = :rule_id and n.dir = -2;
+SELECT name
+from Node as n
+         join NormalLink as nl on n.id = nl.to_id
+where nl.from_id = :rule_id
+  and n.dir = -2;
 -- <eos>
 
 -- name: fetch_monitored_files_inner?
 -- Fetch the monitored files
 -- # Parameters
 -- param: generation_id : i64 - generation id
-SELECT name, event from Monitored_Files where generation_id = :generation_id;
+SELECT name, event
+from Monitored_Files
+where generation_id = :generation_id;
 -- <eos>
 
 -- name: fetch_latest_message?
 -- Fetch the latest message
 -- # Parameters
 -- returns: String
-SELECT message from Messages order by id desc limit 1;
+SELECT message
+from Messages
+order by id desc
+limit 1;
 -- <eos>
 
 -- name: fetch_closest_parent_inner?
@@ -256,29 +329,34 @@ WITH RECURSIVE parentDirectories as (
     -- continue to find parent directories until dir = 0
     Select n.id, n.name, n.dir
     From node n
-    Inner Join parentDirectories pd on n.id = pd.dir
-    Where pd.dir != 0
-) Select f.name, f.dir
+             Inner Join parentDirectories pd on n.id = pd.dir
+    Where pd.dir != 0)
+Select f.name, f.dir
 From parentDirectories pd
-Join node f on f.dir = pd.id and LOWER(f.name) = :name Limit 1;
+         Join node f on f.dir = pd.id and f.name = :name
+LIMIT 1;
 -- <eos>
 
 -- name: for_each_rule_to_run_no_targets_inner&
 -- Fetch the rules to run with no targets
-SELECT n.id, n.dir, n.name, n.display_str, n.flags, n.srcid  from Node n
-JOIN ModifyList ML on n.id = ML.id
-where ML.type = 1; -- 1 is the  node type for a rule
+SELECT n.id, n.dir, n.name, n.display_str, n.flags, n.srcid
+from Node n
+         JOIN ModifyList ML on n.id = ML.id
+where ML.type = 1;
+-- 1 is the  node type for a rule
 -- <eos>
 
 -- name: for_each_link_inner&
 -- Fetch the links
-SELECT from_id, to_id from NormalLink;
+SELECT from_id, to_id
+from NormalLink;
 -- <eos>
 
 -- name: fetch_maybe_changed_globs_inner&
 -- Fetch the globs with modified search directories
-SELECT DISTINCT gwd.to_id from NormalLink as gwd
-    JOIN ChangeList as cl on gwd.from_id = cl.id;
+SELECT DISTINCT gwd.to_id
+from NormalLink as gwd
+         JOIN ChangeList as cl on gwd.from_id = cl.id;
 -- <eos>
 
 
@@ -299,14 +377,15 @@ WITH RECURSIVE sub_tree AS (
     -- Recursive step: Find children that are directories
     SELECT st.id, st.dir, st.name, st.depth + 1 AS depth
     FROM DirPathBuf dt
-    JOIN sub_tree st ON dt.dir = st.id
-    AND (st.depth < :glob_depth)
-)
-SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns  FROM Node n
-JOIN subtree as st on n.dir = st.id
-WHERE n.name GLOB :glob_pattern AND st.name GLOB :glob_dir_pattern
-        AND (n.type in (SELECT type_index from NodeType where class='FILE_SYS'))
-ORDER BY  n.id;
+             JOIN sub_tree st ON dt.dir = st.id
+        AND (st.depth < :glob_depth))
+SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
+FROM Node n
+         JOIN subtree as st on n.dir = st.id
+WHERE n.name GLOB :glob_pattern
+  AND st.name GLOB :glob_dir_pattern
+  AND (n.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
+ORDER BY n.id;
 
 -- <eos>
 -- name: for_each_shallow_glob_match_inner&
@@ -314,11 +393,13 @@ ORDER BY  n.id;
 -- # Parameters
 -- param: glob_dir_id : i64 - id of the directory containing the glob
 -- param: glob_pattern : &str - glob pattern to match file names
-SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns  FROM Node n
-join DIRPATHBUF as st on st.id = n.dir
-WHERE  st.id = :glob_dir_id and n.name GLOB :glob_pattern
-        AND (n.type in (SELECT type_index from NodeType where class='FILE_SYS'))
-ORDER BY  n.id;
+SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
+FROM Node n
+         join DIRPATHBUF as st on st.id = n.dir
+WHERE st.id = :glob_dir_id
+  and n.name GLOB :glob_pattern
+  AND (n.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
+ORDER BY n.id;
 -- <eos>
 
 -- name: for_each_glob_dir_inner&
@@ -336,10 +417,10 @@ WITH RECURSIVE sub_tree AS (
     -- Recursive step: Find children that are directories
     SELECT dt.id, dt.dir, dt.name, st.depth + 1 AS depth
     FROM DirPathBuf dt
-    JOIN sub_tree st ON dt.dir = st.id
-    AND (st.depth < :glob_depth)
-)
-SELECT name FROM  subtree;
+             JOIN sub_tree st ON dt.dir = st.id
+        AND (st.depth < :glob_depth))
+SELECT name
+FROM subtree;
 
 -- <eos>
 

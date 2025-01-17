@@ -1,4 +1,3 @@
-use rusqlite::params;
 use rusqlite::{Connection, Result};
 use tupdb_sql_macro::generate_prepared_statements;
 

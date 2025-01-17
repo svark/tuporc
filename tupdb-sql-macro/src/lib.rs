@@ -165,7 +165,11 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<#return_type>,
                     {
                         let mut stmt = self.prepare(#query_str)?;
-                        stmt.query_row(params![#(#param_names),*], f)
+                        stmt.query_row(
+                        dynamic_named_params! {#(
+                              #param_names
+                           ),*
+                        }, f)
                     }
                 });
             }
@@ -182,8 +186,13 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                     where
                         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
                     {
-                        let mut stmt = self.prepare(#query_str)?;
-                        let mut rows = stmt.query(params![#(#param_names),*])?;
+                        let mut stmt = self.prepare_cached(#query_str)?;
+                        let mut rows = stmt.query(
+                            dynamic_named_params! {#(
+                                  #param_names
+                               ),*
+                            }
+                        )?;
                         while let Some(row) = rows.next()? {
                             f(&row)?;
                         }
@@ -199,8 +208,13 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
 
                 impl_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<i64> {
-                        let mut stmt = self.prepare(#query_str)?;
-                        stmt.insert(params![#(#param_names),*])?;
+                        let mut stmt = self.prepare_cached(#query_str)?;
+                        stmt.insert(
+                            dynamic_named_params!{#(
+                                  #param_names
+                               ),*
+                            }
+                        )?;
                         Ok(self.last_insert_rowid())
                     }
                 });
@@ -212,8 +226,13 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
 
                 impl_functions.push(quote! {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize> {
-                        let mut stmt = self.prepare(#query_str)?;
-                        let sz: usize = stmt.execute(params![#(#param_names),*])?;
+                        let mut stmt = self.prepare_cached(#query_str)?;
+                        let sz: usize = stmt.execute(
+                            dynamic_named_params! {#(
+                                  #param_names
+                               ),*
+                            }
+                        )?;
                         Ok(sz)
                     }
                 });

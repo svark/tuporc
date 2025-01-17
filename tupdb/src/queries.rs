@@ -1,7 +1,6 @@
 use crate::db::{db_path_str, make_node, make_rule_node, make_tup_node, IOClass, Node, RowType};
 use crate::error::{AnyError, DbResult, SqlResult};
 use rusqlite::ffi;
-use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tupdb_sql_macro::generate_prepared_statements;

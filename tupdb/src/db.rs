@@ -2,9 +2,9 @@ use rusqlite::{Connection, Row, Transaction};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::ops::{Deref, DerefMut};
+use std::ops::{AddAssign, Deref, DerefMut, SubAssign};
 use std::path::{Path, MAIN_SEPARATOR};
-
+use std::sync::{Arc, Mutex};
 use crate::db::RowType::{DirGen, GenF};
 use crate::deletes::LibSqlDeletes;
 use crate::error::{AnyError, DbResult, SqlResult};
@@ -374,20 +374,28 @@ pub fn init_db() -> DbResult<()> {
     Ok(())
 }
 
-pub struct TupConnection(Connection);
+pub struct TupConnection(Connection, Arc<Mutex<usize>>);
 pub struct TupConnectionRef<'a>(&'a Connection);
 
-pub struct TupTransaction<'a>(Transaction<'a>);
+pub struct TupTransaction<'a>(Transaction<'a>, Arc<Mutex<usize>>);
 
 impl<'a> TupTransaction<'a> {
-    fn new(t: Transaction) -> TupTransaction {
-        TupTransaction(t)
+    fn new(t: Transaction, ref_count : Arc<Mutex<usize>>) -> TupTransaction {
+        TupTransaction(t, ref_count)
     }
     pub fn commit(self) -> DbResult<()> {
+         let mut binding = self.1.lock().unwrap();
+        let x = binding.deref_mut();
+        assert_eq!(*x, 1);
+        x.sub_assign(1);
         self.0.commit()?;
         Ok(())
     }
     pub fn rollback(self) -> DbResult<()> {
+         let mut binding = self.1.lock().unwrap();
+        let x = binding.deref_mut();
+        assert_eq!(*x, 1);
+        x.sub_assign(1);
         self.0.rollback()?;
         Ok(())
     }
@@ -406,11 +414,16 @@ impl<'a> Deref for TupTransaction<'a> {
 
 impl TupConnection {
     fn new(conn: Connection) -> Self {
-        TupConnection(conn)
+        TupConnection(conn, Arc::from(Mutex::new(0)))
     }
 
     pub fn transaction(&mut self) -> DbResult<TupTransaction<'_>> {
-        Ok(TupTransaction::new(self.0.transaction()?))
+        {
+            let mut ref_cnt = self.1.lock().unwrap();
+            assert_eq!(*ref_cnt, 0usize);
+            ref_cnt.deref_mut().add_assign( 1);
+        }
+        Ok(TupTransaction::new(self.0.transaction()?, self.1.clone()))
     }
 
     pub fn as_ref(&self) -> TupConnectionRef {
@@ -428,6 +441,12 @@ impl Deref for TupConnectionRef<'_> {
     type Target = Connection;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl TupConnectionRef<'_> {
+    pub fn transaction(&self) -> DbResult<TupTransaction<'_>> {
+        unreachable!("Cannot start a transaction on a read-only connection")
     }
 }
 
