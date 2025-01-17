@@ -8,7 +8,7 @@ license = "Apache 2.0"
 ferrisetw = "1.2.0" # This is the only dependency you need to add
 crossbeam-channel = "0.5.14"
 dunce = "1.0.5"
-log = "0.4.22"
+log = "0.4.25"
 thiserror = "2.0.11"
 
 [[example]]
