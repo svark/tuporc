@@ -2,7 +2,7 @@ use crate::scan::{HashedPath, MAX_THRS_DIRS};
 use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
-use eyre::{bail, eyre, OptionExt, Report, Result};
+use eyre::{bail, eyre, Context, OptionExt, Report, Result};
 use log::debug;
 use parking_lot::Mutex;
 use std::borrow::Cow;
@@ -15,13 +15,16 @@ use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
 use tupdb::db::{
     create_path_buf_temptable, db_path_str, MiscStatements, Node, RowType, TupConnection,
-    TupConnectionRef,
+    TupConnectionRef, TupTransaction,
 };
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
-use tupparser::buffers::{EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers, PathDescriptor, RuleDescriptor, RuleRefDescriptor, TaskDescriptor, TupPathDescriptor};
+use tupparser::buffers::{
+    EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
+    PathDescriptor, RuleDescriptor, RuleRefDescriptor, TaskDescriptor, TupPathDescriptor,
+};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
@@ -370,14 +373,15 @@ impl NodeToInsert {
     }
 }
 impl CrossRefMaps {
-    pub fn get_group_db_id(&self, g: &GroupPathDescriptor) -> Option<(i64, i64)> {
+    fn get_group_db_id(&self, g: &GroupPathDescriptor) -> Option<(i64, i64)> {
         self.group_id.get_by_left(g).copied()
     }
     pub fn get_group_db_id_ok(&self, g: &GroupPathDescriptor) -> Result<(i64, i64)> {
-        self.group_id.get_by_left(g).copied().ok_or_else(|| eyre!("group {} not found in crossref", g))
+        self.get_group_db_id(g)
+            .ok_or_else(|| eyre!("group {} not found in crossref", g))
     }
-    
-    pub fn get_path_db_id(&self, p: &PathDescriptor) -> Option<(i64, i64)> {
+
+    fn get_path_db_id(&self, p: &PathDescriptor) -> Option<(i64, i64)> {
         if p.eq(&PathDescriptor::default()) {
             Some((1, 0))
         } else {
@@ -385,35 +389,40 @@ impl CrossRefMaps {
         }
     }
     pub fn get_path_db_id_ok(&self, p: &PathDescriptor) -> Result<(i64, i64)> {
-        self.get_path_db_id(p).ok_or_else(|| eyre!("path {} not found in crossref", p))
+        self.get_path_db_id(p)
+            .ok_or_else(|| eyre!("path {} not found in crossref", p))
     }
-    pub fn get_rule_db_id(&self, r: &RuleDescriptor) -> Option<(i64, i64)> {
+    fn get_rule_db_id(&self, r: &RuleDescriptor) -> Option<(i64, i64)> {
         self.rule_id.get_by_left(r).copied()
     }
-    
+
     pub fn get_rule_db_id_ok(&self, r: &RuleDescriptor) -> Result<(i64, i64)> {
-        self.get_rule_db_id(r).ok_or_else(|| eyre!("rule {} not found in crossref", r))
+        self.get_rule_db_id(r)
+            .ok_or_else(|| eyre!("rule {} not found in crossref", r))
     }
 
-    pub fn get_tup_db_id(&self, r: &TupPathDescriptor) -> Option<(i64, i64)> {
+    fn get_tup_db_id(&self, r: &TupPathDescriptor) -> Option<(i64, i64)> {
         self.tup_id.get_by_left(r).copied()
     }
 
     pub fn get_tup_db_id_ok(&self, r: &TupPathDescriptor) -> Result<(i64, i64)> {
-        self.get_tup_db_id(r).ok_or_else(|| eyre!("tup {} not found in crossref", r))
+        self.get_tup_db_id(r)
+            .ok_or_else(|| eyre!("tup {} not found in crossref", r))
     }
-    pub fn get_env_db_id(&self, e: &EnvDescriptor) -> Option<i64> {
+    fn get_env_db_id(&self, e: &EnvDescriptor) -> Option<i64> {
         self.env_id.get_by_left(e).copied()
     }
 
     pub fn get_env_db_id_ok(&self, e: &EnvDescriptor) -> Result<i64> {
-        self.get_env_db_id(e).ok_or_else(|| eyre!("env {} not found in crossref", e))
+        self.get_env_db_id(e)
+            .ok_or_else(|| eyre!("env {} not found in crossref", e))
     }
-    pub fn get_glob_db_id(&self, s: &GlobPathDescriptor) -> Option<(i64, i64)> {
+    fn get_glob_db_id(&self, s: &GlobPathDescriptor) -> Option<(i64, i64)> {
         self.path_id.get_by_left(&s).copied()
     }
     pub fn get_glob_db_id_ok(&self, s: &GlobPathDescriptor) -> Result<(i64, i64)> {
-        self.get_glob_db_id(s).ok_or_else(|| eyre!("glob {} not found in crossref", s))
+        self.get_glob_db_id(s)
+            .ok_or_else(|| eyre!("glob {} not found in crossref", s))
     }
     #[allow(dead_code)]
     pub fn get_task_id(&self, t: &TaskDescriptor) -> Option<(i64, i64)> {
@@ -506,9 +515,7 @@ impl DbPathSearcher {
                     return Ok(());
                 }
                 debug!("found glob match:{} in db", s);
-                let full_path_pd = ph
-                    .add_abs(s)
-                    .map_err(into_any_error)?;
+                let full_path_pd = ph.add_abs(s).map_err(into_any_error)?;
                 let matching_path = if has_glob_pattern {
                     let full_path_pd_clone = full_path_pd.clone();
                     let full_path = ph.get_path(&full_path_pd);
@@ -722,6 +729,56 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     Ok(())
 }
 
+fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) -> Result<()> {
+    match link {
+        Link::InputToRule(i, rd) => {
+            let input_id = crossref.get_path_db_id_ok(&i)?;
+            let rule_id = crossref.get_rule_db_id_ok(&rd)?;
+            tx.insert_link(input_id.0, rule_id.0, false.into(), Rule)?;
+        }
+        Link::RuleToOutput(rd, out) => {
+            let rule_id = crossref.get_rule_db_id_ok(&rd)?;
+            let output_id = crossref.get_path_db_id_ok(&out)?;
+            tx.insert_link(output_id.0, rule_id.0, true.into(), Rule)?;
+        }
+        Link::OutputToGroup(out, group) => {
+            let output_id = crossref.get_path_db_id_ok(&out)?;
+            let group_id = crossref.get_group_db_id_ok(&group)?;
+            tx.insert_link(output_id.0, group_id.0, true.into(), Group)?;
+        }
+        Link::GroupToRule(group, rd) => {
+            let group_id = crossref.get_group_db_id_ok(&group)?;
+            let rule_id = crossref.get_rule_db_id_ok(&rd)?;
+            tx.insert_link(group_id.0, rule_id.0, false.into(), Rule)?;
+        }
+        Link::EnvToRule(env, rd) => {
+            let env_id = crossref.get_env_db_id_ok(&env)?;
+            let rule_id = crossref.get_rule_db_id_ok(&rd)?;
+            tx.insert_link(env_id, rule_id.0, true.into(), Rule)?;
+        }
+        Link::TupfileToTupfile(pd, tupd) => {
+            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+            let tupfile_read_id = crossref.get_path_db_id_ok(&pd)?;
+            tx.insert_link(tupfile_read_id.0, tupfile_id.0, true.into(), TupF)?;
+        }
+        Link::GlobToTupfile(g, tupd) => {
+            let glob_id = crossref.get_glob_db_id_ok(&g)?;
+            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+            tx.insert_link(glob_id.0, tupfile_id.0, true.into(), TupF)?;
+        }
+        Link::TupfileToRule(tupd, rd) => {
+            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+            let rule_id = crossref.get_rule_db_id_ok(&rd)?;
+            tx.insert_link(tupfile_id.0, rule_id.0, false.into(), Rule)?;
+        }
+        Link::DirToGlob(dir, glob) => {
+            let dir_id = crossref.get_path_db_id_ok(&dir)?;
+            let glob_id = crossref.get_glob_db_id_ok(&glob)?;
+            tx.insert_link(dir_id.0, glob_id.0, true.into(), Glob)?;
+        }
+    }
+    Ok(())
+}
 
 fn insert_links(
     conn: &mut TupConnection,
@@ -741,91 +798,13 @@ fn insert_links(
     let tx = conn.transaction()?;
     {
         for l in links {
-            match l {
-                Link::InputToRule(i, rd) => {
-                    let (input_id, _) = crossref.get_path_db_id(&i).ok_or_else(|| {
-                        eyre!("input not found:{:?} mentioned in rule {:?}", i, rd)
-                    })?;
-                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
-                        eyre!("rule not found:{:?} mentioned in rule {:?}", rd, i)
-                    })?;
-                    tx.insert_link(input_id, rule_id, false.into(), Rule)
-                        .map_err(|e| eyre!(e.to_string()))?;
-                }
-                Link::RuleToOutput(rd, out) => {
-                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
-                        eyre!("rule not found:{:?} mentioned in output {:?}", rd, out)
-                    })?;
-                    let (output_id, _) = crossref.get_path_db_id(&out).ok_or_else(|| {
-                        eyre!("output not found:{:?} mentioned in rule {:?}", out, rd)
-                    })?;
-                    tx.insert_link(output_id, rule_id, true.into(), Rule)
-                        .map_err(|e| eyre!(e.to_string()))?;
-                }
-                Link::OutputToGroup(out, group) => {
-                    let (output_id, _) = crossref.get_path_db_id(&out).ok_or_else(|| {
-                        eyre!("output not found:{:?} mentioned in group {:?}", out, group)
-                    })?;
-                    let (group_id, _) = crossref.get_group_db_id(&group).ok_or_else(|| {
-                        eyre!("group not found:{:?} mentioned in output {:?}", group, out)
-                    })?;
-                    tx.insert_link(output_id, group_id, true.into(), Group)?;
-                }
-                Link::GroupToRule(group, rd) => {
-                    let (group_id, _) = crossref.get_group_db_id(&group).ok_or_else(|| {
-                        eyre!("group not found:{:?} mentioned in rule {:?}", group, rd)
-                    })?;
-                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
-                        eyre!("rule not found:{:?} mentioned in group {:?}", rd, group)
-                    })?;
-                    tx.insert_link(group_id, rule_id, false.into(), Rule)?;
-                }
-                Link::EnvToRule(env, rd) => {
-                    let env_id = crossref.get_env_db_id(&env).ok_or_else(|| {
-                        eyre!("env not found:{:?} mentioned in rule {:?}", env, rd)
-                    })?;
-                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
-                        eyre!("rule not found:{:?} mentioned in env {:?}", rd, env)
-                    })?;
-                    tx.insert_link(env_id, rule_id, true.into(), Rule)?;
-                }
-                Link::TupfileToTupfile(pd, tupd) => {
-                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
-                        eyre!("tupfile not found:{:?} mentioned in tupfile {:?}", tupd, pd)
-                    })?;
-                    let (tupfile_read_id, _) = crossref.get_path_db_id(&pd).ok_or_else(|| {
-                        eyre!("tupfile not found:{:?} mentioned in tupfile {:?}", pd, tupd)
-                    })?;
-                    tx.insert_link(tupfile_read_id, tupfile_id, true.into(), TupF)?;
-                }
-                Link::GlobToTupfile(g, tupd) => {
-                    let (glob_id, _) = crossref.get_glob_db_id(&g).ok_or_else(|| {
-                        eyre!("glob not found:{:?} mentioned in tupfile {:?}", g, tupd)
-                    })?;
-                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
-                        eyre!("tupfile not found:{:?} mentioned in glob {:?}", tupd, g)
-                    })?;
-                    tx.insert_link(glob_id, tupfile_id, true.into(), TupF)?;
-                }
-                Link::TupfileToRule(tupd, rd) => {
-                    let (tupfile_id, _) = crossref.get_tup_db_id(&tupd).ok_or_else(|| {
-                        eyre!("tupfile not found:{:?} mentioned in rule {:?}", tupd, rd)
-                    })?;
-                    let (rule_id, _) = crossref.get_rule_db_id(&rd).ok_or_else(|| {
-                        eyre!("rule not found:{:?} mentioned in tupfile {:?}", rd, tupd)
-                    })?;
-                    tx.insert_link(tupfile_id, rule_id, false.into(), Rule)?;
-                }
-                Link::DirToGlob(dir, glob) => {
-                    let (dir_id, _) = crossref.get_path_db_id(&dir).ok_or_else(|| {
-                        eyre!("dir not found:{:?} mentioned in glob {:?}", dir, glob)
-                    })?;
-                    let (glob_id, _) = crossref.get_glob_db_id(&glob).ok_or_else(|| {
-                        eyre!("glob not found:{:?} mentioned in dir {:?}", glob, dir)
-                    })?;
-                    tx.insert_link(dir_id, glob_id, true.into(), Glob)?;
-                }
-            }
+            insert_link(&tx, l, crossref).wrap_err_with(|| {
+                eyre!(
+                    "error while inserting link {:?} in tupfile {:?}",
+                    l,
+                    resolved_rules.get_tupid()
+                )
+            })?;
         }
     }
     tx.commit()?;
@@ -864,10 +843,9 @@ fn add_links_from_to_globs(
     link_collector: &mut LinkCollector,
 ) -> Result<(), Report> {
     for glob_desc in resolved_rules.get_globs_read() {
-        let (_, glob_dir) = crossref.get_glob_db_id(glob_desc).ok_or_else(|| {
+        let (_, glob_dir) = crossref.get_glob_db_id_ok(glob_desc).wrap_err_with(|| {
             eyre!(
-                "glob not found:{:?} mentioned in tupfile {:?}",
-                glob_desc,
+                "Error adding links from/to glob mentioned in tupfile {:?}",
                 resolved_rules.get_tupid()
             )
         })?;
@@ -905,7 +883,7 @@ fn add_link_glob_dir_to_rules(
             let tupfile_desc = rlink.get_rule_ref().get_tupfile_desc();
             let (tupfile_db_id, _) = crossref.get_tup_db_id(&tupfile_desc).ok_or_else(|| {
                 eyre!(
-                    "tupfile dir not found:{:?} mentioned in rule {:?}",
+                    "Tupfile dir not found:{:?} mentioned in rule {:?}",
                     tupfile_desc,
                     rlink.get_rule_ref()
                 )
@@ -1134,16 +1112,17 @@ fn check_uniqueness_of_parent_rule(
         if let Ok(node) = find_by_path_inner(np.as_path(), &conn.as_ref()) {
             let rule_id = node.get_srcid();
 
-            let current_parent_rule_ref = 
-                outs.get_parent_rule(o).unwrap_or_else(|| panic!("Parent rule not found for {}", o));
+            let current_parent_rule_ref = outs
+                .get_parent_rule(o)
+                .unwrap_or_else(|| panic!("Parent rule not found for {}", o));
             if !conn.check_is_in_update_universe(rule_id)? {
                 let old_rule_name = conn.fetch_node_name(rule_id)?;
-                return Err(eyre!(
-                            format!("File was previously marked as generated from a rule:{} \
+                return Err(eyre!(format!(
+                    "File was previously marked as generated from a rule:{} \
                     but is now being generated in {}",
-                                    old_rule_name, current_parent_rule_ref.to_string()
-                            )
-                        ));
+                    old_rule_name,
+                    current_parent_rule_ref.to_string()
+                )));
             }
         }
     }
@@ -1151,8 +1130,11 @@ fn check_uniqueness_of_parent_rule(
 }
 
 fn find_by_path_inner(path: &Path, conn: &TupConnectionRef) -> Result<Node> {
-   let res =  find_node_id_by_path(conn, path)
-       .and_then(|node| conn.fetch_node_by_id(node).transpose().expect("Unexpected failure in retrieving node from its id"))?;
+    let res = find_node_id_by_path(conn, path).and_then(|node| {
+        conn.fetch_node_by_id(node)
+            .transpose()
+            .expect("Unexpected failure in retrieving node from its id")
+    })?;
     Ok(res)
 }
 
@@ -1163,7 +1145,8 @@ fn find_node_id_by_path(conn: &TupConnectionRef, path: &Path) -> Result<i64, Any
             let name = c.as_os_str().to_string_lossy();
             let node = conn.fetch_node_id_by_dir_and_name(dir, name.as_ref())?;
             Ok((node, path_so_far.join(name.as_ref())))
-        }).map(|(id, _)| id)
+        })
+        .map(|(id, _)| id)
 }
 
 fn find_by_path(path: &Path, conn_ref: &TupConnectionRef) -> Node {
@@ -1575,10 +1558,20 @@ fn insert_nodes(
     let mut envs_to_insert = HashSet::new();
 
     let get_dir = |tup_desc: &TupPathDescriptor, crossref: &CrossRefMaps| -> Result<i64> {
-        crossref.get_tup_db_id(tup_desc)
+        crossref
+            .get_tup_db_id(tup_desc)
             .map(|(_, dir)| dir)
-            .or_else(|| crossref.get_path_db_id(&tup_desc.get_parent_descriptor()).map(|(dir, _)| dir))
-            .ok_or_else(|| eyre!("No tup directory found in db for tup descriptor:{:?}", tup_desc))
+            .or_else(|| {
+                crossref
+                    .get_path_db_id(&tup_desc.get_parent_descriptor())
+                    .map(|(dir, _)| dir)
+            })
+            .ok_or_else(|| {
+                eyre!(
+                    "No tup directory found in db for tup descriptor:{:?}",
+                    tup_desc
+                )
+            })
     };
     // collect all un-added groups and add them in a single transaction.
     let mut nodes: Vec<_> = {
