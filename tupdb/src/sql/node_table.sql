@@ -20,12 +20,12 @@ CREATE TABLE NormalLink
 (
     from_id  INTEGER,           -- id of the node that is the source of the link
     to_id    INTEGER,           -- id of the node that is the target of the link
-    issticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
+    is_sticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
     to_type  INTEGER,           -- type of the target node
     unique (from_id, to_id),    -- from_id and to_id make a unique pair for a link
     FOREIGN KEY (from_id) references Node (id) on DELETE CASCADE,
     FOREIGN KEY (to_id) references Node (id) on DELETE CASCADE,
-    CHECK (issticky in (0, 1) ) -- issticky can only be 0 or 1 indicating if this is hard link where delete should cascade
+    CHECK (is_sticky in (0, 1) ) -- is_sticky can only be 0 or 1 indicating if this is hard link where delete should cascade
 );
 
 

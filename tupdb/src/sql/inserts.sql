@@ -55,13 +55,13 @@ Values (:id, :rtype);
 -- # Parameters
 -- param: from_id : i64 - id of the node from which the link originates
 -- param: to_id : i64 - id of the node to which the link points
--- param: issticky : u8 - whether the link is sticky
+-- param: is_sticky : u8 - whether the link is sticky
 -- param: to_type : u8 - type of the node to which the link points
 INSERT OR
 REPLACE
 into NormalLink (from_id, to_id, is_sticky, to_type)
-Values (:from_id, :to_id, :issticky, :to_type)
-ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :issticky AND to_type = :to_type;
+Values (:from_id, :to_id, :is_sticky, :to_type)
+ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :is_sticky AND to_type = :to_type;
 -- <eos>
 -- name: insert_node_inner ->
 -- Insert a node into the database
@@ -299,6 +299,16 @@ from ChangeList cl
 WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
 
 -- <eos>
+-- name: mark_dependent_tupfiles_of_tupfiles_inner!
+-- Enrich the modify list with all rules that have modified outputs
+INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+SELECT nl.to_id, nl.to_type, 0
+from NormalLink nl
+inner JOIN ChangeList cl on cl.id = nl.from_id
+WHERE cl.type = (SELECT type_index FROM NodeType WHERE type = 'File')
+AND   nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
+
+-- <eos>
 
 -- name: mark_dependent_tupfiles_of_glob_inner!
 -- Enrich the modify list with all rules that have modified outputs
@@ -309,8 +319,8 @@ SELECT nl.to_id, nl.to_type, 0
 from NormalLink nl
 where nl.from_id = :glob_id
   AND nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
-
 -- <eos>
+
 -- name: prune_modifylist_of_non_rules_inner!
 -- Prune the modify list of non-rules
 DELETE

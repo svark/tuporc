@@ -40,6 +40,9 @@ pub trait LibSqlQueries {
     fn for_each_rule_output<F>(&self, rule_id: i64, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
+    /// Check if the node (generated node) is in the list of outputs of rules in Tupfiles being parsed.
+    /// If not, this is case of uniqueness of output failure. In case of failure it may be that you only chose a small subset of tupfiles to parse even though there are other modified tupfiles
+    fn check_is_in_update_universe(&self, node_id: i64) -> DbResult<bool>;
 
     fn for_each_rule_input<F>(&self, rule_id: i64, f: F) -> DbResult<()>
     where
@@ -188,6 +191,13 @@ impl LibSqlQueries for rusqlite::Connection {
         Ok(())
     }
 
+    fn check_is_in_update_universe(&self, node_id: i64) -> DbResult<bool> {
+        let is_in_universe = self.check_is_in_update_universe_inner(node_id, |row| {
+            let is_in_universe: i32 = row.get(0)?;
+            Ok(is_in_universe != 0)
+        })?;
+        Ok(is_in_universe)
+    }
     fn for_each_rule_input<F>(&self, rule_id: i64, mut f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>,

@@ -518,11 +518,14 @@ impl MiscStatements for TupConnection {
         self.delete_tupentries_in_deleted_tupfiles()?;
         self.add_rules_with_changed_io_to_modify_list()?;
 
+        // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
+        self.mark_dependent_tupfiles_of_tupfiles()?; //-- included tup files -> Tupfile
         for (i, sha) in self.fetch_modified_globs()?.into_iter() {
             self.update_node_sha_exec(i, sha.as_str())?;
-            self.mark_dependent_tupfiles_of_glob(i)?;
+            self.mark_dependent_tupfiles_of_glob(i)?; // modified glob -> Tupfile
         }
-        self.mark_dependent_tupfiles_groups()?;
+        
+        self.mark_rules_depending_on_modified_groups()?;
         self.prune_modify_list_of_inputs_and_outputs()?;
         self.delete_nodes()?;
 

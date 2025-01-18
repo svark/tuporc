@@ -424,4 +424,10 @@ FROM subtree;
 
 -- <eos>
 
-
+-- name: check_is_in_update_universe_inner?
+-- Check if the given id is in the update universe
+-- # Parameters
+-- param: id : i64 - id of the node
+-- returns: bool
+SELECT EXISTS(SELECT 1 FROM  TupfileEntities WHERE id = :id);
+-- <eos>

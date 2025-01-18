@@ -44,7 +44,8 @@ pub trait LibSqlInserts {
     fn create_tupfile_entries_table(&self) -> DbResult<()>;
     fn add_not_present_to_delete_list(&self) -> DbResult<()>;
     fn add_rules_with_changed_io_to_modify_list(&self) -> DbResult<()>;
-    fn mark_dependent_tupfiles_groups(&self) -> DbResult<()>;
+    fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()>;
+    fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()>;
     fn delete_tupfile_entries_not_in_present_list(&self) -> DbResult<()>;
     fn delete_tupentries_in_deleted_tupfiles(&self) -> DbResult<()>;
@@ -278,8 +279,12 @@ impl LibSqlInserts for Connection {
         self.add_rules_with_changed_io_to_modify_list_inner()?;
         Ok(())
     }
-    fn mark_dependent_tupfiles_groups(&self) -> DbResult<()> {
+    fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()> {
         self.mark_rules_depending_on_modified_groups_inner()?;
+        Ok(())
+    }
+    fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()> {
+        self.mark_dependent_tupfiles_of_tupfiles_inner()?;
         Ok(())
     }
     fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()> {
