@@ -56,7 +56,7 @@ where dir = :dir
 
 -- name: for_each_gen_file_inner&
 -- Fetch all the nodes
-SELECT n.id, n.dir, n.type, dpb.name || '/' || n.name, mtime_ns
+SELECT n.id, n.dir, n.type, dpb.name || '/' || n.name, n.mtime_ns
 from Node n
          JOIN DirPathBuf dpb on n.dir = dpb.id
 where n.type = (SELECT type_index from NodeType where type = 'GenF');
@@ -94,7 +94,7 @@ where type = (SELECT type_index from NodeType where type = 'Glob')
 -- <eos>
 
 -- DirPathBuf table queries
--- name: fetch_dirid_by_path?
+-- name: fetch_dirid_by_path_inner?
 -- Fetch the id of a directory by path
 -- # Parameters
 -- param: path : &str - path of the directory
@@ -356,7 +356,8 @@ from NormalLink;
 -- Fetch the globs with modified search directories
 SELECT DISTINCT gwd.to_id
 from NormalLink as gwd
-         JOIN ChangeList as cl on gwd.from_id = cl.id;
+         JOIN ChangeList as cl on gwd.from_id = cl.id
+where gwd.to_type = (SELECT type_index from NodeType where type = 'Glob');
 -- <eos>
 
 
@@ -429,5 +430,5 @@ FROM subtree;
 -- # Parameters
 -- param: id : i64 - id of the node
 -- returns: bool
-SELECT EXISTS(SELECT 1 FROM  TupfileEntities WHERE id = :id);
+SELECT EXISTS(SELECT 1 FROM TupfileEntities WHERE id = :id);
 -- <eos>

@@ -70,7 +70,8 @@ pub trait LibSqlQueries {
         name: &str,
     ) -> DbResult<Option<i64>>;
 
-    fn fetch_dir_from_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64>;
+    fn fetch_dirid_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64>;
+    
 
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf>;
 
@@ -276,9 +277,9 @@ impl LibSqlQueries for rusqlite::Connection {
         }
     }
 
-    fn fetch_dir_from_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64> {
+    fn fetch_dirid_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64> {
         let path = db_path_str(path.as_ref());
-        let dir_id = self.fetch_dirid_by_path(path.as_str(), |row| {
+        let dir_id = self.fetch_dirid_by_path_inner(path.as_str(), |row| {
             let dir_id = row.get(0)?;
             Ok(dir_id)
         })?;
@@ -321,7 +322,10 @@ impl LibSqlQueries for rusqlite::Connection {
         P: AsRef<Path>,
     {
         let db_path = db_path_str(no_pattern_dir.as_ref());
-        let glob_dirid = self.fetch_dir_from_path(db_path.as_str())?;
+        let glob_dirid = self.fetch_dirid_by_path(db_path.as_str()).unwrap_or(-1);
+        if glob_dirid == -1 {
+            return Ok(());
+        }
         let path = Path::new(glob_pattern);
         let depth = path
             .parent()
@@ -388,16 +392,22 @@ impl LibSqlQueries for rusqlite::Connection {
         self.fetch_maybe_changed_globs_inner(|row| {
             f(row.get(0)?).map_err(internal_sqlite_error)?;
             Ok(())
-        })?;
-        Ok(())
+        }).or_else(|e| {
+            match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok::<(), AnyError>(()),
+                e => Err(e.into()),
+            }
+        })
     }
     fn fetch_modified_globs(&self) -> DbResult<Vec<(i64, String)>> {
         let mut modified_glob_ids = Vec::new();
         self.fetch_maybe_changed_globs(|glob_id| {
             let sha = self.compute_glob_sha(glob_id)?;
-            let old_sha = self.fetch_saved_nodesha256(glob_id)?;
-            if sha.ne(&old_sha) {
-                modified_glob_ids.push((glob_id, sha));
+            let old_sha = self.fetch_saved_nodesha256(glob_id).ok();
+            if let Some(old_sha) = old_sha {
+                if sha.ne(&old_sha) {
+                    modified_glob_ids.push((glob_id, sha));
+                }
             }
             Ok(())
         })?;

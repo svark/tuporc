@@ -102,10 +102,10 @@ where id = :id;
 -- param: rtype: u8 - new type of the node
 -- param: id : i64 - id of the node to update
 UPDATE Node
-Set type = :type
+Set type = :rtype
 where id = :id;
-
 -- <eos>
+
 -- name: insert_or_replace_node_sha!
 -- Insert or replace the sha of a node
 -- # Parameters

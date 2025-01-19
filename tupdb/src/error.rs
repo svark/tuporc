@@ -34,6 +34,12 @@ impl AnyError {
     pub fn query_returned_no_rows() -> Self {
         AnyError::Db(Arc::new(rusqlite::Error::QueryReturnedNoRows))
     }
+    pub fn is_a_no_rows_error(&self) -> bool {
+        match self {
+            AnyError::Db(e) => e.deref().eq(&rusqlite::Error::QueryReturnedNoRows),
+            _ => false,
+        }
+    }
 }
 impl std::error::Error for AnyError {}
 

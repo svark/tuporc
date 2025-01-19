@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use tupdb::db::{start_connection, Node, TupConnection};
 use tupetw::{DynDepTracker, EventHeader, EventType};
-use tupparser::buffers::TupPathDescriptor;
+use tupparser::buffers::{BufferObjects, PathBuffers, TupPathDescriptor};
 use tupparser::decode::{decode_group_captures};
 use tupparser::statements::{Loc, TupLoc};
 
@@ -354,31 +354,16 @@ impl ProcReceivers {
 fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
     let dir = std::env::current_dir()?;
     let dirc = dir.clone();
-    let dir = pathdiff::diff_paths(dir, root).ok_or(eyre!(format!(
-        "Could not get relative path for:{:?}",
-        dirc.as_path()
-    )))?;
+    let bo = BufferObjects::new(root);
+    let dir_desc = bo.add_abs(&dirc)?;
     let mut dirids = Vec::new();
     for t in targets {
-        let path = dir.join(t.as_str());
-        if let Ok(id) = conn.fetch_dir_from_path(dir.join(&targets[0])) {
+        let path_desc = dir_desc.join(t.as_str())?;
+        let path = bo.get_path(&path_desc);
+        if let Some(id) = conn.fetch_dirid_by_path(path.as_path()).ok()
+        {
             dirids.push(id);
-        } else {
-            // get the parent dir id and fetch the node by its name
-            let parent = path
-                .parent()
-                .ok_or(eyre!(format!("Could not get parent for:{:?}", path)))?;
-            if let Some(parent_id) = conn.fetch_dir_from_path(parent).ok() {
-                if let Ok(nodeid) = conn.fetch_node_id_by_dir_and_name(
-                    parent_id,
-                    &*path.file_name().unwrap().to_string_lossy().to_string(),
-                ) {
-                    dirids.push(nodeid);
-                } else {
-                    eyre::bail!(format!("Could not find target node id for:{:?}", path));
-                }
-            }
-        }
+        } 
     }
     Ok(dirids)
 }
@@ -726,7 +711,7 @@ impl<'a> ProcessIOChecker<'a> {
     }
 
     fn fetch_dirid<P: AsRef<Path>>(&mut self, node_path: P) -> Result<i64> {
-        let dirid = self.conn.fetch_dir_from_path(node_path)?;
+        let dirid = self.conn.fetch_dirid_by_path(node_path)?;
         Ok(dirid)
     }
     fn fetch_node_id(&mut self, node_name: &str, dirid: i64) -> Result<i64> {

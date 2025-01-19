@@ -621,7 +621,6 @@ impl PathSearcher for DbPathSearcher {
         path_buffers: &impl PathBuffers,
     ) -> Vec<PathDescriptor> {
         let conn = self.conn.lock();
-        //let mut node_path_stmt = conn.deref().fetch_node_path_prepare().unwrap();
         let tup_path = tup_cwd.get_path_ref();
         debug!(
             "tup path is : {} in which (or its parents) we look for TupRules.tup or Tuprules.lua",
@@ -629,7 +628,7 @@ impl PathSearcher for DbPathSearcher {
         );
         let dirid = conn
             .deref()
-            .fetch_dir_from_path(tup_path.as_path())
+            .fetch_dirid_by_path(tup_path.as_path())
             .unwrap_or(1i64);
         debug!("dirid: {}", dirid);
         let mut tup_rules = Vec::new();
@@ -709,6 +708,10 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     root: P,
     term_progress: &TermProgress,
 ) -> Result<()> {
+    if tupfiles.is_empty() {
+        log::warn!("No Tupfiles to parse");
+        return Ok(())
+    }
     let conn = Arc::from(Mutex::new(connection));
     {
         let conn = conn.deref().lock();
@@ -1046,6 +1049,9 @@ fn parse_and_add_rules_to_db(
             Ok(())
         };
         let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
+            if resolved_rules.is_empty() {
+                return Ok(());
+            }
             insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
         };
 
@@ -1525,8 +1531,9 @@ impl Collector {
                 self.collect_rule(rule_desc);
             } else {
                 bail!(
-                    "Rule at  {}:{} was previously defined at {}. \
+                    "Rule {} at  {}:{} was previously defined at {}. \
                                         Ensure that rule definitions take the inputs as arguments.",
+                    name.as_str(),
                     tuppath.to_string().as_str(),
                     rule_ref,
                     prevline.unwrap()
