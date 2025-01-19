@@ -192,11 +192,17 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                                   #param_names
                                ),*
                             }
-                        )?;
-                        while let Some(row) = rows.next()? {
-                            f(&row)?;
+                        );
+                        match rows {
+                            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+                            Err(e) => Err(e),
+                            Ok(mut rows) => {
+                                while let Some(row) = rows.next()? {
+                                    f(&row)?;
+                                }
+                                Ok(())
+                            }
                         }
-                        Ok(())
                     }
                 });
             }
