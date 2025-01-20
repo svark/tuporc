@@ -12,6 +12,7 @@ extern crate incremental_topo;
 extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
+extern crate rayon;
 extern crate regex;
 extern crate tupdb;
 
@@ -29,14 +30,13 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use fs4::fs_std::FileExt;
-use tupdb::db::{
-    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnection,
-};
+use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnectionPool};
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
 use tupparser::locate_file;
 use tupparser::paths::NormalPath;
-
+static  TUP_DB : &str = ".tup/db";
+static IO_DB : &str = ".tup/io.db";
 mod execute;
 mod monitor;
 mod parse;
@@ -47,6 +47,11 @@ static APPNAME: &str = "tuporc";
 pub(crate) struct TermProgress {
     mb: MultiProgress,
     pb_main: ProgressBar,
+}
+
+fn start_tup_connection() -> Result<TupConnectionPool> {
+    let pool = start_connection(TUP_DB)?;
+    Ok(pool)
 }
 
 impl TermProgress {
@@ -229,33 +234,37 @@ fn main() -> Result<()> {
             }
             Action::ReInit => {
                 {
-                    let conn = start_connection()?;
-                    conn.for_each_gen_file(|node| {
-                        if node.get_type().eq(&RowType::GenF) {
-                            std::fs::remove_file(node.get_name()).unwrap();
-                        }
-                        Ok(())
-                    })?;
-                    conn.for_each_gen_file(|node| {
-                        if node.get_type().eq(&RowType::DirGen) {
-                            std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e| {
-                                eprintln!("Failed to remove dir {} due to {}", node.get_name(), e)
-                            });
-                        }
-                        Ok(())
-                    })?;
+                    let pool = start_tup_connection()?;
+                    let conn = pool.get().expect("Failed to get connection");
+                    // check if ther is DirPathuf table in the database
+                    if is_initialized(&conn, "DirPathBuf") {
+                        conn.for_each_gen_file(|node| {
+                            if node.get_type().eq(&RowType::GenF) {
+                                std::fs::remove_file(node.get_name()).unwrap();
+                            }
+                            Ok(())
+                        })?;
+                        conn.for_each_gen_file(|node| {
+                            if node.get_type().eq(&RowType::DirGen) {
+                                std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e| {
+                                    eprintln!("Failed to remove dir {} due to {}", node.get_name(), e)
+                                });
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
                 delete_db()?;
                 init_db()?;
             }
             Action::Scan => {
                 change_root()?;
-                let mut conn = start_connection()?;
+                let pool = start_tup_connection()?;
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
                 let running = std::sync::Arc::new(AtomicBool::new(true));
-                match scan::scan_root(root.as_path(), &mut conn, &term_progress, running) {
+                match scan::scan_root(root.as_path(), pool, &term_progress, running) {
                     Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
@@ -265,13 +274,13 @@ fn main() -> Result<()> {
                 keep_going: _keep_going,
             } => {
                 let root = change_root_update_targets(&mut target)?;
-                let mut connection = start_connection()
+                let pool = start_tup_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = monitor::is_monitor_running();
                 let tupfiles = scan_and_get_tupfiles(
                     &root,
-                    &mut connection,
+                    pool.clone(),
                     &term_progress,
                     skip_scan,
                     &target,
@@ -282,7 +291,7 @@ fn main() -> Result<()> {
 
                 let term_progress =
                     term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                parse_tupfiles_in_db(connection, tupfiles, root.as_path(), &term_progress)
+                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress)
                     .inspect_err(|e| {
                         term_progress.abandon_main(format!("Parsing failed with error: {}", e));
                     })?
@@ -295,19 +304,19 @@ fn main() -> Result<()> {
                 println!("Updating db {}", target.join(" "));
                 let term_progress = TermProgress::new("Building ");
                 {
-                    let mut conn = start_connection()
+                    let connection_pool = start_tup_connection()
                         .expect("Connection to tup database in .tup/db could not be established");
                     let skip_scan = monitor::is_monitor_running();
                     let tupfiles = scan_and_get_tupfiles(
                         &root,
-                        &mut conn,
+                        connection_pool.clone(),
                         &term_progress,
                         skip_scan,
                         &target,
                     )?;
                     let term_progress = term_progress
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                    parse_tupfiles_in_db(conn, tupfiles, root.as_path(), &term_progress)?;
+                    parse_tupfiles_in_db(connection_pool, tupfiles, root.as_path(), &term_progress)?;
                     term_progress.clear();
                     execute::execute_targets(&target, keep_going, root, &term_progress)?;
                 }
@@ -332,11 +341,11 @@ fn main() -> Result<()> {
             Action::DumpVars { var, skip_scan, .. } => {
                 change_root()?;
                 let root = current_dir()?;
-                let mut connection = start_connection()
+                let pool = start_tup_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
                 let tupfiles =
-                    scan_and_get_all_tupfiles(&root, &mut connection, &term_progress, skip_scan)
+                    scan_and_get_all_tupfiles(&root, pool.clone(), &term_progress, skip_scan)
                         .inspect_err(|e| {
                             term_progress.abandon_main(format!("Scan failed with error:{}", e))
                         })?;
@@ -345,7 +354,7 @@ fn main() -> Result<()> {
                     let term_progress = term_progress
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
                     let tupfiles_with_vars = parse_tupfiles_in_db_for_dump(
-                        connection,
+                        pool.clone(),
                         tupfiles,
                         root.as_path(),
                         &term_progress,
@@ -407,12 +416,11 @@ fn change_root() -> Result<()> {
 
 fn scan_and_get_tupfiles(
     root: &PathBuf,
-    connection: &mut TupConnection,
+    connection: TupConnectionPool,
     term_progress: &TermProgress,
     skip_scan: bool,
     targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
-    let mut conn = connection;
     let running = std::sync::Arc::new(AtomicBool::new(true));
 
     let lock_file_path = root.join(".tup/build_lock");
@@ -426,23 +434,26 @@ fn scan_and_get_tupfiles(
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
+        scan::scan_root(root.as_path(), connection.clone(), &term_progress, running)?;
     }
     term_progress.clear();
+    let mut conn = connection.get().expect("Failed to get connection");
     gather_modified_tupfiles(&mut conn, targets)
 }
 
 fn scan_and_get_all_tupfiles(
     root: &PathBuf,
-    connection: &mut TupConnection,
+    pool: TupConnectionPool,
     term_progress: &TermProgress,
     skip_scan: bool,
 ) -> Result<Vec<Node>> {
-    let mut conn = connection;
-    if !is_initialized(&conn, "Node") {
-        return Err(eyre!(
-            "Tup database is not initialized, use `tup init' to initialize",
-        ));
+    {
+        let conn = pool.get().expect("Failed to get connection");
+        if !is_initialized(&conn, "Node") {
+            return Err(eyre!(
+                "Tup database is not initialized, use `tup init' to initialize",
+            ));
+        }
     }
 
     let lock_file_path = root.join(".tup/build_lock");
@@ -457,8 +468,8 @@ fn scan_and_get_all_tupfiles(
     let running = std::sync::Arc::new(AtomicBool::new(true));
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), &mut conn, &term_progress, running)?;
+        scan::scan_root(root.as_path(), pool.clone(), &term_progress, running)?;
     }
     term_progress.clear();
-    parse::gather_tupfiles(&mut conn)
+    parse::gather_tupfiles(pool.get().expect("Failed to get connection"))
 }

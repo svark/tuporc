@@ -1,15 +1,18 @@
-use rusqlite::{Connection, Row, Transaction};
-use std::cmp::Ordering;
-use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::ops::{AddAssign, Deref, DerefMut, SubAssign};
-use std::path::{Path, MAIN_SEPARATOR};
-use std::sync::{Arc, Mutex};
 use crate::db::RowType::{DirGen, GenF};
 use crate::deletes::LibSqlDeletes;
 use crate::error::{AnyError, DbResult, SqlResult};
 use crate::inserts::LibSqlInserts;
 use crate::queries::LibSqlQueries;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::TransactionBehavior::Deferred;
+use rusqlite::{Connection, Row, Transaction};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, MAIN_SEPARATOR};
+use std::sync::Arc;
+use std::time::Duration;
 
 //returns change status of a db command
 pub enum UpsertStatus {
@@ -195,14 +198,13 @@ impl Node {
             srcid: -1,
         }
     }
-    #[allow(dead_code)]
-    pub fn unknown_with_dir(dirid: i64, name: &str, rtype: &RowType) -> Node {
+    pub fn unknown() -> Node {
         Node {
             id: -1,
-            dirid,
+            dirid: -1,
             mtime: -1,
-            name: name.to_string(),
-            rtype: *rtype,
+            name: "".to_string(),
+            rtype: RowType::File,
             display_str: "".to_string(),
             flags: "".to_string(),
             srcid: -1,
@@ -304,6 +306,9 @@ impl Node {
     pub fn get_id(&self) -> i64 {
         self.id
     }
+    pub fn is_valid(&self) -> bool {
+        self.id > 0
+    }
     pub fn get_dir(&self) -> i64 {
         self.dirid
     }
@@ -374,28 +379,47 @@ pub fn init_db() -> DbResult<()> {
     Ok(())
 }
 
-pub struct TupConnection(Connection, Arc<Mutex<usize>>);
+type R2D2Pool = Arc<r2d2::Pool<SqliteConnectionManager>> ;
+
+#[derive(Clone, Debug)]
+pub struct TupConnectionPool {
+    pool: R2D2Pool,
+}
+
+pub struct TupConnection(r2d2::PooledConnection<SqliteConnectionManager>);
+
+impl TupConnectionPool {
+    pub fn new(database_url: &str) -> Self {
+        let manager = SqliteConnectionManager::file(database_url);
+        let pool = r2d2::Builder::new()
+            .max_size(18) 
+            .connection_timeout(Duration::from_secs(10)) // Extend the timeout
+            .build(manager)
+            .expect("Failed to create connection pool"); 
+        
+        TupConnectionPool {
+            pool: Arc::new(pool),
+        }
+    }
+
+    pub fn get(&self) -> Result<TupConnection, r2d2::Error> {
+        Ok(TupConnection::new(self.pool.get()?))
+    }
+
+}
 pub struct TupConnectionRef<'a>(&'a Connection);
 
-pub struct TupTransaction<'a>(Transaction<'a>, Arc<Mutex<usize>>);
+pub struct TupTransaction<'a>(Transaction<'a>);
 
 impl<'a> TupTransaction<'a> {
-    fn new(t: Transaction, ref_count : Arc<Mutex<usize>>) -> TupTransaction {
-        TupTransaction(t, ref_count)
+    fn new(t: Transaction) -> TupTransaction {
+        TupTransaction(t)
     }
     pub fn commit(self) -> DbResult<()> {
-         let mut binding = self.1.lock().unwrap();
-        let x = binding.deref_mut();
-        assert_eq!(*x, 1);
-        x.sub_assign(1);
         self.0.commit()?;
         Ok(())
     }
     pub fn rollback(self) -> DbResult<()> {
-         let mut binding = self.1.lock().unwrap();
-        let x = binding.deref_mut();
-        assert_eq!(*x, 1);
-        x.sub_assign(1);
         self.0.rollback()?;
         Ok(())
     }
@@ -413,17 +437,15 @@ impl<'a> Deref for TupTransaction<'a> {
 }
 
 impl TupConnection {
-    fn new(conn: Connection) -> Self {
-        TupConnection(conn, Arc::from(Mutex::new(0)))
+    fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>) -> Self {
+        TupConnection(conn)
     }
 
     pub fn transaction(&mut self) -> DbResult<TupTransaction<'_>> {
-        {
-            let mut ref_cnt = self.1.lock().unwrap();
-            assert_eq!(*ref_cnt, 0usize);
-            ref_cnt.deref_mut().add_assign( 1);
-        }
-        Ok(TupTransaction::new(self.0.transaction()?, self.1.clone()))
+        Ok(TupTransaction::new(self.0.transaction()?))
+    }
+    pub fn deferred_transaction(&mut self) -> DbResult<TupTransaction<'_>> {
+        Ok(TupTransaction::new(self.0.transaction_with_behavior(Deferred)?))
     }
 
     pub fn as_ref(&self) -> TupConnectionRef {
@@ -459,15 +481,15 @@ impl DerefMut for TupConnection {
         &mut self.0
     }
 }
-pub fn start_connection() -> DbResult<TupConnection> {
-    let conn = Connection::open(".tup/db")
-        .expect("Connection to tup database in .tup/db could not be established");
+pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
+    let pool = TupConnectionPool::new(database_url);
+    let conn = pool.get().map_err(|e| AnyError::from(e))?;
     if !is_initialized(&conn, "Node") {
         return Err(AnyError::from(String::from(
-            "Node table not found in .tup/db",
+            format!("Node table not found in {database_url}"),
         )));
     }
-    Ok(TupConnection::new(conn))
+    Ok(pool)
 }
 
 // create a temp table from directories paths to their node ids
@@ -524,7 +546,7 @@ impl MiscStatements for TupConnection {
             self.update_node_sha_exec(i, sha.as_str())?;
             self.mark_dependent_tupfiles_of_glob(i)?; // modified glob -> Tupfile
         }
-        
+
         self.mark_rules_depending_on_modified_groups()?;
         self.prune_modify_list_of_inputs_and_outputs()?;
         self.delete_nodes()?;

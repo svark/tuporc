@@ -4,19 +4,15 @@ use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
 use log::debug;
-use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
-use tupdb::db::{
-    create_path_buf_temptable, db_path_str, MiscStatements, Node, RowType, TupConnection,
-    TupConnectionRef, TupTransaction,
-};
+use tupdb::db::{create_path_buf_temptable, db_path_str, MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
@@ -457,13 +453,13 @@ fn into_any_error(e: Error) -> AnyError {
 /// It is used by the parser to resolve paths and globs. Resolved outputs are dumped in OutputHolder
 #[derive(Clone)]
 struct DbPathSearcher {
-    conn: Arc<Mutex<TupConnection>>,
+    conn: TupConnectionPool,
     psx: OutputHolder,
     root: PathBuf,
 }
 
 impl DbPathSearcher {
-    pub fn new<P: AsRef<Path>>(conn: Arc<Mutex<TupConnection>>, root: P) -> DbPathSearcher {
+    pub fn new<P: AsRef<Path>>(conn: TupConnectionPool, root: P) -> DbPathSearcher {
         DbPathSearcher {
             conn,
             psx: OutputHolder::new(),
@@ -472,7 +468,7 @@ impl DbPathSearcher {
     }
 
     pub fn update_delete_list(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.conn.get()?;
         conn.deref().delete_tupentries_in_deleted_tupfiles()?;
         Ok(())
     }
@@ -558,8 +554,9 @@ impl DbPathSearcher {
 impl Drop for DbPathSearcher {
     fn drop(&mut self) {
         debug!("dropping DbPathSearcher");
-        let mutconn = self.conn.lock();
-        let _ = mutconn.deref().drop_tupfile_entries_table();
+        if let Ok(mutconn) = self.conn.get() {
+            let _ = mutconn.deref().drop_tupfile_entries_table();
+        }
     }
 }
 impl PathDiscovery for DbPathSearcher {
@@ -570,7 +567,7 @@ impl PathDiscovery for DbPathSearcher {
         mut cb: impl FnMut(MatchingPath),
         sel: SelOptions,
     ) -> Result<usize, Error> {
-        let conn = self.conn.deref().lock();
+        let conn = self.conn.get().map_err(|e| Error::new_callback_error(e.to_string()))?;
         let tup_connection_ref = conn.as_ref();
         let mut match_count =
             Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_paths, &mut cb, sel)
@@ -620,7 +617,7 @@ impl PathSearcher for DbPathSearcher {
         tup_cwd: &PathDescriptor,
         path_buffers: &impl PathBuffers,
     ) -> Vec<PathDescriptor> {
-        let conn = self.conn.lock();
+        let conn = self.conn.get().expect("connection not found");
         let tup_path = tup_cwd.get_path_ref();
         debug!(
             "tup path is : {} in which (or its parents) we look for TupRules.tup or Tuprules.lua",
@@ -670,15 +667,14 @@ impl PathSearcher for DbPathSearcher {
 }
 
 pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
-    connection: TupConnection,
+    connection: TupConnectionPool,
     tupfiles: Vec<Node>,
     root: P,
     term_progress: &TermProgress,
     var: &String,
 ) -> Result<Vec<(TupPathDescriptor, String)>> {
     {
-        let conn = Arc::from(Mutex::new(connection));
-        let db = DbPathSearcher::new(conn.clone(), root.as_ref());
+        let db = DbPathSearcher::new(connection, root.as_ref());
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
         let pb = term_progress.make_progress_bar("_");
         let mut states_after_parse = Vec::new();
@@ -703,7 +699,7 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
 }
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
 pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
-    connection: TupConnection,
+    connection: TupConnectionPool,
     tupfiles: Vec<Node>,
     root: P,
     term_progress: &TermProgress,
@@ -712,17 +708,16 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         log::warn!("No Tupfiles to parse");
         return Ok(())
     }
-    let conn = Arc::from(Mutex::new(connection));
     {
-        let conn = conn.deref().lock();
+        let conn = connection.get()?;
         conn.create_tupfile_entries_table()?;
     }
     //conn.prune_modified_list_basic()?;
-    let db = DbPathSearcher::new(conn, root.as_ref());
+    let db = DbPathSearcher::new(connection, root.as_ref());
     let parser = TupParser::try_new_from(root.as_ref(), db)?;
     {
         let dbref = parser.get_mut_searcher();
-        let conn = dbref.conn.deref().lock();
+        let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         conn.enrich_modified_list()?;
         conn.mark_tupfile_entries(&tupfile_ids)?;
@@ -947,9 +942,9 @@ pub fn gather_modified_tupfiles(
     Ok(tupfiles)
 }
 
-pub fn gather_tupfiles(conn: &mut TupConnection) -> Result<Vec<Node>> {
+pub fn gather_tupfiles(conn: TupConnection) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
-    create_path_buf_temptable(conn)?;
+    create_path_buf_temptable(&conn)?;
 
     conn.for_each_tupnode(|n: Node| {
         // the field `name` in n stores full path here
@@ -979,7 +974,7 @@ fn parse_and_add_rules_to_db(
         let poisoned = Arc::new(AtomicBool::new(false));
         let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
         let mut handles = Vec::new();
-        for ithread in 0..num_threads {
+        for thread_index in 0..num_threads {
             let mut parser_clone = parser.clone();
             let sender = sender.clone();
             let wg = wg.clone();
@@ -990,7 +985,7 @@ fn parse_and_add_rules_to_db(
                     .iter()
                     .filter(|x| !x.get_name().ends_with(".lua"))
                     .cloned()
-                    .skip(ithread)
+                    .skip(thread_index)
                     .step_by(num_threads)
                 {
                     if poisoned.load(Ordering::SeqCst) {
@@ -1037,15 +1032,14 @@ fn parse_and_add_rules_to_db(
         let parser_c = parser.clone();
         let mut insert_to_db = move |resolved_rules: ResolvedRules| -> Result<()> {
             let binding = parser_c.get_mut_searcher();
-            let conn = &mut binding.conn.lock();
-            let conn = conn.deref_mut();
+            let conn = &mut binding.conn.get()?;
             check_uniqueness_of_parent_rule(conn, &rwbufs, &outs, &mut crossref)?;
             insert_nodes(conn, &rwbufs, &resolved_rules, &mut crossref)?;
             let _ = insert_links(conn, &resolved_rules, &mut crossref)?;
             let (dbid, _) = crossref
                 .get_tup_db_id(resolved_rules.get_tupid())
                 .expect("tupfile dbid fetch failed");
-            conn.delete_modified(dbid)?;
+            conn.unmark_modified(dbid)?;
             Ok(())
         };
         let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
@@ -1240,11 +1234,11 @@ fn insert_node_in_dir(
     }
     let is_dir = metadata.as_ref().map_or(false, |m| m.is_dir());
     if let Some(node_at_path) =
-        crate::scan::prepare_node_at_path(dir, name, hashed_path.clone(), metadata, &rtype)
+        crate::scan::prepare_node_at_path(dir, name.clone(), hashed_path.clone(), metadata, &rtype)
     {
         let in_node = node_at_path.get_prepared_node();
         let pbuf = node_at_path.get_hashed_path().clone();
-        let node = conn.upsert_node(in_node, || compute_path_hash(is_dir, pbuf.clone()))?;
+        let node = conn.fetch_upsert_node(in_node,  || compute_path_hash(is_dir, pbuf.clone()))?;
         Ok((node.get_id(), dir))
     } else {
         log::warn!("Error while inserting path: {:?}", path);
@@ -1665,7 +1659,7 @@ fn insert_nodes(
                     .unwrap_or_default()
             };
             let (db_id, db_par_id) = {
-                let upsnode = tx.upsert_node(&node, compute_sha)?;
+                let upsnode = tx.fetch_upsert_node(&node,  compute_sha)?;
                 (upsnode.get_id(), upsnode.get_dir())
             };
             if !db_id.is_negative() {

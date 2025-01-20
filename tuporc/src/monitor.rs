@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::parse::CrossRefMaps;
 use crate::scan::scan_root;
-use crate::TermProgress;
+use crate::{start_tup_connection, TermProgress, IO_DB};
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
 use tupdb::db::{start_connection, RowType, TupConnection};
@@ -18,7 +18,7 @@ use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
 use indicatif::ProgressBar;
 use notify::{
-    event, Config, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
+    event, Config, Event, EventKind, RecursiveMode, Watcher,
 };
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
@@ -172,17 +172,49 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
             log::error!("Failed to set handler: {}", e);
         });
     }
-    let mut conn = start_connection()?;
+    let connection_pool = start_tup_connection()?;
     let term_progress = TermProgress::new("Full scan underway..");
-    scan_root(root.as_path(), &mut conn, &term_progress, running.clone())?;
+    scan_root(root.as_path(), connection_pool.clone(), &term_progress, running.clone())?;
     crossbeam::scope(|s| -> Result<()> {
-        let generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
         let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
             .expect("Failed to create watcher");
         watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
+        let custom_spawn_handler = |thread_builder: rayon::ThreadBuilder | {
+            // Spawn a thread with a custom name and execute the logic
+            let builder = s.builder();
+            let builder = if let Some(name) = thread_builder.name() {
+                builder.name(name.to_string())
+            } else {
+                builder
+            };
+            let builder = if let Some(stack_size) = thread_builder.stack_size() {
+                builder.stack_size(stack_size)
+            } else {
+                builder
+            };
+
+            builder.spawn(|_| {
+               thread_builder.run() // Execute the thread's main logic
+            })
+                .map(|_| ())
+        };
+
+        let thread_builder = rayon::ThreadPoolBuilder::new().spawn_handler( custom_spawn_handler)
+       .thread_name(|i| {
+                format!("tup-monitor-thread-{}", i)
+            });
+        let thread_pool = thread_builder.build().unwrap();
         let pb_main = term_progress.get_main();
-        let _ = s
-            .spawn(move |_| -> Result<()> {
+        {
+            let connection_pool = connection_pool.clone();
+            let path_receiver = path_receiver.clone();
+            let term_progress = term_progress.clone();
+            let stop_receiver = stop_receiver.clone();
+            let pb_main = pb_main.clone();
+            let root = root.clone();
+            thread_pool.spawn( move || {
+                let mut conn = connection_pool.get().expect("failed to get connection");
+                let generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
                 run_monitor(
                     path_receiver,
                     root,
@@ -190,15 +222,25 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
                     term_progress,
                     stop_receiver,
                     generation_id,
-                    watcher,
+                //    end_watch,
                     pb_main,
-                )
+                ).expect("failed to run monitor");
             })
-            .join()
-            .expect("failed to join thread")?;
+        }
+        let stop_receiver = stop_receiver.clone();
+        let term_progress = term_progress.clone();
+        thread_pool.spawn( move || {
+           loop {
+               sleep(Duration::from_secs(1));
+               if let Ok(()) = stop_receiver.try_recv() {
+                   term_progress.abandon(&pb_main, "Ctrl-c received");
+                   watcher.unwatch(root.as_path()).unwrap();
+               }
+           }
+        });
         Ok(())
     })
-    .expect("failed to spawn thread")?;
+        .expect("failed to spawn thread")?;
     Ok(())
 }
 
@@ -209,7 +251,7 @@ fn run_monitor(
     term_progress: TermProgress,
     stop_receiver: Receiver<()>,
     mut generation_id: i64,
-    mut watcher: ReadDirectoryChangesWatcher,
+   // mut watcher: ReadDirectoryChangesWatcher,
     pb_main: ProgressBar,
 ) -> Result<()> {
     let current_id: i64 = 0;
@@ -248,7 +290,6 @@ fn run_monitor(
             poll_for_new_messages(conn, &term_progress, current_id, &pb)?
         };
         if end_watch {
-            watcher.unwatch(bo.get_root_dir())?;
             break;
         }
         let build_in_progess_new_stat =
@@ -308,8 +349,8 @@ fn is_ignorable<P: AsRef<Path>>(path: P, ign: &Gitignore, is_dir: bool) -> bool 
 }
 
 fn stop_monitor() -> Result<()> {
-    let conn = start_connection()?;
-    conn.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
+    let conn = start_connection(IO_DB)?;
+    conn.get()?.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())
 }
 

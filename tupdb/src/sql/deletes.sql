@@ -45,15 +45,6 @@ from DirPathBuf
 where id = :dir_id;
 -- <eos>
 
--- name: delete_from_tuppathbuf_inner!
--- Delete a directory from the tup path buffer
--- # Parameters
--- param: tup_id : i64 - id of the tupfile to delete
-Delete
-from TupPathBuf
-where id = :tup_id;
--- <eos>
-
 -- name: delete_from_modifylist_inner!
 -- Delete a glob from the modify list
 -- # Parameters
@@ -108,7 +99,7 @@ from Node
 where id in (SELECT id from DeleteList);
 
 -- <eos>
--- name: delete_modified_inner!
+-- name: unmark_modified_inner!
 -- Delete all entries from the ModifyList table
 -- # Parameters
 -- param: id : i64 - id of the node to delete

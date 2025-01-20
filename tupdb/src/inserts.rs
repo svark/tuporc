@@ -27,7 +27,17 @@ pub trait LibSqlInserts {
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
     ) -> Result<(), AnyError>;
-    fn upsert_node(&self, node: &Node, f: impl FnMut() -> String) -> Result<Node, AnyError>;
+    fn upsert_node(
+        &self,
+        node: &Node,
+        existing_node: &Node,
+        f: impl FnMut() -> String,
+    ) -> Result<Node, AnyError>;
+    fn fetch_upsert_node(
+        &self,
+        node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError>;
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
@@ -185,28 +195,31 @@ impl LibSqlInserts for Connection {
     /// [upsert_node] is akin to the sqlite upsert operation
     /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
     /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
-    fn upsert_node(&self, node: &Node, compute_sha: impl FnMut() -> String) -> Result<Node, AnyError> {
-        let db_node = self
-            .fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
-            .map_err(|e| e.into())
-            .and_then(|existing_node| {
-                self.update_columns(node, &existing_node, compute_sha)
-                    .map(|_| existing_node)
-            });
-        match db_node {
-            Ok(db_node) => Ok(db_node),
-            Err(e) if e.has_no_rows() => {
-                let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
-
-                self.mark_modified(node.get_id(), node.get_type())?;
-                self.mark_present(node.get_id(), node.get_type())?;
-                // node sha is not computed unless needed for a rule
-                Ok::<Node, AnyError>(node)
-            }
-            Err(e) => Err::<Node, AnyError>(e.clone()),
+    fn upsert_node(
+        &self,
+        node: &Node,
+        existing_node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError> {
+        if existing_node.is_valid() {
+            self.update_columns(node, &existing_node, compute_sha)?;
+            Ok(Node::copy_from(existing_node.get_id(), node))
+        } else {
+            let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
+            self.mark_modified(node.get_id(), node.get_type())?;
+            self.mark_present(node.get_id(), node.get_type())?;
+            // node sha is not computed unless needed for a rule
+            Ok::<Node, AnyError>(node)
         }
     }
-
+    fn fetch_upsert_node(
+        &self,
+        node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError> {
+        let existing_node = self.fetch_node_by_dir_and_name(node.get_dir(), node.get_name()).unwrap_or(Node::unknown());
+        self.upsert_node(node, &existing_node, compute_sha)
+    }
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()> {
         self.add_to_modify_list(id, *rtype as u8)?;
         Ok(())

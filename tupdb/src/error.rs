@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
+use rusqlite::ErrorCode::DatabaseBusy;
 
 pub type SqlResult<T> = std::result::Result<T, rusqlite::Error>;
 
@@ -19,6 +20,15 @@ impl CallBackError {
 pub enum AnyError {
     Db(Arc<rusqlite::Error>),
     CbErr(CallBackError),
+}
+
+impl AnyError {
+    pub fn is_busy(&self) -> bool {
+        match self {
+            AnyError::Db(e) =>  e.sqlite_error_code().map_or(false, |err| err == DatabaseBusy),
+            _ => false,
+        }
+    }
 }
 
 impl Display for AnyError {
@@ -58,6 +68,12 @@ impl From<String> for AnyError {
 impl From<rusqlite::Error> for AnyError {
     fn from(value: rusqlite::Error) -> Self {
         AnyError::Db(Arc::new(value))
+    }
+}
+
+impl From<r2d2::Error> for AnyError {
+    fn from(value: r2d2::Error) -> Self {
+        AnyError::CbErr(CallBackError::from(value.to_string()))
     }
 }
 

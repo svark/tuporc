@@ -9,7 +9,7 @@ pub trait LibSqlDeletes {
     fn delete_node_sha(&self, id: i64) -> Result<usize>;
     fn delete_messages(&self) -> Result<usize>;
     fn delete_monitored_by_generation_id(&self, id: i64) -> Result<usize>;
-    fn delete_modified(&self, id: i64) -> Result<usize>;
+    fn unmark_modified(&self, id: i64) -> Result<usize>;
     fn delete_nodes(&self) -> Result<usize>;
     fn prune_delete_list_of_present(&self) -> Result<usize>;
     fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize>;
@@ -48,8 +48,8 @@ impl LibSqlDeletes for Connection {
         Ok(sz)
     }
 
-    fn delete_modified(&self, id: i64) -> Result<usize> {
-        let rows_deleted = self.delete_modified_inner(id)?;
+    fn unmark_modified(&self, id: i64) -> Result<usize> {
+        let rows_deleted = self.unmark_modified_inner(id)?;
         log::debug!("Deleted {} rows from modified", rows_deleted);
         Ok(rows_deleted)
     }

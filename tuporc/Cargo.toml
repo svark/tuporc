@@ -30,6 +30,9 @@ console = "0.15.10"
 notify = { version = "8.0.0", features = ["crossbeam-channel"] }
 fs4 = {version = "0.12.0", features = ["sync"]}
 ignore = "0.4.23"
+rayon = "1.10.0"
+
+
 [profile.release]
 lto = true
 

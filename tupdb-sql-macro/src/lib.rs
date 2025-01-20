@@ -164,7 +164,7 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                     where
                         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<#return_type>,
                     {
-                        let mut stmt = self.prepare(#query_str)?;
+                        let mut stmt = self.prepare_cached(#query_str)?;
                         stmt.query_row(
                         dynamic_named_params! {#(
                               #param_names

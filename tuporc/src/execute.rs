@@ -17,14 +17,14 @@ use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
-use tupdb::db::{start_connection, Node, TupConnection};
+use tupdb::db::{start_connection, Node, TupConnection, TupConnectionPool};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::{BufferObjects, PathBuffers, TupPathDescriptor};
 use tupparser::decode::{decode_group_captures};
 use tupparser::statements::{Loc, TupLoc};
 
 use crate::parse::ConnWrapper;
-use crate::TermProgress;
+use crate::{start_tup_connection, TermProgress, IO_DB};
 use tupdb::db::RowType;
 use tupdb::db::RowType::Excluded;
 use tupdb::error::{AnyError, DbResult};
@@ -65,13 +65,14 @@ impl PoisonedState {
 }
 
 fn prepare_for_execution(
-    conn: &mut TupConnection,
+    connection_pool: TupConnectionPool,
     term_progress: &TermProgress,
 ) -> Result<(IncrementalTopo, BiHashMap<i32, incremental_topo::Node>)> {
     let mut dag = IncrementalTopo::new();
     let mut unique_node_ids = HashMap::new();
     term_progress.clear();
     term_progress.set_message("Preparing for execution");
+    let conn = connection_pool.get()?;
     let pbar = term_progress.make_progress_bar("Adding edges..");
     {
         let add_edge = |x, y| -> std::result::Result<(), AnyError> {
@@ -108,13 +109,14 @@ pub(crate) fn execute_targets(
     root: PathBuf,
     term_progress: &TermProgress,
 ) -> Result<()> {
-    let mut conn =
-        start_connection().expect("Connection to tup database in .tup/db could not be established");
-    let (dag, node_bimap) = prepare_for_execution(&mut conn, &term_progress)?;
+    let connection_pool =
+        start_tup_connection().expect("Connection to tup database in .tup/db could not be established");
+    let (dag, node_bimap) = prepare_for_execution(connection_pool.clone(), &term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
-    let tup_connection_ref = conn.as_ref();
+    let tup_connection = connection_pool.get()?;
+    let tup_connection_ref = tup_connection.as_ref();
     let conn_wrapper = ConnWrapper::new(&tup_connection_ref);
     let f = |node: Node| -> DbResult<Node> {
         let rule_id = node.get_id();
@@ -140,7 +142,7 @@ pub(crate) fn execute_targets(
             node.get_srcid() as _,
         ))
     };
-    let rule_nodes = conn.fetch_rules_to_run()?;
+    let rule_nodes = tup_connection.fetch_rules_to_run()?;
     let rule_nodes = rule_nodes
         .into_iter()
         .map(f)
@@ -150,7 +152,7 @@ pub(crate) fn execute_targets(
         return Ok(());
     }
     let _ = exec_rules_to_run(
-        conn,
+        connection_pool.clone(),
         rule_nodes,
         &node_bimap,
         &dag,
@@ -369,7 +371,7 @@ fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> R
 }
 
 fn exec_rules_to_run(
-    mut conn: TupConnection,
+    connection_pool: TupConnectionPool,
     mut rule_nodes: Vec<Node>,
     fwd_refs: &BiMap<i32, incremental_topo::Node>,
     dag: &IncrementalTopo,
@@ -379,6 +381,7 @@ fn exec_rules_to_run(
     term_progress: &TermProgress,
 ) -> Result<()> {
     // order the rules based on their dependencies
+    let conn = connection_pool.get()?;
     let target_ids = get_target_ids(&conn, root, target)?;
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
     let (completed_child_id_sender, completed_child_id_receiver) = crossbeam::channel::unbounded();
@@ -481,7 +484,9 @@ fn exec_rules_to_run(
                 trace_receiver,
                 spawned_child_id_receiver,
             );
+            let pool = connection_pool.clone();
             s.spawn(move |_| -> Result<()> {
+                let mut conn = pool.get()?;
                 if let Err(e) =
                     listen_to_processes(&mut conn, root, tracker, poisoned.clone(), proc_receivers)
                 {
@@ -797,7 +802,8 @@ fn listen_to_processes(
     poisoned: PoisonedState,
     mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
-    let mut io_conn = start_connection().expect("Failed to open in memory db");
+    let io_conn_pool = start_connection(IO_DB).expect("Failed to open in memory db");
+    let mut io_conn = io_conn_pool.get()?;
     tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();

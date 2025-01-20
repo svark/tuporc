@@ -1,5 +1,8 @@
 extern crate rusqlite;
 extern crate sha2;
+extern crate r2d2;
+extern crate r2d2_sqlite;
+
 macro_rules! dynamic_named_params {
     ($($param_name:ident),* $(,)?) => {
         &[
