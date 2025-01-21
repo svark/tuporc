@@ -11,6 +11,7 @@ CREATE TABLE Node
     srcid       INTEGER default -1,                         -- id of the dir (which has Tupfile) that generated this node
     UNIQUE (dir, name)                                      --- dir and name make a unique pair for a node
 );
+--- Indices for the Node table
 Create UNIQUE INDEX NodeIdIndex on Node (id);
 Create INDEX NodeSrcIdIndex on Node (srcid);
 Create UNIQUE INDEX NodeDirNameIndex on Node (dir, name);
@@ -18,11 +19,11 @@ Create UNIQUE INDEX NodeDirNameIndex on Node (dir, name);
 --- NormalLink has links between tup files/rules/groups etc
 CREATE TABLE NormalLink
 (
-    from_id  INTEGER,           -- id of the node that is the source of the link
-    to_id    INTEGER,           -- id of the node that is the target of the link
+    from_id   INTEGER,           -- id of the node that is the source of the link
+    to_id     INTEGER,           -- id of the node that is the target of the link
     is_sticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
-    to_type  INTEGER,           -- type of the target node
-    unique (from_id, to_id),    -- from_id and to_id make a unique pair for a link
+    to_type   INTEGER,           -- type of the target node
+    unique (from_id, to_id),     -- from_id and to_id make a unique pair for a link
     FOREIGN KEY (from_id) references Node (id) on DELETE CASCADE,
     FOREIGN KEY (to_id) references Node (id) on DELETE CASCADE,
     CHECK (is_sticky in (0, 1) ) -- is_sticky can only be 0 or 1 indicating if this is hard link where delete should cascade
@@ -56,6 +57,7 @@ VALUES ('File', 0, 'FILE_SYS'),
        ('Task', 10, 'TUPLANG');
 
 
+--- ChangeList holds the list of nodes that have been modified or deleted
 Create Table IF NOT EXISTS ChangeList
 (
     id        integer PRIMARY KEY not null,
@@ -68,6 +70,7 @@ Create Table IF NOT EXISTS ChangeList
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ChangeList_id ON ChangeList (id);
 
+--- NODESHA holds the sha of the node that are involved in the build
 CREATE TABLE NODESHA
 (
     id  INTEGER PRIMARY KEY not null,
@@ -86,6 +89,7 @@ CREATE TABLE MONITORED_FILES
     generation_id INTEGER                           not NULL
 );
 
+-- create a table to store messages that are generated during the build
 CREATE TABLE MESSAGES
 (
     id      INTEGER PRIMARY KEY AUTOINCREMENT not NULL,
