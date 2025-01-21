@@ -21,7 +21,6 @@ use std::env::{current_dir, set_current_dir};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clap::Parser;
@@ -263,8 +262,7 @@ fn main() -> Result<()> {
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
-                let running = std::sync::Arc::new(AtomicBool::new(true));
-                match scan::scan_root(root.as_path(), pool, &term_progress, running) {
+                match scan::scan_root(root.as_path(), pool, &term_progress) {
                     Err(e) => eprintln!("{}", e),
                     Ok(()) => println!("Scan was successful"),
                 };
@@ -421,7 +419,6 @@ fn scan_and_get_tupfiles(
     skip_scan: bool,
     targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
-    let running = std::sync::Arc::new(AtomicBool::new(true));
 
     let lock_file_path = root.join(".tup/build_lock");
     let file = OpenOptions::new()
@@ -434,7 +431,7 @@ fn scan_and_get_tupfiles(
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), connection.clone(), &term_progress, running)?;
+        scan::scan_root(root.as_path(), connection.clone(), &term_progress)?;
     }
     term_progress.clear();
     let mut conn = connection.get().expect("Failed to get connection");
@@ -465,10 +462,9 @@ fn scan_and_get_all_tupfiles(
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
 
-    let running = std::sync::Arc::new(AtomicBool::new(true));
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), pool.clone(), &term_progress, running)?;
+        scan::scan_root(root.as_path(), pool.clone(), &term_progress)?;
     }
     term_progress.clear();
     parse::gather_tupfiles(pool.get().expect("Failed to get connection"))

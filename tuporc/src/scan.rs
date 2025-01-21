@@ -5,14 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::ops::Deref;
 //use std::io::Error as IOError;
+use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
-use rayon::{ThreadPoolBuilder};
 
 use crate::parse::compute_path_hash;
 use crate::{is_tupfile, TermProgress};
@@ -22,12 +23,13 @@ use crossbeam::sync::WaitGroup;
 use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
+use parking_lot::Mutex;
 use tupdb::db::{Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::inserts::{LibSqlInserts, TupinsertsSql};
+use tupdb::queries::LibSqlQueries;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
-use tupdb::queries::LibSqlQueries;
 
 const MAX_THRS_NODES: u8 = 4;
 pub const MAX_THRS_DIRS: usize = 24;
@@ -38,9 +40,8 @@ pub(crate) fn scan_root(
     root: &Path,
     conn: TupConnectionPool,
     term_progress: &TermProgress,
-    running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
-    insert_direntries(root, conn, term_progress, running)
+    insert_direntries(root, conn, term_progress)
 }
 
 /// mtime stored wrt 1-1-1970
@@ -285,7 +286,7 @@ fn walkdir_from(
                 if !ign.matched(pp.get_path().as_path(), true).is_ignore() {
                     let pdir = DirSender::new(pp, dir_sender.clone());
                     dir_sender.send(pdir).unwrap(); // unwrap is safe here as we are not expecting the receiver to be closed within scope
-                }else {
+                } else {
                     log::debug!("ignoring path:{}", pp.get_path().as_path().display());
                     return;
                 }
@@ -328,8 +329,8 @@ fn insert_direntries(
     root: &Path,
     pool: TupConnectionPool,
     term_progress: &TermProgress,
-    running: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
     log::debug!("Inserting/updating directory entries to db");
     {
         let conn = pool.get().expect("unable to get connection from pool");
@@ -346,10 +347,9 @@ fn insert_direntries(
 
         let compute_root_sha = || compute_dir_sha256(root).ok();
 
-        let inserted = conn.fetch_upsert_node(&root_node.get_prepared_node(),
-                                         || {
-                                                    compute_root_sha().unwrap_or_default()
-                                                })?;
+        let inserted = conn.fetch_upsert_node(&root_node.get_prepared_node(), || {
+            compute_root_sha().unwrap_or_default()
+        })?;
 
         let mt = std::fs::metadata(root.join(TUP_CONFIG)).ok();
         if mt.is_some() {
@@ -363,38 +363,18 @@ fn insert_direntries(
             .expect("Unable to prepare tup.config node for insertion");
             let pathbuf = root.join(TUP_CONFIG);
             let tup_config_sha = || compute_sha256(pathbuf.clone()).unwrap_or_default();
-            let _ = conn.fetch_upsert_node(&tup_config_node.get_prepared_node() , tup_config_sha)?;
+            let _ = conn.fetch_upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
         }
     }
 
     let pb = term_progress.pb_main.clone();
     // Begin processing the directory tree
-    crossbeam::scope(|s| -> eyre::Result<()> {
+    let thread_pool_builder =
+        ThreadPoolBuilder::new().thread_name(|i| format!("tup-scan-thread-{}", i));
+    let thread_pool = thread_pool_builder.build()?;
+    thread_pool.scope(|s| -> eyre::Result<()> {
+        let error = Arc::new(Mutex::from(eyre::Ok(())));
         let wg = WaitGroup::new();
-        let custom_spawn_handler = |thread_builder: rayon::ThreadBuilder | {
-            // Spawn a thread with a custom name and execute the logic
-            let mut builder = s.builder();
-            builder = if let Some(name) = thread_builder.name() {
-                builder.name(name.to_string())
-            } else {
-                builder.name("tup-scan-thread".to_string())
-            };
-            let builder = if let Some(stack_size) = thread_builder.stack_size() {
-                builder.stack_size(stack_size)
-            } else {
-                builder
-            };
-            
-            builder.spawn(|_| {
-               thread_builder.run() // Execute the thread's main logic
-            })
-                .map(|_| ())
-        };
-        let thread_pool_builder =
-            ThreadPoolBuilder::new().spawn_handler(custom_spawn_handler).thread_name(|i| {
-                format!("tup-scan-thread-{}", i)
-            });
-        let thread_pool = thread_pool_builder.build()?;
         {
             let (nodesender, nodereceiver) = crossbeam::channel::unbounded();
             let (dire_sender, dire_receiver) = crossbeam::channel::unbounded::<ProtoNode>();
@@ -429,15 +409,15 @@ fn insert_direntries(
 
             //println!("root:{:?}", root.to_path_buf());
             {
+                let running = running.clone();
                 let ign = ign.clone();
-                thread_pool.spawn(move || {
+                s.spawn(move |_| {
                     let ticker = tick(Duration::from_millis(500));
                     let mut dirid_receiver = Some(dirid_receiver);
                     let mut dir_children_receiver = Some(dir_children_receiver);
                     let n1 = never();
                     let n2 = never();
                     let mut receiver_cnt = 2;
-                    let running = running.clone();
                     let send_children = move |dir_children: DirChildren, id| {
                         let (pp, children) = dir_children.get();
                         for p in children {
@@ -505,7 +485,7 @@ fn insert_direntries(
                     let dire_receiver = dire_receiver.clone();
                    // let dirid_sender = dirid_sender.clone();
                     //let pool = pool.clone();
-                    thread_pool.spawn(move || {
+                    s.spawn(move |_| {
                         for mut p in dire_receiver.iter() {
                             let dirid = p.get_dir_id();
                             let hashed_path = p.take_path();
@@ -520,8 +500,6 @@ fn insert_direntries(
                                 prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype);
                             if let Some(node_at_path) = node_at_path {
                                 ns.send(node_at_path).expect("Failed to send prepared node");
-                               /* check_and_send_modified_nodes(pool.clone(), node_at_path, ns.clone(), dirid_sender.clone())
-                                    .expect("Failed to check and send modified nodes"); */
                             }
                         }
                         drop(ns);
@@ -540,16 +518,21 @@ fn insert_direntries(
                 let pool = pool.clone();
                 let dirid_sender = dirid_sender.clone();
                 let term_progress = term_progress.clone();
-                thread_pool.spawn(move || {
+                let running = running.clone();
+                let err = error.clone();
+                s.spawn(move |_| {
                     let mut conn = pool.get().expect("unable to get connection from pool");
                     let res = add_modify_nodes(&mut conn, nodereceiver, dirid_sender, &pb);
                     log::debug!("finished adding nodes");
                     if res.is_err() {
                         log::error!("Error:{:?}", res);
-                        term_progress.abandon(&pb, " Errors encountered during scanning.");
+                        term_progress.abandon(&pb, " Errors encountered during scanning inserting nodes.");
+                        running.store(false, Ordering::SeqCst);
                     } else {
                         term_progress.finish(&pb, "✔ Finished scanning");
                     }
+                    let mut e = err.lock();
+                    *e= res;
                     drop(wg);
                 });
             }
@@ -567,7 +550,7 @@ fn insert_direntries(
                 let wg = wg.clone();
                 let ign = ign.clone();
                 //let running = running.clone();
-                thread_pool.spawn(move || {
+                s.spawn(move |_| {
                     // walkdir over the children and send the children for insertion into db using the sender for DirChildren.
                     // This is a sort of recursive, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
                     // Eventually, each such  `DirSender` will be received by some sister thread which calls `walk_recvd_dirs` again on them
@@ -591,9 +574,12 @@ fn insert_direntries(
             }
         }
         wg.wait();
+        let e = error.lock();
+        if let Err(e) = e.deref() {
+            eyre::bail!(e.to_string())
+        }
         Ok(())
     })
-    .expect("Failed to spawn thread for dir insertion")
 }
 
 pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
@@ -634,25 +620,26 @@ impl NodeUpdateState {
     pub(crate) fn get_existing_node(&self) -> Node {
         self.existing_node.clone()
     }
-    
 }
 
 fn fetch_node_update_state(conn: TupConnectionRef, node: &Node) -> NodeUpdateState {
     conn.fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
-        .map_or(NodeUpdateState::new (Node::unknown(), true),
-                |existing_node| {
-            if needs_update(node, &existing_node) {
-                NodeUpdateState {
-                    existing_node,
-                    modified: true,
+        .map_or(
+            NodeUpdateState::new(Node::unknown(), true),
+            |existing_node| {
+                if needs_update(node, &existing_node) {
+                    NodeUpdateState {
+                        existing_node,
+                        modified: true,
+                    }
+                } else {
+                    NodeUpdateState {
+                        existing_node,
+                        modified: false,
+                    }
                 }
-            } else {
-                NodeUpdateState {
-                    existing_node,
-                    modified: false,
-                }
-            }
-        })
+            },
+        )
 }
 fn needs_update(node: &Node, existing_node: &Node) -> bool {
     if existing_node.get_type().ne(&node.get_type()) {
@@ -673,11 +660,12 @@ fn needs_update(node: &Node, existing_node: &Node) -> bool {
     false
 }
 #[allow(dead_code)]
-fn check_and_send_modified_nodes(pool: TupConnectionPool, 
-                                 node_at_path: NodeAtPath,
-                                 node_to_insert_sender: Sender<NodeUpdateState>,
-                                 dirid_sender: Sender<(HashedPath, i64)>)
-    -> eyre::Result<()> {
+fn check_and_send_modified_nodes(
+    pool: TupConnectionPool,
+    node_at_path: NodeAtPath,
+    node_to_insert_sender: Sender<NodeUpdateState>,
+    dirid_sender: Sender<(HashedPath, i64)>,
+) -> eyre::Result<()> {
     let mut conn = pool.get()?;
     {
         let node = node_at_path.get_prepared_node();
@@ -686,22 +674,21 @@ fn check_and_send_modified_nodes(pool: TupConnectionPool,
             let tx = conn.deferred_transaction();
             match tx {
                 Ok(tx) => {
-                    let node_update_sta =
-                        fetch_node_update_state(tx.connection(), node);
+                    let node_update_sta = fetch_node_update_state(tx.connection(), node);
                     tx.rollback()?;
                     if node.get_type() == &RowType::Dir {
                         let id = node_update_sta.get_id();
                         if id >= 0 {
                             dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;
                         }
-                    } 
-                    node_to_insert_sender.send(node_update_sta)?; 
+                    }
+                    node_to_insert_sender.send(node_update_sta)?;
                     break;
                 }
                 Err(e) if e.is_busy() => {
                     retries -= 1;
                     log::warn!("Retrying to gain a read lock on database");
-                    thread::sleep(Duration::from_millis(5)); 
+                    thread::sleep(Duration::from_millis(5));
                 }
                 Err(_) => {
                     return Err(eyre!("unable to gain a read lock on database"));
@@ -728,8 +715,7 @@ fn add_modify_nodes(
         for node_at_path in node_at_path_receiver.iter() {
             let node = node_at_path.get_prepared_node();
             let pbuf = node_at_path.get_hashed_path();
-            let node_state =
-                fetch_node_update_state(tx.connection(), node);
+            let node_state = fetch_node_update_state(tx.connection(), node);
             let existing_node = node_state.get_existing_node();
             let is_dir = node.get_type() == &RowType::Dir;
             let id = if node_state.is_modified() {
@@ -743,7 +729,7 @@ fn add_modify_nodes(
             if is_dir {
                 dirid_sender.send((pbuf.clone(), id))?;
             }
-            
+
             cnt += 1;
             progressbar.tick();
         }

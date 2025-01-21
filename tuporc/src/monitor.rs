@@ -174,7 +174,7 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
     }
     let connection_pool = start_tup_connection()?;
     let term_progress = TermProgress::new("Full scan underway..");
-    scan_root(root.as_path(), connection_pool.clone(), &term_progress, running.clone())?;
+    scan_root(root.as_path(), connection_pool.clone(), &term_progress)?;
     crossbeam::scope(|s| -> Result<()> {
         let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
             .expect("Failed to create watcher");
