@@ -23,12 +23,7 @@ pub trait LibSqlQueries {
     where
         F: FnMut(Node) -> SqlResult<()>;
 
-    /// Find a node by its path and name
-    fn fetch_node_by_path<P: AsRef<Path>>(
-        &mut self,
-        dir_path: P,
-        name: &str,
-    ) -> DbResult<(i64, i64)>;
+
 
     /// Fetch all rule nodes in a tupfile directory
     fn fetch_rule_nodes_by_dir(&self, dir: i64) -> DbResult<Vec<Node>>;
@@ -54,6 +49,9 @@ pub trait LibSqlQueries {
     fn for_each_modified_tupfile<F>(&self, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
+
+    fn for_each_subdirectory<F>(&self, dir_id: i64, f: F) -> DbResult<()>
+    where F: FnMut(i64, String) -> SqlResult<()> ;
 
     fn for_each_rule_to_run_no_targets<F>(&self, f: F) -> DbResult<()>
     where
@@ -148,16 +146,6 @@ impl LibSqlQueries for rusqlite::Connection {
         .map_err(Into::into)
     }
 
-    fn fetch_node_by_path<P: AsRef<Path>>(
-        &mut self,
-        dir_path: P,
-        name: &str,
-    ) -> DbResult<(i64, i64)> {
-        let dir_path_str: String = db_path_str(dir_path.as_ref());
-        self.fetch_node_by_path_inner(&dir_path_str, name, |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(Into::into)
-    }
-
     fn fetch_rule_nodes_by_dir(&self, dir: i64) -> DbResult<Vec<Node>> {
         let mut nodes = Vec::new();
         self.fetch_rule_nodes_by_dir_inner(dir, |row| {
@@ -225,6 +213,17 @@ impl LibSqlQueries for rusqlite::Connection {
         self.for_each_modified_tupfile_inner(|row| {
             let node = make_tup_node(row)?;
             f(node)
+        })?;
+        Ok(())
+    }
+
+    fn for_each_subdirectory<F>(&self, dir_id: i64, mut f: F) -> DbResult<()>
+    where F: FnMut(i64, String) -> SqlResult<()>
+    {
+        self.for_each_subdirectory_inner(dir_id, |row| {
+            let dir_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            f(dir_id, name)
         })?;
         Ok(())
     }

@@ -1,6 +1,6 @@
 use crate::db::RowType::{DirGen, GenF};
 use crate::deletes::LibSqlDeletes;
-use crate::error::{AnyError, DbResult, SqlResult};
+use crate::error::{AnyError, DbResult};
 use crate::inserts::LibSqlInserts;
 use crate::queries::LibSqlQueries;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -12,7 +12,7 @@ use std::fs::File;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, MAIN_SEPARATOR};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 //returns change status of a db command
 pub enum UpsertStatus {
@@ -379,7 +379,7 @@ pub fn init_db() -> DbResult<()> {
     Ok(())
 }
 
-type R2D2Pool = Arc<r2d2::Pool<SqliteConnectionManager>> ;
+type R2D2Pool = Arc<r2d2::Pool<SqliteConnectionManager>>;
 
 #[derive(Clone, Debug)]
 pub struct TupConnectionPool {
@@ -392,11 +392,11 @@ impl TupConnectionPool {
     pub fn new(database_url: &str) -> Self {
         let manager = SqliteConnectionManager::file(database_url);
         let pool = r2d2::Builder::new()
-            .max_size(18) 
+            .max_size(18)
             .connection_timeout(Duration::from_secs(10)) // Extend the timeout
             .build(manager)
-            .expect("Failed to create connection pool"); 
-        
+            .expect("Failed to create connection pool");
+
         TupConnectionPool {
             pool: Arc::new(pool),
         }
@@ -445,7 +445,9 @@ impl TupConnection {
         Ok(TupTransaction::new(self.0.transaction()?))
     }
     pub fn deferred_transaction(&mut self) -> DbResult<TupTransaction<'_>> {
-        Ok(TupTransaction::new(self.0.transaction_with_behavior(Deferred)?))
+        Ok(TupTransaction::new(
+            self.0.transaction_with_behavior(Deferred)?,
+        ))
     }
 
     pub fn as_ref(&self) -> TupConnectionRef {
@@ -485,29 +487,110 @@ pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
     let pool = TupConnectionPool::new(database_url);
     let conn = pool.get().map_err(|e| AnyError::from(e))?;
     if !is_initialized(&conn, "Node") {
-        return Err(AnyError::from(String::from(
-            format!("Node table not found in {database_url}"),
-        )));
+        return Err(AnyError::from(String::from(format!(
+            "Node table not found in {database_url}"
+        ))));
+    }
+    conn.execute("PRAGMA optimize;", [])?;
+    #[cfg(debug_assertions)]
+    {
+        let mut stmt = conn.prepare("PRAGMA compile_options")?;
+        let s = stmt
+            .query_map([], |r| {
+                // println!("Sqlite compile options: {}",
+                Ok(r.get::<_, String>(0)?)
+            })
+            .map_err(|e| AnyError::from(e))?;
+        for i in s {
+            println!("Sqlite compile options: {}", i.unwrap_or("_".to_string()));
+        }
     }
     Ok(pool)
 }
 
-// create a temp table from directories paths to their node ids
-pub fn create_path_buf_temptable(conn: &TupConnection) -> SqlResult<()> {
-    // https://gist.github.com/jbrown123/b65004fd4e8327748b650c77383bf553
-    //let dir : u8 = RowType::Dir as u8;
-    let s = include_str!("sql/dirpathbuf_temptable.sql");
+
+pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
+    let start_time = Instant::now();
+    let dirpathbuf_create_sql = include_str!("sql/dirpathbuf_temptable.sql");
+    let dirpathbuf_indices_sql = include_str!("sql/dirpathbuf_indices.sql");
+
+    // Define the DirPath structure
+    struct DirPath {
+        id: i64,
+        dir: i64,
+        name: String,
+    }
+
+    // Initialize the stack with an estimated capacity
+    let mut stack = Vec::with_capacity(1024);
+    stack.push(DirPath {
+        id: 1,
+        dir: 0,
+        name: ".".to_string(),
+    });
+
+    // Begin a transaction for better performance
+    let tx = conn.transaction()?;
+    let mut max_stack_size = 0;
+    
+    {
+        // Execute the initial setup SQL to create Die
+        tx.execute_batch(dirpathbuf_create_sql)?;
+        // Process directories using a stack (Depth-First Search)
+        while let Some(dir_path) = stack.pop() {
+            // Insert the current directory path
+            tx.insert_into_dirpathuf( dir_path.id, dir_path.dir, dir_path.name.as_str() )?;
+
+            // Query child directories
+            tx.for_each_subdirectory(dir_path.id, |id, name| {
+                let new_name = format!("{}/{}", dir_path.name, name);
+                stack.push(DirPath {
+                    id,
+                    dir: dir_path.id,
+                    name: new_name,
+                });
+                Ok(())
+            })?;
+            max_stack_size = max_stack_size.max(stack.len());
+        }
+
+        // Create indexes to optimize future queries
+        tx.execute_batch(dirpathbuf_indices_sql)?;
+    }
+    tx.commit()?;
+
+    // Log the elapsed time
+    let elapsed_time = start_time.elapsed();
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "DirPathBuf table created in {:.4} seconds.\n max_stack_size: {}",
+        elapsed_time.as_secs_f64(),
+        max_stack_size
+    );
+
+    Ok(())
+}
+
+
+pub fn create_presentlist_temptable(conn: &TupConnection) -> DbResult<()> {
+    let s = include_str!("sql/presentlisttemptable.sql");
     conn.execute_batch(s)?;
     Ok(())
 }
 
-pub fn create_dyn_io_temp_tables(conn: &TupConnection) -> SqlResult<()> {
+pub fn create_tuppathbuf_temptable(conn: &TupConnection) -> DbResult<()> {
+    let s = include_str!("sql/tuppathbuf.sql");
+    conn.execute_batch(s)?;
+    Ok(())
+}
+
+pub fn create_dyn_io_temp_tables(conn: &TupConnection) -> DbResult<()> {
     conn.execute_batch(include_str!("sql/dynio.sql"))?;
     Ok(())
 }
 
 //creates a temp table
-pub fn create_temptables(conn: &TupConnection) -> SqlResult<()> {
+pub fn create_temptables(conn: &TupConnection) -> DbResult<()> {
     let stmt = include_str!("sql/temptables.sql");
     conn.execute_batch(stmt)?;
     Ok(())
@@ -535,7 +618,6 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
 }
 
 impl MiscStatements for TupConnection {
-
     fn enrich_modified_list(&self) -> DbResult<()> {
         self.delete_tupentries_in_deleted_tupfiles()?;
         self.add_rules_with_changed_io_to_modify_list()?;
@@ -590,3 +672,5 @@ pub(crate) fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
         srcid as u32,
     ))
 }
+
+

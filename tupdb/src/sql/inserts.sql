@@ -346,6 +346,15 @@ SELECT id, type, 1
 from TupfileEntities;
 -- <eos>
 
+-- name: insert_into_dirpathbuf_inner!
+-- Insert a directory path into the DirPathBuf table
+-- # Parameters
+-- param: id : i64 - id of the directory
+-- param: dir : i64 - id of the parent directory
+-- param: name : &str - name of the directory
+INSERT INTO DirPathBuf (id, dir, name)  VALUES (:id, :dir, :name);
+-- <eos>
+    
 -- name: insert_monitored_inner!
 -- Insert a monitored file into the database
 -- # Parameters

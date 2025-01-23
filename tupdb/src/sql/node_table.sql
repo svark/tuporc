@@ -109,9 +109,10 @@ where is_delete = 1;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
-PRAGMA cache_size = 10000;
+PRAGMA cache_size = 20000;
+
 ---  mmap_size is the maximum amount of memory that SQLite is allowed to use for memory-mapped I/O.
-PRAGMA mmap_size = 20000000000;
+PRAGMA mmap_size = 21400000000;
 PRAGMA threads = 4;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 10000;

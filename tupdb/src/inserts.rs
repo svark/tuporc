@@ -61,6 +61,7 @@ pub trait LibSqlInserts {
     fn delete_tupentries_in_deleted_tupfiles(&self) -> DbResult<()>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
+    fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
 }
 
 pub enum UpsertStatus {
@@ -327,6 +328,11 @@ impl LibSqlInserts for Connection {
     }
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()> {
         let _ = self.insert_monitored_inner(path, gen_id, event)?;
+        Ok(())
+    }
+    
+    fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()> {
+        let _ = self.insert_into_dirpathbuf_inner(id, dir, name)?;
         Ok(())
     }
 }

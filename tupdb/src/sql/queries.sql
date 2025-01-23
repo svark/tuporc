@@ -104,29 +104,6 @@ FROM DirPathBuf
 where name = :path;
 -- <eos>
 
--- name: fetch_dirid_and_parent_by_path?
--- Fetch the id of a directory and its parent by path
--- # Parameters
--- param: path : &str - path of the directory
--- returns: (i64, i64)
-SELECT id, dir
-FROM DirPathBuf
-where name = :path
-LIMIT 1;
--- <eos>
-
--- name: fetch_node_by_path_inner?
--- Fetch a node by path
--- # Parameters
--- param: filename: &str  - name of the node
--- param: dir_path : &str - dir path of the node
--- returns: (i64, i64)
-SELECT Node.id, Node.dir
-from Node
-         join DIRPATHBUF on Node.dir = DIRPATHBUF.id
-where DIRPATHBUF.name = :dir_path
-  and Node.name = :filename;
--- <eos>
 -- name: fetch_dirpath_by_dirid?
 -- Fetch the directory path buffer by directory id
 -- # Parameters
@@ -142,8 +119,7 @@ where id = :dir_id;
 -- Fetch the modified tup files
 SELECT tpb.id, tpb.dir, tpb.name
 from TupPathBuf tpb
-         join ModifyList on tpb.id = ModifyList.id
-where type = (SELECT type_index from NodeType where type = 'TupF');
+         join ModifyList on tpb.id = ModifyList.id;
 -- <eos>
 
 -- name: for_each_tupnode_inner&
@@ -403,6 +379,13 @@ WHERE st.id = :glob_dir_id
 ORDER BY n.id;
 -- <eos>
 
+-- name: for_each_subdirectory_inner&
+-- Find immediate subdirectories of a directory
+-- # Parameters
+-- param: dir_id : i64 - id of the directory
+SELECT id, name FROM Node WHERE dir = :dir_id AND (type in (SELECT type_index from NodeType where type LIKE 'Dir%'));
+-- <eos>
+    
 -- name: for_each_glob_dir_inner&
 --  Find the directories within which glob searches would happen, this is needed for watching for changes
 -- # Parameters

@@ -1,5 +1,5 @@
 use crate::scan::{HashedPath, MAX_THRS_DIRS};
-use crate::TermProgress;
+use crate::{TermProgress};
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
-use tupdb::db::{create_path_buf_temptable, db_path_str, MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction};
+use tupdb::db::{create_dirpathbuf_temptable, create_presentlist_temptable,create_tuppathbuf_temptable, db_path_str, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
@@ -719,7 +719,33 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let dbref = parser.get_mut_searcher();
         let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
-        conn.enrich_modified_list()?;
+        //conn.enrich_modified_list()?;
+        
+        {
+            let tp = term_progress.clone();
+            tp.set_main_with_len("Enriching modified list", 7);
+            conn.delete_tupentries_in_deleted_tupfiles()?;
+            let pb_main = term_progress.pb_main.clone();
+            pb_main.inc(1);
+            conn.add_rules_with_changed_io_to_modify_list()?;
+            pb_main.inc(1);
+
+            // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
+            conn.mark_dependent_tupfiles_of_tupfiles()?; //-- included tup files -> Tupfile
+            pb_main.inc(1);
+            for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
+                conn.update_node_sha_exec(i, sha.as_str())?;
+                conn.mark_dependent_tupfiles_of_glob(i)?; // modified glob -> Tupfile
+            }
+            pb_main.inc(1);
+
+            conn.mark_rules_depending_on_modified_groups()?;
+            pb_main.inc(1);
+            conn.prune_modify_list_of_inputs_and_outputs()?;
+            pb_main.inc(1);
+            conn.delete_nodes()?;
+            pb_main.finish_with_message("Done enriching modified list");
+        }
         conn.mark_tupfile_entries(&tupfile_ids)?;
     }
     parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
@@ -912,9 +938,21 @@ fn add_link_glob_dir_to_rules(
 pub fn gather_modified_tupfiles(
     conn: &mut TupConnection,
     targets: &Vec<String>,
+    term_progress: TermProgress,
+    inspect_dir_path_buf: bool,
 ) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
-    create_path_buf_temptable(conn)?;
+    
+    let term_progress = term_progress.set_main_with_ticker("Gathering modified Tupfiles");
+    term_progress.pb_main.set_message("Creating temp tables");
+    term_progress.tick(&term_progress.pb_main);
+    create_dirpathbuf_temptable(conn).with_context(|| "Failed to create and fill dirpathbuf table")?;
+    
+    create_tuppathbuf_temptable(conn).with_context(|| "Failed to create and fill tuppathbuf table")?;
+    term_progress.tick(&term_progress.pb_main);
+    
+    create_presentlist_temptable(conn)?; 
+    term_progress.tick(&term_progress.pb_main);
 
     let mut target_dirs_and_names = Vec::new();
     if !targets.is_empty() {
@@ -927,6 +965,10 @@ pub fn gather_modified_tupfiles(
             target_dirs_and_names.push(db_path_str(dir_path.as_path()));
         }
     }
+    if inspect_dir_path_buf {
+        return Ok(tupfiles);
+    }
+    term_progress.pb_main.set_message("Looking up modified Tupfiles");
     conn.for_each_modified_tupfile(|n: Node| {
         // name stores full path here
         debug!("tupfile to parse:{}", n.get_name());
@@ -937,14 +979,15 @@ pub fn gather_modified_tupfiles(
         {
             tupfiles.push(n);
         }
+        term_progress.tick(&term_progress.pb_main);
         Ok(())
     })?;
     Ok(tupfiles)
 }
 
-pub fn gather_tupfiles(conn: TupConnection) -> Result<Vec<Node>> {
+pub fn gather_tupfiles(mut conn: TupConnection) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
-    create_path_buf_temptable(&conn)?;
+    create_dirpathbuf_temptable(&mut conn)?;
 
     conn.for_each_tupnode(|n: Node| {
         // the field `name` in n stores full path here

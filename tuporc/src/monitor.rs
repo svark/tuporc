@@ -247,7 +247,7 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
 fn run_monitor(
     path_receiver: Receiver<(PathBuf, i32)>,
     root: PathBuf,
-    conn: &TupConnection,
+    conn: &mut TupConnection,
     term_progress: TermProgress,
     stop_receiver: Receiver<()>,
     mut generation_id: i64,
@@ -259,7 +259,7 @@ fn run_monitor(
     pb_main.println("Full scan complete");
     let pb = term_progress.pb_main.clone();
     let pb = pb.with_message("Monitoring filesystem for changes");
-    tupdb::db::create_path_buf_temptable(conn)?;
+    tupdb::db::create_dirpathbuf_temptable(conn)?;
     let bo = BufferObjects::new(root);
     let mut cross_ref_maps = CrossRefMaps::default();
     let mut update_nodes = |path: &Path, added: bool| -> Result<()> {

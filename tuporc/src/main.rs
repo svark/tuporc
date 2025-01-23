@@ -189,6 +189,9 @@ enum Action {
         /// keep_going when set, allows builds to continue on error
         #[arg(short = 'k', default_value = "false")]
         keep_going: bool,
+        /// skip scanning the filesystem before parse
+        #[arg(short = 's', long = "skip-scan", default_value = "false")]
+        skip_scan: bool
     },
 
     #[clap(about = "Build specified targets")]
@@ -270,12 +273,14 @@ fn main() -> Result<()> {
             Action::Parse {
                 mut target,
                 keep_going: _keep_going,
+                skip_scan,
             } => {
                 let root = change_root_update_targets(&mut target)?;
+                
                 let pool = start_tup_connection()
                     .expect("Connection to tup database in .tup/db could not be established");
                 let term_progress = TermProgress::new("Scanning ");
-                let skip_scan = monitor::is_monitor_running();
+                let skip_scan = skip_scan || monitor::is_monitor_running();
                 let tupfiles = scan_and_get_tupfiles(
                     &root,
                     pool.clone(),
@@ -414,7 +419,7 @@ fn change_root() -> Result<()> {
 
 fn scan_and_get_tupfiles(
     root: &PathBuf,
-    connection: TupConnectionPool,
+    connection_pool: TupConnectionPool,
     term_progress: &TermProgress,
     skip_scan: bool,
     targets: &Vec<String>,
@@ -431,11 +436,14 @@ fn scan_and_get_tupfiles(
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), connection.clone(), &term_progress)?;
+        scan::scan_root(root.as_path(), connection_pool.clone(), &term_progress)?;
     }
     term_progress.clear();
-    let mut conn = connection.get().expect("Failed to get connection");
-    gather_modified_tupfiles(&mut conn, targets)
+    
+    let mut conn = connection_pool.get().expect("Failed to get connection");
+   // conn.execute("PRAGMA optimize" ,[])?;
+    let inspect_dirpath_buf = std::env::var("INSPECT_DIRPATHBUF").is_ok();
+    gather_modified_tupfiles(&mut conn, targets, term_progress.clone(), inspect_dirpath_buf)
 }
 
 fn scan_and_get_all_tupfiles(
