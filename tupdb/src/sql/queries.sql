@@ -182,8 +182,8 @@ where Node.srcid = :rule_id
 SELECT Node.id   as                          id,
        Node.dir  as                          dir,
        Node.type as                          type,
-       (DirPathBuf.name || '/' || Node.name) name,
-       Node.mtime_ns                         mtime_ns
+       (DirPathBuf.name || '/' || Node.name) AS name,
+       Node.mtime_ns                         AS mtime_ns
 from NODE
          join DirPathBuf on (Node.dir = DirPathBuf.id)
          join NormalLink nl on (Node.id = nl.from_id)
@@ -358,7 +358,7 @@ WITH RECURSIVE sub_tree AS (
         AND (st.depth < :glob_depth))
 SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
 FROM Node n
-         JOIN subtree as st on n.dir = st.id
+         JOIN sub_tree as st on n.dir = st.id
 WHERE n.name GLOB :glob_pattern
   AND st.name GLOB :glob_dir_pattern
   AND (n.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
@@ -385,7 +385,7 @@ ORDER BY n.id;
 -- param: dir_id : i64 - id of the directory
 SELECT id, name FROM Node WHERE dir = :dir_id AND (type in (SELECT type_index from NodeType where type LIKE 'Dir%'));
 -- <eos>
-    
+
 -- name: for_each_glob_dir_inner&
 --  Find the directories within which glob searches would happen, this is needed for watching for changes
 -- # Parameters
@@ -393,7 +393,7 @@ SELECT id, name FROM Node WHERE dir = :dir_id AND (type in (SELECT type_index fr
 -- param: glob_depth : i32 - max depth of the directory from the root of the glob
 WITH RECURSIVE sub_tree AS (
     -- Base case: Start with the specified parent node (ensure it's a directory)
-    SELECT id, dir, name 1 AS depth
+    SELECT id, dir, name, 1 AS depth
     FROM DIRPATHBUF
     WHERE id = :glob_dir_id -- Ensure the starting node is a folder
     UNION ALL
@@ -404,7 +404,7 @@ WITH RECURSIVE sub_tree AS (
              JOIN sub_tree st ON dt.dir = st.id
         AND (st.depth < :glob_depth))
 SELECT name
-FROM subtree;
+FROM sub_tree;
 
 -- <eos>
 
