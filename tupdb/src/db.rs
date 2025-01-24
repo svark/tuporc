@@ -529,12 +529,10 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
         name: ".".to_string(),
     });
 
-    // Begin a transaction for better performance
     let tx = conn.transaction()?;
-    let mut max_stack_size = 0;
     
     {
-        // Execute the initial setup SQL to create Die
+        // Execute the initial setup SQL
         tx.execute_batch(dirpathbuf_create_sql)?;
         // Process directories using a stack (Depth-First Search)
         while let Some(dir_path) = stack.pop() {
@@ -551,7 +549,6 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
                 });
                 Ok(())
             })?;
-            max_stack_size = max_stack_size.max(stack.len());
         }
 
         // Create indexes to optimize future queries
@@ -563,9 +560,8 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
     let elapsed_time = start_time.elapsed();
     #[cfg(debug_assertions)]
     eprintln!(
-        "DirPathBuf table created in {:.4} seconds.\n max_stack_size: {}",
+        "DirPathBuf table created in {:.4} seconds.",
         elapsed_time.as_secs_f64(),
-        max_stack_size
     );
 
     Ok(())
