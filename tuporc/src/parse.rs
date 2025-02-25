@@ -1,3 +1,4 @@
+//! This module contains functions to parse Tupfiles and add rules to the database
 use crate::scan::{HashedPath, MAX_THRS_DIRS};
 use crate::{TermProgress};
 use bimap::BiMap;
@@ -99,6 +100,7 @@ impl NodeToInsert {
         }
     }
 
+    /// get the name of the node to insert in the database
     pub fn get_name(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
             NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_rule_str(),
@@ -1152,7 +1154,7 @@ fn check_uniqueness_of_parent_rule(
 ) -> Result<()> {
     for o in outs.get_output_files().iter() {
         let np = read_buf.get_path(o);
-        if let Ok(node) = find_by_path_inner(np.as_path(), &conn.as_ref()) {
+        if let Ok(node) = find_by_path(np.as_path(), &conn.as_ref()) {
             let rule_id = node.get_srcid();
 
             let current_parent_rule_ref = outs
@@ -1172,7 +1174,8 @@ fn check_uniqueness_of_parent_rule(
     Ok(())
 }
 
-fn find_by_path_inner(path: &Path, conn: &TupConnectionRef) -> Result<Node> {
+/// find node by path
+fn find_by_path(path: &Path, conn: &TupConnectionRef) -> Result<Node> {
     let res = find_node_id_by_path(conn, path).and_then(|node| {
         conn.fetch_node_by_id(node)
             .transpose()
@@ -1181,6 +1184,7 @@ fn find_by_path_inner(path: &Path, conn: &TupConnectionRef) -> Result<Node> {
     Ok(res)
 }
 
+// find node id by path
 fn find_node_id_by_path(conn: &TupConnectionRef, path: &Path) -> Result<i64, AnyError> {
     path.components()
         .try_fold((0, PathBuf::new()), |acc, c| {
@@ -1192,30 +1196,19 @@ fn find_node_id_by_path(conn: &TupConnectionRef, path: &Path) -> Result<i64, Any
         .map(|(id, _)| id)
 }
 
-fn find_by_path(path: &Path, conn_ref: &TupConnectionRef) -> Node {
-    find_by_path_inner(path, conn_ref).unwrap_or_else(|e| {
-        log::warn!("Error while finding path: {:?}", e);
-        Default::default()
-    })
-}
 
+ /// removes the path from the database
 pub(crate) fn remove_path<P: AsRef<Path>>(conn: &TupConnection, path: P) -> Result<()> {
-    // if the path is a file, add it to the deletelist table
     let connection_ref = conn.as_ref();
-    let node = find_by_path(path.as_ref(), &connection_ref);
-    let nodeid = node.get_id();
-    if nodeid > 0 {
-        //add_ids_statements.add_to_delete(nodeid, *node.get_type())?;
-        conn.mark_deleted(nodeid, node.get_type())?;
-        /* if node.get_type() == &Dir {
-            buf_statements.remove_dirpathbuf(nodeid)?;
-        } else if node.get_type() == &TupF {
-            buf_statements.remove_tuppathbuf(nodeid)?;
-        } */
+    if let Ok(node) = find_by_path(path.as_ref(), &connection_ref) {
+    //  add it to the deletelist table
+        conn.mark_deleted(node.get_id(), node.get_type())?;
     }
     Ok(())
 }
 
+/// inserts a path into the database,
+/// After insertion, the path also appears in crossref maps as a bimap source and target <-> db_id
 pub(crate) fn insert_path(
     conn: &TupConnectionRef,
     path_buffers: &impl PathBuffers,
@@ -1318,7 +1311,7 @@ fn ensure_parent_inserted(
         return Ok((dir, pardir));
     }
 
-    let (dir, pardir) = find_by_path_inner(parent_path.as_path(), conn)
+    let (dir, pardir) = find_by_path(parent_path.as_path(), conn)
         .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
             // try adding parent directory if not in db
