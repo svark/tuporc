@@ -42,7 +42,7 @@ mod parse;
 mod scan;
 
 static APPNAME: &str = "tuporc";
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TermProgress {
     mb: MultiProgress,
     pb_main: ProgressBar,
@@ -201,6 +201,8 @@ enum Action {
         /// keep_going when set, allows builds to continue on error
         #[arg(short = 'k', default_value = "false")]
         keep_going: bool,
+        #[arg(short = 'j', long = "num-jobs", default_value = "0")]
+        num_jobs: usize,
     },
     #[clap(about = "Monitor the filesystem for changes")]
     Monitor {
@@ -228,6 +230,7 @@ fn main() -> Result<()> {
         Some(Action::Upd {
             target: Vec::new(),
             keep_going: false,
+            num_jobs: 0,
         })
     }) {
         match act {
@@ -238,7 +241,7 @@ fn main() -> Result<()> {
                 {
                     let pool = start_tup_connection()?;
                     let conn = pool.get().expect("Failed to get connection");
-                    // check if ther is DirPathuf table in the database
+                    // check if there is DirPathuf table in the database
                     if is_initialized(&conn, "DirPathBuf") {
                         conn.for_each_gen_file(|node| {
                             if node.get_type().eq(&RowType::GenF) {
@@ -302,6 +305,7 @@ fn main() -> Result<()> {
             Action::Upd {
                 mut target,
                 keep_going,
+                num_jobs,
             } => {
                 let root = change_root_update_targets(&mut target)?;
                 println!("Updating db {}", target.join(" "));
@@ -321,7 +325,13 @@ fn main() -> Result<()> {
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
                     parse_tupfiles_in_db(connection_pool, tupfiles, root.as_path(), &term_progress)?;
                     term_progress.clear();
-                    execute::execute_targets(&target, keep_going, root, &term_progress)?;
+                    let exec_options = execute::ExecOptions {
+                        keep_going,
+                        verbose: args.verbose,
+                        num_jobs,
+                        term_progress:term_progress.clone()
+                    };
+                    execute::execute_targets(&target, root, &exec_options)?;
                 }
 
                 // receive events from subprocesses.

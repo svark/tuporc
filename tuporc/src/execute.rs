@@ -103,15 +103,32 @@ fn prepare_for_execution(
     ))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExecOptions {
+    pub keep_going: bool,
+    pub term_progress: TermProgress,
+    pub num_jobs: usize,
+    pub verbose: bool,
+}
+impl Default for ExecOptions {
+    fn default() -> Self {
+        Self {
+            keep_going: false,
+            term_progress: TermProgress::new("Executing rules"),
+            num_jobs: num_cpus::get(),
+            verbose: false,
+        }
+    }
+}
+
 pub(crate) fn execute_targets(
     target: &Vec<String>,
-    keep_going: bool,
     root: PathBuf,
-    term_progress: &TermProgress,
+    exec_options: &ExecOptions,
 ) -> Result<()> {
     let connection_pool =
         start_tup_connection().expect("Connection to tup database in .tup/db could not be established");
-    let (dag, node_bimap) = prepare_for_execution(connection_pool.clone(), &term_progress)?;
+    let (dag, node_bimap) = prepare_for_execution(connection_pool.clone(), &exec_options.term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
@@ -158,8 +175,7 @@ pub(crate) fn execute_targets(
         &dag,
         root.as_path(),
         &target,
-        keep_going,
-        term_progress,
+        &exec_options
     )?;
     Ok(())
 }
@@ -210,13 +226,13 @@ impl ProcReceivers {
 
     fn handle_child_ids<'a>(
         &'a self,
-        oper: SelectedOperation<'a>,
+        operation: SelectedOperation<'a>,
         process_checker: &mut ProcessIOChecker,
         rules_to_verify: &mut RulesToVerify,
     ) -> Result<bool> {
         let mut end_receive = false;
         if let Ok((child_id, (rule_id, rule_name, succeeded))) = {
-            oper.recv(&self.child_id_receiver).map_err(|_| {
+            operation.recv(&self.child_id_receiver).map_err(|_| {
                 debug!("no more children  expected");
                 end_receive = true;
             })
@@ -247,14 +263,14 @@ impl ProcReceivers {
 
     fn handle_trace(
         &self,
-        oper: SelectedOperation,
+        operation: SelectedOperation,
         root: &Path,
         deleted_child_procs: &mut std::collections::BTreeSet<u32>,
         io_conn: &mut IoConn,
     ) -> Result<bool> {
         let r = &self.trace_receiver;
         let mut end = false;
-        if let Ok(evt_header) = oper.recv(r).map_err(|_| {
+        if let Ok(evt_header) = operation.recv(r).map_err(|_| {
             debug!("no more trace events expected");
             end = true;
         }) {
@@ -272,12 +288,12 @@ impl ProcReceivers {
 
     fn handle_spawned_child(
         &self,
-        oper: SelectedOperation,
+        operation: SelectedOperation,
         children: &mut std::collections::BTreeSet<u32>,
     ) -> bool {
         let r = &self.spawned_child_id_receiver;
         let mut end = false;
-        if let Ok(child_id) = oper.recv(r).map_err(|_| {
+        if let Ok(child_id) = operation.recv(r).map_err(|_| {
             debug!("no more spawned children expected");
             end = true;
         }) {
@@ -324,18 +340,18 @@ impl ProcReceivers {
                 sel,
             );
 
-            while let Ok(oper) = sel.try_select() {
-                match oper.index() {
+            while let Ok(operation) = sel.try_select() {
+                match operation.index() {
                     i if i == index_child_ids => {
                         self.end_completed_child_ids =
-                            self.handle_child_ids(oper, process_checker, rules_to_verify)?;
+                            self.handle_child_ids(operation, process_checker, rules_to_verify)?;
                     }
                     i if i == index_trace => {
                         self.end_trace =
-                            self.handle_trace(oper, root, deleted_child_procs, io_conn)?;
+                            self.handle_trace(operation, root, deleted_child_procs, io_conn)?;
                     }
                     i if i == index_spawned_child => {
-                        self.end_spawned_child_ids = self.handle_spawned_child(oper, children);
+                        self.end_spawned_child_ids = self.handle_spawned_child(operation, children);
                     }
                     _ => {
                         unreachable!("unexpected index");
@@ -355,19 +371,18 @@ impl ProcReceivers {
 
 fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
     let dir = std::env::current_dir()?;
-    let dirc = dir.clone();
     let bo = BufferObjects::new(root);
-    let dir_desc = bo.add_abs(&dirc)?;
-    let mut dirids = Vec::new();
+    let dir_desc = bo.add_abs(&dir)?;
+    let mut dir_ids = Vec::new();
     for t in targets {
         let path_desc = dir_desc.join(t.as_str())?;
         let path = bo.get_path(&path_desc);
         if let Some(id) = conn.fetch_dirid_by_path(path.as_path()).ok()
         {
-            dirids.push(id);
+            dir_ids.push(id);
         } 
     }
-    Ok(dirids)
+    Ok(dir_ids)
 }
 
 fn exec_rules_to_run(
@@ -377,10 +392,12 @@ fn exec_rules_to_run(
     dag: &IncrementalTopo,
     root: &Path,
     target: &Vec<String>,
-    keep_going: bool,
-    term_progress: &TermProgress,
+    exec_options: &ExecOptions
 ) -> Result<()> {
     // order the rules based on their dependencies
+    let keep_going = exec_options.keep_going;
+    let num_threads = exec_options.num_jobs;
+    let term_progress = &exec_options.term_progress;
     let conn = connection_pool.get()?;
     let target_ids = get_target_ids(&conn, root, target)?;
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
@@ -448,7 +465,7 @@ fn exec_rules_to_run(
         topo_orders_set.insert(topo_order.get(&(v.get_id() as i32)).unwrap());
     }
     let poisoned = PoisonedState::new(keep_going);
-    let num_threads = std::cmp::min(num_cpus::get(), valid_rules.len());
+    let num_threads = std::cmp::min(num_threads, valid_rules.len());
     let mut pbars: Vec<ProgressBar> = Vec::new();
     {
         let poisoned = poisoned.clone();
@@ -475,8 +492,8 @@ fn exec_rules_to_run(
     let rule_for_child_id = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process()?;
-
-    crossbeam::scope(|s| -> Result<()> {
+    let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().expect("Failed to build thread pool to execute rules");
+    let _ = thread_pool.scope(|s| -> Result<()> {
         {
             let poisoned = poisoned.clone();
             let proc_receivers = ProcReceivers::new(
@@ -485,18 +502,14 @@ fn exec_rules_to_run(
                 spawned_child_id_receiver,
             );
             let pool = connection_pool.clone();
-            s.spawn(move |_| -> Result<()> {
-                let mut conn = pool.get()?;
+            s.spawn(move |_| {
+                let mut conn = pool.get().expect("Failed to get connection from pool");
                 if let Err(e) =
                     listen_to_processes(&mut conn, root, tracker, poisoned.clone(), proc_receivers)
                 {
                     eprintln!("Error while listening to processes: {}", e);
                     poisoned.force_poisoned();
-                    //conn.prune_modified_list()?;
-                    return Err(e);
                 }
-                //conn.prune_modified_list()?;
-                Ok(())
             });
         }
         for o in topo_orders_set {
@@ -542,7 +555,6 @@ fn exec_rules_to_run(
                     .insert(ch_id, (rule_id, rule_node.get_name().to_owned()));
                 children[j % num_threads]
                     .push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned()))));
-                //childids.push_back(ch_id);
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
             }
@@ -558,9 +570,9 @@ fn exec_rules_to_run(
                 let wg = wg.clone();
                 let pbar = term_progress.make_len_progress_bar("..", children.len() as u64);
                 pbars.push(pbar.clone());
-                s.spawn(move |_| -> Result<()> {
+                s.spawn(move |_|  {
                     let (finished, failed) =
-                        wait_for_children(poisoned, children, &pbar, &term_progress)?;
+                        wait_for_children(poisoned, children, &pbar, &term_progress);
                     for (id, succeeded) in finished
                         .iter()
                         .map(|i| (*i, true))
@@ -569,12 +581,11 @@ fn exec_rules_to_run(
                         let rule_for_child_id = rule_for_child_id.read();
                         if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
                             completed_child_id_sender
-                                .send((id, (rule_id, rule_name, succeeded)))?;
+                                .send((id, (rule_id, rule_name, succeeded))).expect("Failed to send completed child id");
                         }
                     }
                     pbar.finish();
                     drop(wg);
-                    Ok(())
                 });
             }
             wg.wait(); // wait for all processes to finish before next topo order rules are executed
@@ -594,24 +605,22 @@ fn exec_rules_to_run(
         Ok(())
     })
     .unwrap_or_else(|e| {
-        eprintln!("Error while executing rules: {:?}", e);
-        return Ok(());
-    })
-    .expect(" panic message");
+        eyre::eyre!("Error while executing rules: {:?}", e);
+    });
 
     Ok(())
 }
 
 fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String)>>>) -> Vec<u32> {
-    let mut failedids = Vec::new();
+    let mut failed_children = Vec::new();
     children.into_iter().for_each(|ch| {
         let ref mut ch = ch.lock().0;
         let id = ch.id();
-        failedids.push(id);
+        failed_children.push(id);
         ch.kill().ok();
         eprintln!("Killed child process {}", id);
     });
-    failedids
+    failed_children
 }
 
 fn wait_for_children(
@@ -619,7 +628,7 @@ fn wait_for_children(
     mut children: Vec<Arc<Mutex<(Child, String)>>>,
     pbar: &ProgressBar,
     term_progress: &TermProgress,
-) -> Result<(Vec<u32>, Vec<u32>)> {
+) -> (Vec<u32>, Vec<u32>) {
     let (mut finished, mut failed) = (Vec::new(), Vec::new());
     while !children.is_empty() {
         let mut tryagain = Vec::new();
@@ -627,7 +636,7 @@ fn wait_for_children(
         for child in children.iter() {
             let ref mut ch = child.lock();
             let id = ch.0.id();
-            if let Some(ref exit_status) = ch.0.try_wait()? {
+            if let Ok(Some(ref exit_status)) = ch.0.try_wait() {
                 if !exit_status.success() {
                     failed.push(id);
                     if poisoned.update_poisoned(2) {
@@ -653,7 +662,7 @@ fn wait_for_children(
             }
         }
     }
-    Ok((finished, failed))
+    (finished, failed)
 }
 
 struct ProcessIOChecker<'a> {
@@ -882,22 +891,22 @@ fn verify_rule_io(
     let outs = process_checker.fetch_outputs(rule_id as _)?;
     let flags = process_checker.fetch_flags(rule_id as _)?;
     let mut processed_io = std::collections::BTreeSet::new();
-    for (fnode, ty) in io_vec.iter() {
-        if !processed_io.insert((fnode.clone(), *ty)) {
+    for (file_node, ty) in io_vec.iter() {
+        if !processed_io.insert((file_node.clone(), *ty)) {
             continue;
         }
         if *ty == EventType::Read as _ || *ty == EventType::Open as _ {
-            if input_matches_declared(&inps, &outs, fnode) {
+            if input_matches_declared(&inps, &outs, file_node) {
                 continue;
             }
-            link_input_to_rule(rule_id, process_checker, fnode)?;
+            link_input_to_rule(rule_id, process_checker, file_node)?;
         } else if *ty == EventType::Write as u8 {
-            if output_matches_declared(&outs, fnode) {
+            if output_matches_declared(&outs, file_node) {
                 continue;
             }
             return Err(eyre!(
                 "File {} being written was not an output to rule {}",
-                fnode,
+                file_node,
                 rule_name
             ));
         }
@@ -950,16 +959,16 @@ fn declared_matches_input(io_vec: &Vec<(String, u8)>, name: &str) -> bool {
     false
 }
 
-fn output_matches_declared(outs: &Vec<Node>, fnode: &String) -> bool {
+fn output_matches_declared(outs: &Vec<Node>, file_node_name: &String) -> bool {
     for out in outs.iter() {
         if out.get_type().eq(&Excluded) {
             let exclude_pattern = out.get_name().to_string();
             let re = Regex::new(&*exclude_pattern).unwrap();
-            if re.is_match(fnode) {
+            if re.is_match(file_node_name) {
                 return true;
             }
         }
-        if out.get_name() == fnode {
+        if out.get_name() == file_node_name {
             return true;
         }
     }
@@ -969,10 +978,10 @@ fn output_matches_declared(outs: &Vec<Node>, fnode: &String) -> bool {
 fn link_input_to_rule(
     rule_id: i32,
     process_checker: &mut ProcessIOChecker,
-    fnode: &str,
+    file_node: &str,
 ) -> Result<()> {
-    if let Ok(dirid) = process_checker.fetch_dirid(fnode) {
-        let p = Path::new(fnode);
+    if let Ok(dirid) = process_checker.fetch_dirid(file_node) {
+        let p = Path::new(file_node);
         if let Some(name) = p.file_name() {
             if let Ok(from_id) =
                 process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
@@ -984,7 +993,7 @@ fn link_input_to_rule(
     Ok(())
 }
 
-fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, fnode: &String) -> bool {
+fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, file_node: &String) -> bool {
     for inp in inps.iter().chain(outs.iter()) {
         if *inp.get_type() == RowType::Dir
             || *inp.get_type() == RowType::Group
@@ -993,7 +1002,7 @@ fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, fnode: &String) ->
         {
             continue;
         }
-        if inp.get_name() == fnode {
+        if inp.get_name() == file_node {
             return true;
         }
     }

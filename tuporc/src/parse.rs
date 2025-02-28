@@ -937,6 +937,8 @@ fn add_link_glob_dir_to_rules(
     Ok(())
 }
 
+// Gather all the modified tupfiles within directories specified
+// Processing Tupfiles within small set of directories with leave db in an incomplete state but is useful for debugging
 pub fn gather_modified_tupfiles(
     conn: &mut TupConnection,
     targets: &Vec<String>,
@@ -1137,7 +1139,6 @@ fn parse_and_add_rules_to_db(
             join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
         }
         Ok(())
-        //   Ok(new_resolved_rules)
     })
     .expect("Thread error while fetching resolved rules from tupfiles")?;
     let ps = parser.get_mut_searcher();
@@ -1255,6 +1256,7 @@ pub(crate) fn insert_path(
     )
 }
 
+/// inserts a node into the database. This is an upsert operation and will not modify the node if it already exists with same values
 fn insert_node_in_dir(
     conn: &TupConnectionRef,
     name: Cow<str>,
@@ -1290,6 +1292,7 @@ pub(crate) fn compute_path_hash(is_dir: bool, pbuf: HashedPath) -> String {
     }
 }
 
+/// Before we insert a child node, insert its parent and record its db id in cross_ref_maps against parent's PathDescriptor
 fn ensure_parent_inserted(
     conn: &TupConnectionRef,
     path_buffers: &impl PathBuffers,
@@ -1322,6 +1325,7 @@ fn ensure_parent_inserted(
     Ok((dir, pardir))
 }
 
+//  Collector records the work done in inserting/verifying correctness of tup nodes into db.
 #[derive(Debug, Clone)]
 struct Collector {
     processed_globs: HashSet<PathDescriptor>,
@@ -1333,6 +1337,7 @@ struct Collector {
     read_write_buffer_objects: ReadWriteBufferObjects,
     processed_envs: HashSet<EnvDescriptor>,
 }
+// Various types of links that are inserted into db
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 enum Link {
@@ -1347,6 +1352,7 @@ enum Link {
     TupfileToRule(TupPathDescriptor, RuleDescriptor),
 }
 
+/// Place holder for all types of links that would go into db in the NormalLink table.
 #[derive(Debug, Clone, Default)]
 struct LinkCollector {
     links: HashSet<Link>,
@@ -1581,7 +1587,7 @@ impl Collector {
     }
 }
 
-// nodes to insert after rules have been resolved
+/// nodes to insert after rules have been resolved
 fn insert_nodes(
     conn: &mut TupConnection,
     read_write_buf: &ReadWriteBufferObjects,
