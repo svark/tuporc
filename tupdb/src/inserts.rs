@@ -193,7 +193,7 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    /// [upsert_node] is akin to the sqlite upsert operation
+    /// `upsert_node` is akin to the sqlite upsert operation
     /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
     /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
     fn upsert_node(

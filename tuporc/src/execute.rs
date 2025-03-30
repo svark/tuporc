@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -19,7 +19,8 @@ use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use tupdb::db::{start_connection, Node, TupConnection, TupConnectionPool};
 use tupetw::{DynDepTracker, EventHeader, EventType};
-use tupparser::buffers::{BufferObjects, PathBuffers, TupPathDescriptor};
+use tupparser::buffers::{BufferObjects, PathBuffers};
+use tupparser::TupPathDescriptor;
 use tupparser::decode::{decode_group_captures};
 use tupparser::statements::{Loc, TupLoc};
 
@@ -108,6 +109,8 @@ pub(crate) struct ExecOptions {
     pub keep_going: bool,
     pub term_progress: TermProgress,
     pub num_jobs: usize,
+    /// Verbose output
+    #[allow(unused)]
     pub verbose: bool,
 }
 impl Default for ExecOptions {
@@ -384,6 +387,29 @@ fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> R
     }
     Ok(dir_ids)
 }
+fn execute_rule(
+    rule_node: &Node,
+    dirpath: &Path,
+    spawned_child_id_sender: &crossbeam::channel::Sender<u32>,
+    children: &mut Vec<Arc<Mutex<(Child, String)>>>,
+) -> Result<()> {
+    let mut cmd = shell(rule_node.get_name());
+    cmd.current_dir(dirpath);
+
+    let ch = cmd.spawn()?;
+    let ch_id = ch.id();
+    if rule_node.get_display_str().is_empty() {
+        println!("id:{} {:?}", ch_id, cmd);
+    } else {
+        println!("{} {}", ch_id, rule_node.get_display_str());
+    }
+    spawned_child_id_sender.send(ch_id)?;
+
+    children.push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned()))));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    Ok(())
+}
 
 fn exec_rules_to_run(
     connection_pool: TupConnectionPool,
@@ -489,7 +515,8 @@ fn exec_rules_to_run(
     }
     let mut min_idx = 0;
 
-    let rule_for_child_id = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
+    let rule_for_child_id : BTreeMap<u32, (i64, String)>  = BTreeMap::new();
+    let rule_for_child_id = Arc::from(RwLock::new(rule_for_child_id));
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process()?;
     let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().expect("Failed to build thread pool to execute rules");
@@ -535,28 +562,10 @@ fn exec_rules_to_run(
                     for pb in pbars {
                         pb.abandon();
                     }
-                    eyre::bail!("Aborted executing rule: \n{}", rule_name)
-                }
-                let mut cmd = shell(rule_node.get_name());
-                cmd.current_dir(dirpaths[j].as_path());
-
-                let ch = cmd.spawn()?;
-                let ch_id = ch.id();
-                if rule_node.get_display_str().is_empty() {
-                    println!("id:{} {:?}", ch_id, cmd);
+                    eyre::bail!("Aborted executing rule: \n{}", rule_name);
                 } else {
-                    println!("{} {}", ch_id, rule_node.get_display_str());
+                    execute_rule(rule_node, &dirpaths[j], &spawned_child_id_sender, &mut children[j % num_threads])?;
                 }
-                spawned_child_id_sender.send(ch_id)?;
-
-                let rule_id = rule_node.get_id();
-                rule_for_child_id
-                    .write()
-                    .insert(ch_id, (rule_id, rule_node.get_name().to_owned()));
-                children[j % num_threads]
-                    .push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned()))));
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
             }
 
             let wg = crossbeam::sync::WaitGroup::new();
@@ -564,7 +573,7 @@ fn exec_rules_to_run(
                 let poisoned = poisoned.clone();
                 let i = i.clone();
                 let children = children[i].clone();
-                // in this thread we wait for children to finish
+                // here we wait for tasks to finish
                 let completed_child_id_sender = completed_child_id_sender.clone();
                 let rule_for_child_id = rule_for_child_id.clone();
                 let wg = wg.clone();
@@ -592,8 +601,6 @@ fn exec_rules_to_run(
             min_idx = max_idx;
 
             if poisoned.should_stop() {
-                drop(completed_child_id_sender);
-                drop(spawned_child_id_sender);
                 for pb in pbars {
                     pb.finish();
                 }
@@ -603,11 +610,7 @@ fn exec_rules_to_run(
         drop(completed_child_id_sender);
         drop(spawned_child_id_sender);
         Ok(())
-    })
-    .unwrap_or_else(|e| {
-        eyre::eyre!("Error while executing rules: {:?}", e);
     });
-
     Ok(())
 }
 

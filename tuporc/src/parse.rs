@@ -18,13 +18,16 @@ use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
-use tupparser::buffers::{
-    EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, OutputHolder, PathBuffers,
-    PathDescriptor, RuleDescriptor, RuleRefDescriptor, TaskDescriptor, TupPathDescriptor,
+
+use tupparser::buffers::{OutputHolder, PathBuffers};
+use tupparser::{
+    EnvDescriptor,
+     RuleDescriptor, RuleRefDescriptor, TaskDescriptor, TupPathDescriptor, GroupPathDescriptor,
+    PathDescriptor, GlobPathDescriptor
 };
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::paths::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
+use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 use RowType::Group;
@@ -882,7 +885,7 @@ fn add_links_from_to_globs(
         if depth > 1 {
             conn.for_each_glob_dir(glob_dir, depth as i32, |dir| -> DbResult<()> {
                 let tup_cwd = PathDescriptor::default();
-                let dir_path = tup_cwd.join(dir).map_err(into_any_error)?;
+                let dir_path = tup_cwd.join(dir).map_err(tupparser::errors::Error::from).map_err(into_any_error)?;
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
             })?;
@@ -1716,8 +1719,8 @@ fn insert_nodes(
         }
 
         for env_var in envs_to_insert.iter() {
-            let env_val = env_var.get().get_val_str();
-            let key = env_var.get().get_key_str();
+            let env_val = env_var.get_val_str();
+            let key = env_var.get_key_str();
             match tx.upsert_env_var(key, env_val) {
                 Ok(ups) => {
                     let env_id = ups.get_id();

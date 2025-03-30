@@ -1,28 +1,38 @@
+extern crate pathdiff;
+extern crate crossbeam;
+extern crate execute;
+
+use std::borrow::Cow;
+use crossbeam::channel::unbounded;
+use crossbeam::thread::scope;
 use std::collections::BTreeSet;
 use std::env;
 use std::env::current_dir;
 use std::fs::File;
 use std::io::LineWriter;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use tupetw::{EventHeader, EventType};
-
+use tuppaths::paths::NormalPath;
 struct ProcHandler {
     validprocs: BTreeSet<u32>,
-    root: PathBuf,
+    roots: Vec<NormalPath>,
     f: LineWriter<File>,
 }
 
-impl ProcHandler {}
-
-impl ProcHandler {}
-
 impl ProcHandler {
-    pub fn new(root: &Path, ch_id: u32) -> Self {
+    pub fn new(roots: Vec<PathBuf>, ch_id: u32) -> Self {
         let f = File::create("trace.log").expect("failed to create trace.log");
+        let roots = roots
+            .into_iter()
+            .map(|path| {
+                let path = NormalPath::new_from_cow_path(Cow::from(path));
+                path
+            })
+            .collect::<Vec<_>>();
         ProcHandler {
             validprocs: BTreeSet::from([ch_id]),
-            root: root.to_path_buf(),
+            roots,
             f: LineWriter::new(f),
         }
     }
@@ -30,8 +40,8 @@ impl ProcHandler {
         self.validprocs.is_empty()
     }
 
-    fn get_root(&self) -> &Path {
-        self.root.as_path()
+    fn paths(&self) -> &[NormalPath] {
+        self.roots.as_slice()
     }
     #[allow(dead_code)]
     fn write_proc_ids(&mut self, process_id: u32, parent_process_id: u32, added: bool) {
@@ -109,40 +119,73 @@ fn insert_trace(proc_handler: &mut ProcHandler, evt_header: &EventHeader) {
             if !proc_handler.is_valid_proc(process_id) {
                 return;
             }
+            let normal_file_path = NormalPath::new_from_cow_str(Cow::from(file_path.as_str()));
             // only add paths relative to root
-            if let Some(rel_path) =
-                pathdiff::diff_paths(Path::new(file_path.as_str()), &proc_handler.get_root())
-            {
-                if !rel_path.starts_with("..") {
-                    if event_type == EventType::Read
-                        || event_type == EventType::Open
-                        || event_type == EventType::Write
-                    {
-                        proc_handler.write_file_event(process_id, file_path, event_type);
+            for path in proc_handler.paths() {
+                if let Some(rel_path) =
+                    pathdiff::diff_paths(normal_file_path.as_path(), path.as_path())
+                {
+                    if !rel_path.starts_with("..") {
+                        if event_type == EventType::Read
+                            || event_type == EventType::Open
+                            || event_type == EventType::Write
+                        {
+                            proc_handler.write_file_event(process_id, file_path, event_type);
+                        }
                     }
+                    break;
                 }
             }
         }
     }
 }
+#[derive(clap::Subcommand)]
+enum Action {
+
+    #[clap(about = "Filter io events to this directory")]
+    Parse {
+        /// Space separated targets to parse
+        target: Vec<String>,
+    },
+
+}
+
 
 fn main() {
     let _ = env_logger::try_init();
     //   std::process::Command::
-    let shell_command = env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let curdir = current_dir().expect("no current directory!");
+    // collect args that begin with --target to push to folder list
+    let mut args = env::args()
+        .filter(|arg| arg.starts_with("--dir"))
+        .map(|arg| {
+            let mut parts = arg.split('=');
+            parts.next();
+            let path = parts.next().unwrap_or("");
+            PathBuf::from(path)
+        })
+        .collect::<Vec<_>>();
+    if args.is_empty() {
+        args.push(curdir);
+    }
+    // process args that are not --target
+    let mut cmd = Vec::new();
+    for arg in env::args().skip(1).skip_while(|arg| arg.starts_with("--dir")) {
+        cmd.push(arg);
+    }
+    let shell_command = cmd.join(" ");
     println!("Executing: {}", shell_command);
-    let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
+    let (trace_sender, trace_receiver) = unbounded();
     let mut tracker = tupetw::DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process().unwrap();
     let mut cmd = execute::shell(shell_command);
     let mut ch = cmd.spawn().expect("failed to spawn");
     let ch_id = ch.id();
-    let curdir = current_dir().expect("no current directory!");
     log::info!("Child process id: {}", ch_id);
-    crossbeam::scope(|s| {
+    let mut proc_handler = ProcHandler::new(args, ch_id);
+    scope(|s| {
         s.spawn(|_| {
             // print the trace
-            let mut proc_handler = ProcHandler::new(curdir.as_path(), ch_id);
             while let Ok(trace) = trace_receiver.recv() {
                 //println!("{:?}", trace);
                 insert_trace(&mut proc_handler, &trace);

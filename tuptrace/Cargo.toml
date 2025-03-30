@@ -1,0 +1,17 @@
+[package]
+name = "tuptrace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tupetw = { path = "../tupetw" }
+tuppaths = { path = "../tuppaths" }
+pathdiff = "0.2.3"
+log = "0.4.27"
+env_logger = "0.11.7"
+execute = "0.2.13"
+crossbeam = "0.8.4"
+clap = { version = "4.5.34", features = ["derive"] }
+
+[build-dependencies]
+embed-manifest = "1.4.0"

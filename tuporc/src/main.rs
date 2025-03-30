@@ -33,7 +33,7 @@ use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_co
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
 use tupparser::locate_file;
-use tupparser::paths::NormalPath;
+use tupparser::buffers::NormalPath;
 static  TUP_DB : &str = ".tup/db";
 static IO_DB : &str = ".tup/io.db";
 mod execute;
@@ -241,7 +241,7 @@ fn main() -> Result<()> {
                 {
                     let pool = start_tup_connection()?;
                     let conn = pool.get().expect("Failed to get connection");
-                    // check if there is DirPathuf table in the database
+                    // check if there is DirPathBuf table in the database
                     if is_initialized(&conn, "DirPathBuf") {
                         conn.for_each_gen_file(|node| {
                             if node.get_type().eq(&RowType::GenF) {

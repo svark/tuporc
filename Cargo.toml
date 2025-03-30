@@ -4,8 +4,9 @@ resolver = "2"
 members = [
     "tuprs",
     "tuporc",
-    "tupetw"
-, "tupdb"]
+    "tupetw",
+    "tupdb",
+    "tuptrace", "tuppaths", "tupcompat"]
 
 
 [profile.release]
