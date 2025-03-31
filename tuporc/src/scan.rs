@@ -509,7 +509,7 @@ fn insert_direntries(
                 drop(nodesender);
             }
             {
-                // Sink for the data being transfered over channels processed in different threads.
+                // Sink for the data being transferred over channels processed in different threads.
                 // Thread below adds nodes to database for the nodes prepared so far.
                 // Nodes are expected to have parent dir ids at this stage.
                 // Once a dir is upserted this also sends database ids of dirs so that children of inserted dirs can also be inserted
@@ -541,7 +541,7 @@ fn insert_direntries(
             dirs_sender.send(DirSender::new(root_hash_path, dirs_sender.clone()))?;
             drop(dirs_sender);
             for i in 0..MAX_THRS_DIRS {
-                // This loop spreads the task for walking over children among threads.
+                // This loop spreads the task of walking over children among MAX_THRS_DIRS threads.
                 // walkdir is only run for immediate children. When  we encounter dirs during a walkdir operation,
                 // they are packaged in `dir_sender` queuing them until
                 // they are popped for running walkdir on them with `dirs_receiver`.
