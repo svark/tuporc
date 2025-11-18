@@ -650,6 +650,23 @@ pub(crate) fn make_node(row: &Row) -> rusqlite::Result<Node> {
         .unwrap_or_else(|_| panic!("Invalid row type {} for node {}", rtype, name));
     Ok(Node::new(id, dirid, mtime, name, rtype))
 }
+pub(crate) fn make_task_node(row: &Row) -> rusqlite::Result<Node> {
+    let id: i64 = row.get(0)?;
+    let dirid: i64 = row.get(1)?;
+    let name: String = row.get(2)?;
+    let display_str: String = row.get(3)?;
+    let flags: String = row.get(4)?;
+    let srcid: i64 = row.get(5)?;
+
+    Ok(Node::new_task(
+        id,
+        dirid,
+        name,
+        display_str,
+        flags,
+        srcid as u32,
+    ))
+}
 
 pub(crate) fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
     let id: i64 = row.get(0)?;

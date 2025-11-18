@@ -162,7 +162,8 @@ pub(crate) fn execute_targets(
             node.get_srcid() as _,
         ))
     };
-    let rule_nodes = tup_connection.fetch_rules_to_run()?;
+    let mut rule_nodes = tup_connection.fetch_rules_to_run()?;
+    rule_nodes.extend(tup_connection.fetch_tasks_to_run()?);
     let rule_nodes = rule_nodes
         .into_iter()
         .map(f)
@@ -171,7 +172,7 @@ pub(crate) fn execute_targets(
         println!("Nothing to do");
         return Ok(());
     }
-    let _ = exec_rules_to_run(
+    let _ = exec_nodes_to_run(
         connection_pool.clone(),
         rule_nodes,
         &node_bimap,
@@ -411,7 +412,7 @@ fn execute_rule(
     Ok(())
 }
 
-fn exec_rules_to_run(
+fn exec_nodes_to_run(
     connection_pool: TupConnectionPool,
     mut rule_nodes: Vec<Node>,
     fwd_refs: &BiMap<i32, incremental_topo::Node>,
@@ -704,6 +705,10 @@ impl<'a> ProcessIOChecker<'a> {
         Ok(s)
     }
 
+    fn fetch_node_by_id(&self, node_id: i64) -> Result<Node> {
+        let node = self.conn.fetch_node_by_id(node_id)?.ok_or_else(|| eyre!("Node with id {} not found", node_id))?;
+        Ok(node)
+    }
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
         let mut nodes = Vec::new();
         self.conn.for_each_rule_input(rule_id as _, |node| {
@@ -741,8 +746,8 @@ impl<'a> ProcessIOChecker<'a> {
         Ok(())
     }
 
-    fn insert_link(&mut self, from_id: i64, rule_id: i64) -> Result<()> {
-        self.conn.insert_link(from_id, rule_id, 0, RowType::Rule)?;
+    fn insert_link(&mut self, from_id: i64, to_id: i64, is_output: bool) -> Result<()> {
+        self.conn.insert_link(from_id, to_id, is_output.into(), RowType::Rule)?;
         Ok(())
     }
 }
@@ -847,10 +852,10 @@ fn listen_to_processes(
                     continue;
                 }
                 deleted_child_procs.remove(&child_id);
-                if let Err(e) = verify_rule_io(
+                let node = process_checker.fetch_node_by_id(*rule_id)?;
+                if let Err(e) = verify_node_io(
                     *child_id,
-                    *rule_id as _,
-                    rule_name.as_str(),
+                    &node,
                     &mut io_conn,
                     &mut process_checker,
                 ) {
@@ -882,17 +887,18 @@ fn listen_to_processes(
     Ok(())
 }
 
-fn verify_rule_io(
+fn verify_node_io(
     ch_id: u32,
-    rule_id: i32,
-    rule_name: &str,
+    node: &Node,
     io_conn: &mut IoConn,
     process_checker: &mut ProcessIOChecker,
 ) -> Result<()> {
     let io_vec = io_conn.fetch_io(ch_id)?;
-    let inps = process_checker.fetch_inputs(rule_id as _)?;
-    let outs = process_checker.fetch_outputs(rule_id as _)?;
-    let flags = process_checker.fetch_flags(rule_id as _)?;
+    let node_id = node.get_id();
+    let node_name = node.get_name();
+    let inps = process_checker.fetch_inputs(node_id as _)?;
+    let outs = process_checker.fetch_outputs(node_id as _)?;
+    let flags = process_checker.fetch_flags(node_id as _)?;
     let mut processed_io = std::collections::BTreeSet::new();
     for (file_node, ty) in io_vec.iter() {
         if !processed_io.insert((file_node.clone(), *ty)) {
@@ -902,7 +908,7 @@ fn verify_rule_io(
             if input_matches_declared(&inps, &outs, file_node) {
                 continue;
             }
-            link_input_to_rule(rule_id, process_checker, file_node)?;
+            link_file_to_node(node_id, process_checker, file_node)?;
         } else if *ty == EventType::Write as u8 {
             if output_matches_declared(&outs, file_node) {
                 continue;
@@ -910,7 +916,7 @@ fn verify_rule_io(
             return Err(eyre!(
                 "File {} being written was not an output to rule {}",
                 file_node,
-                rule_name
+                node_name
             ));
         }
     }
@@ -922,20 +928,22 @@ fn verify_rule_io(
         if flags.contains('*') {
             eprintln!(
                 "Proc:{} file {} was not read by rule {}",
-                ch_id, fname, rule_name
+                ch_id, fname, node_name
             );
         }
     }
-    for out in outs.iter() {
-        let fname = match declared_matches_output(&io_vec, out) {
-            Some(value) => value,
-            None => continue,
-        };
-        eprintln!(
-            "Proc:{} File {} was not written by rule {}",
-            ch_id, fname, rule_name
-        );
-        //return Err(eyre!("File {} was not written by rule {}",fname,rule_name));
+    if node.get_type() == &RowType::Rule {
+        for out in outs.iter() {
+            let fname = match declared_matches_output(&io_vec, out) {
+                Some(value) => value,
+                None => continue,
+            };
+            eprintln!(
+                "Proc:{} File {} was not written by rule {}",
+                ch_id, fname, node_name
+            );
+            //return Err(eyre!("File {} was not written by rule {}",fname,rule_name));
+        }
     }
     Ok(())
 }
@@ -978,8 +986,8 @@ fn output_matches_declared(outs: &Vec<Node>, file_node_name: &String) -> bool {
     false
 }
 
-fn link_input_to_rule(
-    rule_id: i32,
+fn link_file_to_node(
+    rule_id: i64,
     process_checker: &mut ProcessIOChecker,
     file_node: &str,
 ) -> Result<()> {
@@ -989,7 +997,25 @@ fn link_input_to_rule(
             if let Ok(from_id) =
                 process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
             {
-                process_checker.insert_link(from_id, rule_id as _)?;
+                process_checker.insert_link(from_id, rule_id, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn link_output_to_task(
+    task_id: i64,
+    process_checker: &mut ProcessIOChecker,
+    file_node: &str,
+) -> Result<()> {
+    if let Ok(dirid) = process_checker.fetch_dirid(file_node) {
+        let p = Path::new(file_node);
+        if let Some(name) = p.file_name() {
+            if let Ok(from_id) =
+                process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
+            {
+                process_checker.insert_link(task_id, from_id, true)?;
             }
         }
     }

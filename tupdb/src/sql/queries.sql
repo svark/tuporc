@@ -322,6 +322,16 @@ where ML.type = 1;
 -- 1 is the  node type for a rule
 -- <eos>
 
+-- name: for_each_task_to_run_no_targets_inner&
+-- Fetch the tasks to run with no targets
+SELECT n.id, n.dir, n.name, n.display_str, n.flags, n.srcid
+from Node n
+         JOIN ModifyList ML on n.id = ML.id
+where ML.type = 10;
+-- 10 is the  node type for a task
+-- <eos>
+
+
 -- name: for_each_link_inner&
 -- Fetch the links
 SELECT from_id, to_id
