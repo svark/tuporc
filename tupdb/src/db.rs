@@ -424,7 +424,7 @@ impl<'a> TupTransaction<'a> {
         Ok(())
     }
 
-    pub fn connection(&self) -> TupConnectionRef {
+    pub fn connection(&self) -> TupConnectionRef<'_> {
         TupConnectionRef(self.0.deref())
     }
 }
@@ -450,7 +450,7 @@ impl TupConnection {
         ))
     }
 
-    pub fn as_ref(&self) -> TupConnectionRef {
+    pub fn as_ref(&self) -> TupConnectionRef<'_> {
         TupConnectionRef(&self.0)
     }
 }
