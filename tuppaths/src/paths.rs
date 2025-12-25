@@ -52,7 +52,7 @@ impl Display for NormalPath {
     }
 }
 /// return parent of path as a cow path
-pub fn get_parent(cur_file: &Path) -> Cow<Path> {
+pub fn get_parent(cur_file: &Path) -> Cow<'_, Path> {
     if cur_file.eq(OsStr::new("/"))
         || cur_file.eq(OsStr::new("."))
         || cur_file.as_os_str().is_empty()
