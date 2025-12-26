@@ -39,5 +39,5 @@ lto = true
 inherits = "release"
 debug = true
 
-[build-dependencies]
-embed-manifest = "1.4.0"
+#[build-dependencies]
+# (none)

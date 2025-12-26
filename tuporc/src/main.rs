@@ -169,6 +169,9 @@ struct Args {
     /// Verbose output of the build steps
     #[clap(long)]
     verbose: bool,
+    /// Internal flag used when relaunching elevated on Windows
+    #[clap(long, hide = true, action)]
+    elevated: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -307,6 +310,54 @@ fn main() -> Result<()> {
                 keep_going,
                 num_jobs,
             } => {
+                #[cfg(windows)]
+                {
+                    // Relaunch elevated only for update when not already elevated
+                    if !args.elevated {
+                        use std::process::Command;
+                        let exe = std::env::current_exe()?;
+                        let cwd = std::env::current_dir()?;
+                        // Recreate original args from std::env to preserve unparsed flags
+                        let mut arg_list: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                        // Mark as elevated to avoid loops
+                        arg_list.push(std::ffi::OsString::from("--elevated"));
+
+                        // Build a PowerShell command that elevates this process
+                        // We rely on PowerShell's Start-Process -Verb RunAs
+                        // Note: We join arguments with spaces; this is a best-effort approach.
+                        let mut args_joined = String::new();
+                        for (i, s) in arg_list.iter().enumerate() {
+                            let s = s.to_string_lossy();
+                            // Basic quoting: wrap each arg in double quotes and escape inner quotes
+                            let quoted = format!("\"{}\"", s.replace('"', "`\""));
+                            if i > 0 { args_joined.push(' '); }
+                            args_joined.push_str(&quoted);
+                        }
+
+                        let ps_script = format!(
+                            "Start-Process -FilePath \"{}\" -ArgumentList {} -Verb RunAs -WorkingDirectory \"{}\"",
+                            exe.display(),
+                            args_joined,
+                            cwd.display()
+                        );
+
+                        let status = Command::new("powershell")
+                            .arg("-NoProfile")
+                            .arg("-Command")
+                            .arg(ps_script)
+                            .status();
+
+                        match status {
+                            Ok(st) if st.success() => {
+                                // Successfully spawned elevated child; parent can exit.
+                                return Ok(());
+                            }
+                            Ok(_) | Err(_) => {
+                                // If elevation failed, continue without elevation, which may fail later.
+                            }
+                        }
+                    }
+                }
                 let root = change_root_update_targets(&mut target)?;
                 println!("Updating db {}", target.join(" "));
                 let term_progress = TermProgress::new("Building ");
