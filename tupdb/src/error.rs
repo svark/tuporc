@@ -1,7 +1,7 @@
+use rusqlite::ErrorCode::DatabaseBusy;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
-use rusqlite::ErrorCode::DatabaseBusy;
 
 pub type SqlResult<T> = std::result::Result<T, rusqlite::Error>;
 
@@ -25,7 +25,9 @@ pub enum AnyError {
 impl AnyError {
     pub fn is_busy(&self) -> bool {
         match self {
-            AnyError::Db(e) =>  e.sqlite_error_code().map_or(false, |err| err == DatabaseBusy),
+            AnyError::Db(e) => e
+                .sqlite_error_code()
+                .map_or(false, |err| err == DatabaseBusy),
             _ => false,
         }
     }

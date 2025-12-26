@@ -12,7 +12,7 @@ use std::fs::File;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, MAIN_SEPARATOR};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 //returns change status of a db command
 pub enum UpsertStatus {
@@ -405,7 +405,6 @@ impl TupConnectionPool {
     pub fn get(&self) -> Result<TupConnection, r2d2::Error> {
         Ok(TupConnection::new(self.pool.get()?))
     }
-
 }
 pub struct TupConnectionRef<'a>(&'a Connection);
 
@@ -508,9 +507,10 @@ pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
     Ok(pool)
 }
 
-
 pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
-    let start_time = Instant::now();
+    #[cfg(debug_assertions)]
+    let start_time = std::time::Instant::now();
+    
     let dirpathbuf_create_sql = include_str!("sql/dirpathbuf_temptable.sql");
     let dirpathbuf_indices_sql = include_str!("sql/dirpathbuf_indices.sql");
 
@@ -530,14 +530,14 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
     });
 
     let tx = conn.transaction()?;
-    
+
     {
         // Execute the initial setup SQL
         tx.execute_batch(dirpathbuf_create_sql)?;
         // Process directories using a stack (Depth-First Search)
         while let Some(dir_path) = stack.pop() {
             // Insert the current directory path
-            tx.insert_into_dirpathuf( dir_path.id, dir_path.dir, dir_path.name.as_str() )?;
+            tx.insert_into_dirpathuf(dir_path.id, dir_path.dir, dir_path.name.as_str())?;
 
             // Query child directories
             tx.for_each_subdirectory(dir_path.id, |id, name| {
@@ -557,16 +557,14 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
     tx.commit()?;
 
     // Log the elapsed time
-    let elapsed_time = start_time.elapsed();
     #[cfg(debug_assertions)]
     eprintln!(
         "DirPathBuf table created in {:.4} seconds.",
-        elapsed_time.as_secs_f64(),
+        start_time.elapsed().as_secs_f64(),
     );
 
     Ok(())
 }
-
 
 pub fn create_presentlist_temptable(conn: &TupConnection) -> DbResult<()> {
     let s = include_str!("sql/presentlisttemptable.sql");
@@ -685,5 +683,3 @@ pub(crate) fn make_rule_node(row: &Row) -> rusqlite::Result<Node> {
         srcid as u32,
     ))
 }
-
-

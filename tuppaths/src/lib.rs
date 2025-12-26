@@ -1,12 +1,12 @@
 //! Crate for interning and manipulating paths in a tupfile
 #![warn(missing_docs)]
-extern crate tinyset;
 extern crate bstr;
-pub mod glob;
-pub mod paths;
-pub mod intern;
-pub mod errors;
+extern crate tinyset;
 pub mod descs;
+pub mod errors;
+pub mod glob;
+pub mod intern;
+pub mod paths;
 
 /// add two numbers
 pub fn add(left: u64, right: u64) -> u64 {

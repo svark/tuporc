@@ -74,7 +74,6 @@ pub fn get_parent_with_fsep<P: AsRef<Path>>(cur_file: P) -> NormalPath {
     NormalPath::new_from_cow_path(cur_file.as_ref().parent().unwrap().into())
 }
 
-
 impl NormalPath {
     /// Construct consuming the given pathbuf
     pub fn new(p: PathBuf) -> NormalPath {

@@ -1,17 +1,17 @@
-extern crate pathdiff;
 extern crate crossbeam;
 extern crate execute;
+extern crate pathdiff;
 
-use std::borrow::Cow;
 use crossbeam::channel::unbounded;
 use crossbeam::thread::scope;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::env;
 use std::env::current_dir;
 use std::fs::File;
 use std::io::LineWriter;
 use std::io::Write;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use tupetw::{EventHeader, EventType};
 use tuppaths::paths::NormalPath;
 struct ProcHandler {
@@ -141,15 +141,12 @@ fn insert_trace(proc_handler: &mut ProcHandler, evt_header: &EventHeader) {
 }
 #[derive(clap::Subcommand)]
 enum Action {
-
     #[clap(about = "Filter io events to this directory")]
     Parse {
         /// Space separated targets to parse
         target: Vec<String>,
     },
-
 }
-
 
 fn main() {
     let _ = env_logger::try_init();
@@ -170,7 +167,10 @@ fn main() {
     }
     // process args that are not --target
     let mut cmd = Vec::new();
-    for arg in env::args().skip(1).skip_while(|arg| arg.starts_with("--dir")) {
+    for arg in env::args()
+        .skip(1)
+        .skip_while(|arg| arg.starts_with("--dir"))
+    {
         cmd.push(arg);
     }
     let shell_command = cmd.join(" ");

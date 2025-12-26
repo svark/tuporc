@@ -17,9 +17,7 @@ use tupdb::db::{start_connection, RowType, TupConnection};
 use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
 use indicatif::ProgressBar;
-use notify::{
-    event, Config, Event, EventKind, RecursiveMode, Watcher,
-};
+use notify::{event, Config, Event, EventKind, RecursiveMode, Watcher};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::{BufferObjects, PathBuffers};
@@ -179,7 +177,7 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
         let mut watcher = notify::RecommendedWatcher::new(watch_handler, config)
             .expect("Failed to create watcher");
         watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
-        let custom_spawn_handler = |thread_builder: rayon::ThreadBuilder | {
+        let custom_spawn_handler = |thread_builder: rayon::ThreadBuilder| {
             // Spawn a thread with a custom name and execute the logic
             let builder = s.builder();
             let builder = if let Some(name) = thread_builder.name() {
@@ -193,16 +191,16 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
                 builder
             };
 
-            builder.spawn(|_| {
-               thread_builder.run() // Execute the thread's main logic
-            })
+            builder
+                .spawn(|_| {
+                    thread_builder.run() // Execute the thread's main logic
+                })
                 .map(|_| ())
         };
 
-        let thread_builder = rayon::ThreadPoolBuilder::new().spawn_handler( custom_spawn_handler)
-       .thread_name(|i| {
-                format!("tup-monitor-thread-{}", i)
-            });
+        let thread_builder = rayon::ThreadPoolBuilder::new()
+            .spawn_handler(custom_spawn_handler)
+            .thread_name(|i| format!("tup-monitor-thread-{}", i));
         let thread_pool = thread_builder.build().unwrap();
         let pb_main = term_progress.get_main();
         {
@@ -212,9 +210,10 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
             let stop_receiver = stop_receiver.clone();
             let pb_main = pb_main.clone();
             let root = root.clone();
-            thread_pool.spawn( move || {
+            thread_pool.spawn(move || {
                 let mut conn = connection_pool.get().expect("failed to get connection");
-                let generation_id = fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
+                let generation_id =
+                    fetch_latest_id(&conn, "MONITORED_FILES", "generation_id").unwrap_or(1);
                 run_monitor(
                     path_receiver,
                     root,
@@ -222,25 +221,24 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
                     term_progress,
                     stop_receiver,
                     generation_id,
-                //    end_watch,
+                    //    end_watch,
                     pb_main,
-                ).expect("failed to run monitor");
+                )
+                .expect("failed to run monitor");
             })
         }
         let stop_receiver = stop_receiver.clone();
         let term_progress = term_progress.clone();
-        thread_pool.spawn( move || {
-           loop {
-               sleep(Duration::from_secs(1));
-               if let Ok(()) = stop_receiver.try_recv() {
-                   term_progress.abandon(&pb_main, "Ctrl-c received");
-                   watcher.unwatch(root.as_path()).unwrap();
-               }
-           }
+        thread_pool.spawn(move || loop {
+            sleep(Duration::from_secs(1));
+            if let Ok(()) = stop_receiver.try_recv() {
+                term_progress.abandon(&pb_main, "Ctrl-c received");
+                watcher.unwatch(root.as_path()).unwrap();
+            }
         });
         Ok(())
     })
-        .expect("failed to spawn thread")?;
+    .expect("failed to spawn thread")?;
     Ok(())
 }
 
@@ -251,7 +249,7 @@ fn run_monitor(
     term_progress: TermProgress,
     stop_receiver: Receiver<()>,
     mut generation_id: i64,
-   // mut watcher: ReadDirectoryChangesWatcher,
+    // mut watcher: ReadDirectoryChangesWatcher,
     pb_main: ProgressBar,
 ) -> Result<()> {
     let current_id: i64 = 0;
@@ -350,7 +348,8 @@ fn is_ignorable<P: AsRef<Path>>(path: P, ign: &Gitignore, is_dir: bool) -> bool 
 
 fn stop_monitor() -> Result<()> {
     let conn = start_connection(IO_DB)?;
-    conn.get()?.execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
+    conn.get()?
+        .execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())
 }
 

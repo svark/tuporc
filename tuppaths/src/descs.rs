@@ -1,4 +1,8 @@
 //! Module for path descriptors of various types
+use crate::errors::Error;
+use crate::intern::Intern;
+use crate::paths::NormalPath;
+use log::debug;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -9,11 +13,7 @@ use std::marker::PhantomData;
 use std::ops::{AddAssign, Deref};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use log::debug;
 use tinyset::Fits64;
-use crate::errors::Error;
-use crate::intern::Intern;
-use crate::paths::NormalPath;
 
 /// ```PathDescriptor``` is an id given to a  folder where tupfile was found
 pub type PathSym = u64;
@@ -499,4 +499,3 @@ pub type BinDescriptor = Descriptor<BinPathEntry>;
 
 /// ```TupPathDescriptor``` is a unique id given to a tupfile
 pub type TupPathDescriptor = PathDescriptor;
-

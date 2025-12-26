@@ -2,6 +2,8 @@
 //! Adapted from interment crate
 #![deny(missing_docs)]
 
+use hashbrown::HashMap;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::any::TypeId;
 use std::borrow::Borrow;
@@ -10,8 +12,6 @@ use std::fmt::{Debug, Display, Pointer};
 use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use hashbrown::HashMap;
-use parking_lot::Mutex;
 use tinyset::Fits64;
 
 /// A `TypeHolder` is a container for any sendable type.
@@ -244,18 +244,14 @@ impl<T: Eq + Hash + Send + Sync + 'static> Intern<T> {
         INTERN_CONTAINERS.with(|m: &mut HashSet<&'static T>| -> usize { m.len() })
     }
     /// Iterate over all interned objects and apply a function to each one.
-    pub fn iter_interned<F,E>(mut f: F) -> Result<(), E>
+    pub fn iter_interned<F, E>(mut f: F) -> Result<(), E>
     where
         F: FnMut(Intern<T>) -> Result<(), E>,
     {
-        INTERN_CONTAINERS.with(
-            |m: &mut HashSet<&'static T>| -> Result<(),E> {
-                m.0.keys()
-                    .try_for_each(move |&k| -> Result<(), E> {
-                        f(Intern { pointer: k })
-                    })
-            },
-        )
+        INTERN_CONTAINERS.with(|m: &mut HashSet<&'static T>| -> Result<(), E> {
+            m.0.keys()
+                .try_for_each(move |&k| -> Result<(), E> { f(Intern { pointer: k }) })
+        })
     }
     /// Check if a value has been interned.
     pub fn is_interned(t: &T) -> bool {
@@ -301,10 +297,8 @@ const fn sz<T>() -> u64 {
 /// fewer than 8 bytes.
 impl<T> Fits64 for Intern<T> {
     unsafe fn from_u64(x: u64) -> Self {
-        let t = unsafe{ &*(((x ^ heap_location() / sz::<T>()) * sz::<T>()) as *const T)};
-        Intern {
-            pointer: t,
-        }
+        let t = unsafe { &*(((x ^ heap_location() / sz::<T>()) * sz::<T>()) as *const T) };
+        Intern { pointer: t }
     }
     fn to_u64(self) -> u64 {
         self.get_pointer() as u64 / sz::<T>() ^ heap_location() / sz::<T>()

@@ -1,6 +1,6 @@
 //! This module contains functions to parse Tupfiles and add rules to the database
 use crate::scan::{HashedPath, MAX_THRS_DIRS};
-use crate::{TermProgress};
+use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
@@ -8,27 +8,29 @@ use log::debug;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::ops::{Deref};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
-use tupdb::db::{create_dirpathbuf_temptable, create_presentlist_temptable,create_tuppathbuf_temptable, db_path_str, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction};
+use tupdb::db::{
+    create_dirpathbuf_temptable, create_presentlist_temptable, create_tuppathbuf_temptable,
+    db_path_str, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction,
+};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 
+use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::buffers::{OutputHolder, PathBuffers};
-use tupparser::{
-    EnvDescriptor,
-     RuleDescriptor, RuleRefDescriptor, TaskDescriptor, TupPathDescriptor, GroupPathDescriptor,
-    PathDescriptor, GlobPathDescriptor
-};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
+use tupparser::{
+    EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, PathDescriptor, RuleDescriptor,
+    RuleRefDescriptor, TaskDescriptor, TupPathDescriptor,
+};
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 use RowType::Group;
 
@@ -55,13 +57,13 @@ pub enum SrcId {
 }
 #[derive(Debug, Clone)]
 pub(crate) enum NodeToInsert {
-    Rule(RuleDescriptor),
+    Rule(RuleDescriptor, TupPathDescriptor),
     #[allow(dead_code)]
     Tup(TupPathDescriptor),
     Group(GroupPathDescriptor),
     GeneratedFile(PathDescriptor, SrcId),
     Env(EnvDescriptor),
-    Task(TaskDescriptor),
+    Task(TaskDescriptor, TupPathDescriptor),
     #[allow(dead_code)]
     InputFile(PathDescriptor),
     Glob(GlobPathDescriptor, TupPathDescriptor),
@@ -106,7 +108,7 @@ impl NodeToInsert {
     /// get the name of the node to insert in the database
     pub fn get_name(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_rule_str(),
+            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_rule_str(),
             NodeToInsert::Tup(t) => read_write_buffer_objects
                 .get_tup_path(t)
                 .file_name()
@@ -117,7 +119,7 @@ impl NodeToInsert {
                 .file_name()
                 .to_string(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_name(e),
-            NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).to_string(),
+            NodeToInsert::Task(t, _) => read_write_buffer_objects.get_task(t).to_string(),
             NodeToInsert::InputFile(p) => read_write_buffer_objects
                 .get_path(p)
                 .file_name()
@@ -139,12 +141,12 @@ impl NodeToInsert {
 
     pub fn get_id(&self) -> i64 {
         match self {
-            NodeToInsert::Rule(r) => r.to_u64() as i64,
+            NodeToInsert::Rule(r, _) => r.to_u64() as i64,
             NodeToInsert::Tup(t) => t.to_u64() as i64,
             NodeToInsert::Group(g) => g.to_u64() as i64,
             NodeToInsert::GeneratedFile(p, _) => p.to_u64() as i64,
             NodeToInsert::Env(e) => e.to_u64() as i64,
-            NodeToInsert::Task(t) => t.to_u64() as i64,
+            NodeToInsert::Task(t, _) => t.to_u64() as i64,
             NodeToInsert::InputFile(p) => p.to_u64() as i64,
             NodeToInsert::Glob(g, _) => g.to_u64() as i64,
             NodeToInsert::ExcludedFile(p) => p.to_u64() as i64,
@@ -155,12 +157,12 @@ impl NodeToInsert {
 
     pub fn get_row_type(&self) -> RowType {
         match self {
-            NodeToInsert::Rule(_) => Rule,
+            NodeToInsert::Rule(_, _) => Rule,
             NodeToInsert::Tup(_) => TupF,
             NodeToInsert::Group(_) => Group,
             NodeToInsert::GeneratedFile(_, _) => GenF,
             NodeToInsert::Env(_) => Env,
-            NodeToInsert::Task(_) => Task,
+            NodeToInsert::Task(_, _) => Task,
             NodeToInsert::InputFile(_) => File,
             NodeToInsert::Glob(_, _) => Glob,
             NodeToInsert::ExcludedFile(_) => Excluded,
@@ -171,6 +173,21 @@ impl NodeToInsert {
 
     pub fn get_srcid(&self, cross_ref_maps: &CrossRefMaps) -> Result<i64> {
         match self {
+            NodeToInsert::Rule(r, tupid) => cross_ref_maps
+                .get_tup_db_id(tupid)
+                .map(|x| x.0)
+                .ok_or_eyre(eyre!(
+                    "srcid not found for rule: {:?}",
+                    r,
+                )),
+            NodeToInsert::Task(t, tupid) => cross_ref_maps
+                .get_tup_db_id(tupid)
+                .map(|x| x.0)
+                .ok_or_eyre(eyre!(
+                    "srcid not found for task: {:?} with tup descriptor:{:?}",
+                    t,
+                    tupid
+                )),
             NodeToInsert::GeneratedFile(gen, SrcId::RuleId(id)) => cross_ref_maps
                 .get_rule_db_id(id)
                 .map(|x| x.0)
@@ -194,7 +211,7 @@ impl NodeToInsert {
     }
     pub fn get_display_str(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_display_str(),
+            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_display_str(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_value(e),
             NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_recursive_glob_str(g),
             _ => "".to_string(),
@@ -202,7 +219,7 @@ impl NodeToInsert {
     }
     fn get_flags(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r) => read_write_buffer_objects
+            NodeToInsert::Rule(r, _) => read_write_buffer_objects
                 .get_rule(r)
                 .get_flags()
                 .to_string(),
@@ -214,12 +231,12 @@ impl NodeToInsert {
         read_write_buffer_objects: &ReadWriteBufferObjects,
     ) -> PathDescriptor {
         match self {
-            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_parent_id(),
+            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_parent_id(),
             NodeToInsert::Tup(t) => read_write_buffer_objects.get_tup_parent_id(t),
             NodeToInsert::Group(g) => read_write_buffer_objects.get_group_parent_id(g),
             NodeToInsert::GeneratedFile(p, _) => read_write_buffer_objects.get_parent_id(p),
             NodeToInsert::Env(_) => PathDescriptor::default(),
-            NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).get_parent_id(),
+            NodeToInsert::Task(t, _) => read_write_buffer_objects.get_task(t).get_parent_id(),
             NodeToInsert::InputFile(p) => read_write_buffer_objects.get_parent_id(p),
             NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_glob_prefix(g),
             NodeToInsert::ExcludedFile(e) => read_write_buffer_objects.get_parent_id(e),
@@ -327,7 +344,7 @@ impl NodeToInsert {
 
     pub fn update_crossref(&self, crossref: &mut CrossRefMaps, id: i64, parid: i64) {
         match self {
-            NodeToInsert::Rule(r) => {
+            NodeToInsert::Rule(r, _) => {
                 crossref.add_rule_xref(r.clone(), id, parid);
             }
             NodeToInsert::Tup(td) => {
@@ -342,7 +359,7 @@ impl NodeToInsert {
             NodeToInsert::Env(e) => {
                 crossref.add_env_xref(e.clone(), id);
             }
-            NodeToInsert::Task(t) => {
+            NodeToInsert::Task(t, _) => {
                 crossref.add_task_xref(t.clone(), id, parid);
             }
             NodeToInsert::InputFile(p) => {
@@ -572,7 +589,10 @@ impl PathDiscovery for DbPathSearcher {
         mut cb: impl FnMut(MatchingPath),
         sel: SelOptions,
     ) -> Result<usize, Error> {
-        let conn = self.conn.get().map_err(|e| Error::new_callback_error(e.to_string()))?;
+        let conn = self
+            .conn
+            .get()
+            .map_err(|e| Error::new_callback_error(e.to_string()))?;
         let tup_connection_ref = conn.as_ref();
         let mut match_count =
             Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_paths, &mut cb, sel)
@@ -711,7 +731,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 ) -> Result<()> {
     if tupfiles.is_empty() {
         log::warn!("No Tupfiles to parse");
-        return Ok(())
+        return Ok(());
     }
     {
         let conn = connection.get()?;
@@ -725,7 +745,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         //conn.enrich_modified_list()?;
-        
+
         {
             let tp = term_progress.clone();
             tp.set_main_with_len("Enriching modified list", 7);
@@ -768,7 +788,44 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
         Link::RuleToOutput(rd, out) => {
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
             let output_id = crossref.get_path_db_id_ok(&out)?;
-            tx.insert_link(output_id.0, rule_id.0, true.into(), Rule)?;
+            // Enforce unique producer per output (Rule or Task): check if an existing producer exists
+            {
+                let mut stmt = tx
+                    .prepare("SELECT from_id FROM NormalLink WHERE to_id = ?1 AND to_type IN (4, 7) LIMIT 1")
+                    .map_err(|e| eyre!("DB prepare failed while checking producer uniqueness: {}", e))?;
+                let mut rows = stmt.query([output_id.0]).map_err(|e| {
+                    eyre!("DB query failed while checking producer uniqueness: {}", e)
+                })?;
+                if let Some(row) = rows
+                    .next()
+                    .map_err(|e| eyre!("DB row fetch failed: {}", e))?
+                {
+                    let existing_from_id: i64 = row
+                        .get(0)
+                        .map_err(|e| eyre!("DB column get failed: {}", e))?;
+                    if existing_from_id != rule_id.0 {
+                        return Err(eyre!(
+                            "Output (id={}) already has a producer (id={}), cannot also be produced by Rule (id={})",
+                            output_id.0,
+                            existing_from_id,
+                            rule_id.0
+                        ));
+                    }
+                }
+            }
+            // Determine actual output node type (GenF or DirGen) for link's to_type
+            let out_node = tx
+                .connection()
+                .fetch_node_by_id(output_id.0)
+                .map_err(|e| eyre!("DB fetch failed while getting output node type: {}", e))?
+                .ok_or_else(|| {
+                    eyre!(
+                        "Output node id {} not found while linking rule",
+                        output_id.0
+                    )
+                })?;
+            let out_ty = *out_node.get_type();
+            tx.insert_link(rule_id.0, output_id.0, true.into(), out_ty)?;
         }
         Link::OutputToGroup(out, group) => {
             let output_id = crossref.get_path_db_id_ok(&out)?;
@@ -885,7 +942,10 @@ fn add_links_from_to_globs(
         if depth > 1 {
             conn.for_each_glob_dir(glob_dir, depth as i32, |dir| -> DbResult<()> {
                 let tup_cwd = PathDescriptor::default();
-                let dir_path = tup_cwd.join(dir).map_err(tupparser::errors::Error::from).map_err(into_any_error)?;
+                let dir_path = tup_cwd
+                    .join(dir)
+                    .map_err(Error::from)
+                    .map_err(into_any_error)?;
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
             })?;
@@ -949,16 +1009,18 @@ pub fn gather_modified_tupfiles(
     inspect_dir_path_buf: bool,
 ) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
-    
+
     let term_progress = term_progress.set_main_with_ticker("Gathering modified Tupfiles");
     term_progress.pb_main.set_message("Creating temp tables");
     term_progress.tick(&term_progress.pb_main);
-    create_dirpathbuf_temptable(conn).with_context(|| "Failed to create and fill dirpathbuf table")?;
-    
-    create_tuppathbuf_temptable(conn).with_context(|| "Failed to create and fill tuppathbuf table")?;
+    create_dirpathbuf_temptable(conn)
+        .with_context(|| "Failed to create and fill dirpathbuf table")?;
+
+    create_tuppathbuf_temptable(conn)
+        .with_context(|| "Failed to create and fill tuppathbuf table")?;
     term_progress.tick(&term_progress.pb_main);
-    
-    create_presentlist_temptable(conn)?; 
+
+    create_presentlist_temptable(conn)?;
     term_progress.tick(&term_progress.pb_main);
 
     let mut target_dirs_and_names = Vec::new();
@@ -975,7 +1037,9 @@ pub fn gather_modified_tupfiles(
     if inspect_dir_path_buf {
         return Ok(tupfiles);
     }
-    term_progress.pb_main.set_message("Looking up modified Tupfiles");
+    term_progress
+        .pb_main
+        .set_message("Looking up modified Tupfiles");
     conn.for_each_modified_tupfile(|n: Node| {
         // name stores full path here
         debug!("tupfile to parse:{}", n.get_name());
@@ -1149,29 +1213,36 @@ fn parse_and_add_rules_to_db(
     Ok(())
 }
 
-/// checks that in  parsed tup files, no two rules produce the same output
+/// checks that in  parsed tup files, no two  rules/tasks produce the same output
 fn check_uniqueness_of_parent_rule(
     conn: &mut TupConnection,
     read_buf: &ReadWriteBufferObjects,
     outs: &impl OutputHandler,
-    _crossref: &mut CrossRefMaps,
+    crossref: &mut CrossRefMaps,
 ) -> Result<()> {
     for o in outs.get_output_files().iter() {
         let np = read_buf.get_path(o);
         if let Ok(node) = find_by_path(np.as_path(), &conn.as_ref()) {
-            let rule_id = node.get_srcid();
-
+            // Identify the current rule (producer) from parser context
             let current_parent_rule_ref = outs
                 .get_parent_rule(o)
                 .unwrap_or_else(|| panic!("Parent rule not found for {}", o));
-            if !conn.check_is_in_update_universe(rule_id)? {
-                let old_rule_name = conn.fetch_node_name(rule_id)?;
-                return Err(eyre!(format!(
-                    "File was previously marked as generated from a rule:{} \
-                    but is now being generated in {}",
-                    old_rule_name,
-                    current_parent_rule_ref.to_string()
-                )));
+            let (current_rule_db_id, _) = crossref.get_rule_db_id_ok(&current_parent_rule_ref)?;
+
+            // Fallback using srcid as generic producer: if a previous producer exists via srcid,
+            // handle both Rule and Task cases. For Rule, preserve the update-universe diagnostic.
+            let prev_producer_id = node.get_srcid();
+            if prev_producer_id > 0 && prev_producer_id != current_rule_db_id {
+                if !conn.check_is_in_update_universe(prev_producer_id)? {
+                    let old_rule_name = conn.fetch_node_name(prev_producer_id)?;
+                    return Err(eyre!(format!(
+                                    "File was previously marked as generated from a producer:{} \
+                                    but is now being generated in {}",
+                                    old_rule_name,
+                                    current_parent_rule_ref.to_string()
+                                )));
+                }
+
             }
         }
     }
@@ -1200,12 +1271,11 @@ fn find_node_id_by_path(conn: &TupConnectionRef, path: &Path) -> Result<i64, Any
         .map(|(id, _)| id)
 }
 
-
- /// removes the path from the database
+/// removes the path from the database
 pub(crate) fn remove_path<P: AsRef<Path>>(conn: &TupConnection, path: P) -> Result<()> {
     let connection_ref = conn.as_ref();
     if let Ok(node) = find_by_path(path.as_ref(), &connection_ref) {
-    //  add it to the deletelist table
+        //  add it to the deletelist table
         conn.mark_deleted(node.get_id(), node.get_type())?;
     }
     Ok(())
@@ -1279,7 +1349,7 @@ fn insert_node_in_dir(
     {
         let in_node = node_at_path.get_prepared_node();
         let pbuf = node_at_path.get_hashed_path().clone();
-        let node = conn.fetch_upsert_node(in_node,  || compute_path_hash(is_dir, pbuf.clone()))?;
+        let node = conn.fetch_upsert_node(in_node, || compute_path_hash(is_dir, pbuf.clone()))?;
         Ok((node.get_id(), dir))
     } else {
         log::warn!("Error while inserting path: {:?}", path);
@@ -1481,11 +1551,11 @@ impl Collector {
         Ok(())
     }
 
-    fn collect_rule(&mut self, p: &RuleDescriptor) {
-        self.nodes_to_insert.push(NodeToInsert::Rule(p.clone()));
+    fn collect_rule(&mut self, p: &RuleDescriptor, tupid: &TupPathDescriptor) {
+        self.nodes_to_insert.push(NodeToInsert::Rule(p.clone(), tupid.clone()));
     }
-    fn collect_task(&mut self, p: &TaskDescriptor) {
-        self.nodes_to_insert.push(NodeToInsert::Task(p.clone()));
+    fn collect_task(&mut self, p: &TaskDescriptor, tupid: &TupPathDescriptor) {
+        self.nodes_to_insert.push(NodeToInsert::Task(p.clone(), tupid.clone()));
     }
     fn add_env(&mut self, p: &EnvDescriptor) {
         if self.processed_envs.insert(p.clone()) {
@@ -1523,6 +1593,7 @@ impl Collector {
         let name = task_instance.get_target();
         let tuppath = task_instance.get_parent();
         let tuppathstr = tuppath.as_path();
+        let tupid = task_instance.get_tupfile_desc();
         let line = task_instance.get_task_loc();
         debug!(
             " task to insert: {} at  {} at {}",
@@ -1534,7 +1605,7 @@ impl Collector {
             .unique_rule_check
             .insert(task_instance.get_path().to_string(), line.clone());
         if prevline.is_none() {
-            self.collect_task(task_desc);
+            self.collect_task(task_desc, &tupid);
         } else {
             bail!(
                 "Task at  {}:{} was previously defined at line {}. \
@@ -1552,6 +1623,7 @@ impl Collector {
         let ref ph = self.read_write_buffer_objects;
         let tup_cwd_desc = &rule_formula.get_rule_ref().get_tup_dir();
         let tuppath = ph.get_path(&tup_cwd_desc);
+        let tupid = rule_formula.get_rule_ref().get_tupfile_desc();
         {
             let rule_ref = rule_formula.get_rule_ref();
             if log::log_enabled!(log::Level::Debug) {
@@ -1567,7 +1639,7 @@ impl Collector {
                 .unique_rule_check
                 .insert(dir.to_string() + "/" + name.as_str(), rule_ref.clone());
             if prevline.is_none() {
-                self.collect_rule(rule_desc);
+                self.collect_rule(rule_desc, &tupid);
             } else {
                 bail!(
                     "Rule {} at  {}:{} was previously defined at {}. \
@@ -1704,7 +1776,7 @@ fn insert_nodes(
                     .unwrap_or_default()
             };
             let (db_id, db_par_id) = {
-                let upsnode = tx.fetch_upsert_node(&node,  compute_sha)?;
+                let upsnode = tx.fetch_upsert_node(&node, compute_sha)?;
                 (upsnode.get_id(), upsnode.get_dir())
             };
             if !db_id.is_negative() {

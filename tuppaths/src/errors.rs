@@ -1,7 +1,6 @@
 //! Errors concerning path search and globbing
 use thiserror::Error as ThisError;
 
-
 /// Various kinds of path search errors
 #[non_exhaustive]
 #[derive(Debug, ThisError)]
@@ -15,7 +14,7 @@ pub enum Error {
 }
 impl Error {
     /// Create  a path search error
-    pub fn new_path_search_error(str: &str)  -> Self {
+    pub fn new_path_search_error(str: &str) -> Self {
         Error::PathSearchError(str.to_string())
     }
     /// Create a glob error

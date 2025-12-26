@@ -29,13 +29,15 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use fs4::fs_std::FileExt;
-use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnectionPool};
+use tupdb::db::{
+    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnectionPool,
+};
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
-use tupparser::locate_file;
 use tupparser::buffers::NormalPath;
-static  TUP_DB : &str = ".tup/db";
-static IO_DB : &str = ".tup/io.db";
+use tupparser::locate_file;
+static TUP_DB: &str = ".tup/db";
+static IO_DB: &str = ".tup/io.db";
 mod execute;
 mod monitor;
 mod parse;
@@ -195,7 +197,7 @@ enum Action {
         keep_going: bool,
         /// skip scanning the filesystem before parse
         #[arg(short = 's', long = "skip-scan", default_value = "false")]
-        skip_scan: bool
+        skip_scan: bool,
     },
 
     #[clap(about = "Build specified targets")]
@@ -259,7 +261,11 @@ fn main() -> Result<()> {
                         conn.for_each_gen_file(|node| {
                             if node.get_type().eq(&RowType::DirGen) {
                                 std::fs::remove_dir_all(node.get_name()).unwrap_or_else(|e| {
-                                    eprintln!("Failed to remove dir {} due to {}", node.get_name(), e)
+                                    eprintln!(
+                                        "Failed to remove dir {} due to {}",
+                                        node.get_name(),
+                                        e
+                                    )
                                 });
                             }
                             Ok(())
@@ -287,28 +293,28 @@ fn main() -> Result<()> {
                 skip_scan,
             } => {
                 let root = change_root_update_targets(&mut target)?;
-                
+                if !target.is_empty() {
+                    eprintln!("Warning: parse action on specific targets is for debug purposes only,\
+                     and it not correctly update all dependencies. Use `tup upd` instead.");
+                }
+
                 let pool = start_tup_connection()
                     .wrap_err("Parse action: could not establish connection to .tup/db")?;
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = skip_scan || monitor::is_monitor_running();
-                let tupfiles = scan_and_get_tupfiles(
-                    &root,
-                    pool.clone(),
-                    &term_progress,
-                    skip_scan,
-                    &target,
-                )
-                .inspect_err(|e| {
-                    term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                })?;
+                let tupfiles =
+                    scan_and_get_tupfiles(&root, pool.clone(), &term_progress, skip_scan, &target)
+                        .inspect_err(|e| {
+                            term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                        })?;
 
                 let term_progress =
                     term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress)
-                    .inspect_err(|e| {
+                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress).inspect_err(
+                    |e| {
                         term_progress.abandon_main(format!("Parsing failed with error: {}", e));
-                    })?
+                    },
+                )?
             }
             Action::Upd {
                 mut target,
@@ -323,7 +329,8 @@ fn main() -> Result<()> {
                         let exe = std::env::current_exe()?;
                         let cwd = std::env::current_dir()?;
                         // Recreate original args from std::env to preserve unparsed flags
-                        let mut arg_list: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                        let mut arg_list: Vec<std::ffi::OsString> =
+                            std::env::args_os().skip(1).collect();
                         // Mark as elevated to avoid loops
                         arg_list.push(std::ffi::OsString::from("--elevated"));
 
@@ -335,7 +342,9 @@ fn main() -> Result<()> {
                             let s = s.to_string_lossy();
                             // Basic quoting: wrap each arg in double quotes and escape inner quotes
                             let quoted = format!("\"{}\"", s.replace('"', "`\""));
-                            if i > 0 { args_joined.push(' '); }
+                            if i > 0 {
+                                args_joined.push(' ');
+                            }
                             args_joined.push_str(&quoted);
                         }
 
@@ -379,13 +388,18 @@ fn main() -> Result<()> {
                     )?;
                     let term_progress = term_progress
                         .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                    parse_tupfiles_in_db(connection_pool, tupfiles, root.as_path(), &term_progress)?;
+                    parse_tupfiles_in_db(
+                        connection_pool,
+                        tupfiles,
+                        root.as_path(),
+                        &term_progress,
+                    )?;
                     term_progress.clear();
                     let exec_options = execute::ExecOptions {
                         keep_going,
                         verbose: args.verbose,
                         num_jobs,
-                        term_progress:term_progress.clone()
+                        term_progress: term_progress.clone(),
                     };
                     execute::execute_targets(&target, root, &exec_options)?;
                 }
@@ -435,7 +449,8 @@ fn main() -> Result<()> {
                     tupfiles_with_vars
                 };
                 {
-                    let vars_file = File::create("vars.txt").wrap_err("Failed to open vars.txt for write")?;
+                    let vars_file =
+                        File::create("vars.txt").wrap_err("Failed to open vars.txt for write")?;
                     let mut writer = BufWriter::new(vars_file);
                     use std::io::Write;
                     for (tupfile, val) in tupfiles_with_vars {
@@ -457,13 +472,13 @@ fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
     let root = current_dir().wrap_err("Failed to get current directory after changing root")?;
     if root.ne(&curdir) {
         println!("Changed root to {}", root.display());
-        let prefix = curdir
-            .strip_prefix(&root)
-            .wrap_err_with(|| format!(
+        let prefix = curdir.strip_prefix(&root).wrap_err_with(|| {
+            format!(
                 "Failed to strip new root '{}' from previous cwd '{}'",
                 root.display(),
                 curdir.display()
-            ))?;
+            )
+        })?;
         // adjust the target paths to be relative to the new root
         let mut new_targets = Vec::new();
         for t in target.iter() {
@@ -496,13 +511,17 @@ fn scan_and_get_tupfiles(
     skip_scan: bool,
     targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
-
     let lock_file_path = root.join(".tup/build_lock");
     let file = OpenOptions::new()
         .write(true)
         .create(true) // Create the file if it doesn't exist
         .open(&lock_file_path)
-        .wrap_err_with(|| format!("Failed to open/create build lock file at '{}'", lock_file_path.display()))?;
+        .wrap_err_with(|| {
+            format!(
+                "Failed to open/create build lock file at '{}'",
+                lock_file_path.display()
+            )
+        })?;
     // Apply an exclusive lock
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
@@ -513,13 +532,18 @@ fn scan_and_get_tupfiles(
             .wrap_err("Scan failed while preparing modified tupfiles list")?;
     }
     term_progress.clear();
-    
+
     let mut conn = connection_pool
         .get()
         .wrap_err("Failed to get database connection from pool")?;
-   // conn.execute("PRAGMA optimize" ,[])?;
+    // conn.execute("PRAGMA optimize" ,[])?;
     let inspect_dirpath_buf = std::env::var("INSPECT_DIRPATHBUF").is_ok();
-    gather_modified_tupfiles(&mut conn, targets, term_progress.clone(), inspect_dirpath_buf)
+    gather_modified_tupfiles(
+        &mut conn,
+        targets,
+        term_progress.clone(),
+        inspect_dirpath_buf,
+    )
 }
 
 fn scan_and_get_all_tupfiles(
@@ -542,7 +566,12 @@ fn scan_and_get_all_tupfiles(
         .write(true)
         .create(true) // Create the file if it doesn't exist
         .open(&lock_file_path)
-        .wrap_err_with(|| format!("Failed to open/create build lock file at '{}'", lock_file_path.display()))?;
+        .wrap_err_with(|| {
+            format!(
+                "Failed to open/create build lock file at '{}'",
+                lock_file_path.display()
+            )
+        })?;
     // Apply an exclusive lock
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
@@ -555,6 +584,6 @@ fn scan_and_get_all_tupfiles(
     term_progress.clear();
     parse::gather_tupfiles(
         pool.get()
-            .wrap_err("Failed to get database connection from pool")?
+            .wrap_err("Failed to get database connection from pool")?,
     )
 }

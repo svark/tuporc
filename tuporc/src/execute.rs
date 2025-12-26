@@ -20,9 +20,9 @@ use regex::Regex;
 use tupdb::db::{start_connection, Node, TupConnection, TupConnectionPool};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::{BufferObjects, PathBuffers};
-use tupparser::TupPathDescriptor;
-use tupparser::decode::{decode_group_captures};
+use tupparser::decode::decode_group_captures;
 use tupparser::statements::{Loc, TupLoc};
+use tupparser::TupPathDescriptor;
 
 use crate::parse::ConnWrapper;
 use crate::{start_tup_connection, TermProgress, IO_DB};
@@ -129,9 +129,10 @@ pub(crate) fn execute_targets(
     root: PathBuf,
     exec_options: &ExecOptions,
 ) -> Result<()> {
-    let connection_pool =
-        start_tup_connection().expect("Connection to tup database in .tup/db could not be established");
-    let (dag, node_bimap) = prepare_for_execution(connection_pool.clone(), &exec_options.term_progress)?;
+    let connection_pool = start_tup_connection()
+        .expect("Connection to tup database in .tup/db could not be established");
+    let (dag, node_bimap) =
+        prepare_for_execution(connection_pool.clone(), &exec_options.term_progress)?;
 
     //create_dyn_io_temp_tables(&conn)?;
     // start tracking file io by subprocesses.
@@ -179,7 +180,7 @@ pub(crate) fn execute_targets(
         &dag,
         root.as_path(),
         &target,
-        &exec_options
+        &exec_options,
     )?;
     Ok(())
 }
@@ -381,10 +382,9 @@ fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> R
     for t in targets {
         let path_desc = dir_desc.join(t.as_str())?;
         let path = bo.get_path(&path_desc);
-        if let Some(id) = conn.fetch_dirid_by_path(path.as_path()).ok()
-        {
+        if let Some(id) = conn.fetch_dirid_by_path(path.as_path()).ok() {
             dir_ids.push(id);
-        } 
+        }
     }
     Ok(dir_ids)
 }
@@ -419,7 +419,7 @@ fn exec_nodes_to_run(
     dag: &IncrementalTopo,
     root: &Path,
     target: &Vec<String>,
-    exec_options: &ExecOptions
+    exec_options: &ExecOptions,
 ) -> Result<()> {
     // order the rules based on their dependencies
     let keep_going = exec_options.keep_going;
@@ -516,11 +516,14 @@ fn exec_nodes_to_run(
     }
     let mut min_idx = 0;
 
-    let rule_for_child_id : BTreeMap<u32, (i64, String)>  = BTreeMap::new();
+    let rule_for_child_id: BTreeMap<u32, (i64, String)> = BTreeMap::new();
     let rule_for_child_id = Arc::from(RwLock::new(rule_for_child_id));
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process()?;
-    let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().expect("Failed to build thread pool to execute rules");
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .expect("Failed to build thread pool to execute rules");
     let _ = thread_pool.scope(|s| -> Result<()> {
         {
             let poisoned = poisoned.clone();
@@ -565,7 +568,12 @@ fn exec_nodes_to_run(
                     }
                     eyre::bail!("Aborted executing rule: \n{}", rule_name);
                 } else {
-                    execute_rule(rule_node, &dirpaths[j], &spawned_child_id_sender, &mut children[j % num_threads])?;
+                    execute_rule(
+                        rule_node,
+                        &dirpaths[j],
+                        &spawned_child_id_sender,
+                        &mut children[j % num_threads],
+                    )?;
                 }
             }
 
@@ -580,7 +588,7 @@ fn exec_nodes_to_run(
                 let wg = wg.clone();
                 let pbar = term_progress.make_len_progress_bar("..", children.len() as u64);
                 pbars.push(pbar.clone());
-                s.spawn(move |_|  {
+                s.spawn(move |_| {
                     let (finished, failed) =
                         wait_for_children(poisoned, children, &pbar, &term_progress);
                     for (id, succeeded) in finished
@@ -591,7 +599,8 @@ fn exec_nodes_to_run(
                         let rule_for_child_id = rule_for_child_id.read();
                         if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
                             completed_child_id_sender
-                                .send((id, (rule_id, rule_name, succeeded))).expect("Failed to send completed child id");
+                                .send((id, (rule_id, rule_name, succeeded)))
+                                .expect("Failed to send completed child id");
                         }
                     }
                     pbar.finish();
@@ -706,7 +715,10 @@ impl<'a> ProcessIOChecker<'a> {
     }
 
     fn fetch_node_by_id(&self, node_id: i64) -> Result<Node> {
-        let node = self.conn.fetch_node_by_id(node_id)?.ok_or_else(|| eyre!("Node with id {} not found", node_id))?;
+        let node = self
+            .conn
+            .fetch_node_by_id(node_id)?
+            .ok_or_else(|| eyre!("Node with id {} not found", node_id))?;
         Ok(node)
     }
     fn fetch_inputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
@@ -747,7 +759,19 @@ impl<'a> ProcessIOChecker<'a> {
     }
 
     fn insert_link(&mut self, from_id: i64, to_id: i64, is_output: bool) -> Result<()> {
-        self.conn.insert_link(from_id, to_id, is_output.into(), RowType::Rule)?;
+        self.conn
+            .insert_link(from_id, to_id, is_output.into(), RowType::Rule)?;
+        Ok(())
+    }
+
+    fn upsert_output_producer(
+        &mut self,
+        output_id: i64,
+        producer_id: i64,
+        producer_type: RowType,
+    ) -> Result<()> {
+        self.conn
+            .upsert_output_producer_link(output_id, producer_id, producer_type)?;
         Ok(())
     }
 }
@@ -853,12 +877,8 @@ fn listen_to_processes(
                 }
                 deleted_child_procs.remove(&child_id);
                 let node = process_checker.fetch_node_by_id(*rule_id)?;
-                if let Err(e) = verify_node_io(
-                    *child_id,
-                    &node,
-                    &mut io_conn,
-                    &mut process_checker,
-                ) {
+                if let Err(e) = verify_node_io(*child_id, &node, &mut io_conn, &mut process_checker)
+                {
                     eprintln!("Error verifying rule io {}\n{}", rule_name, e.to_string());
                     poisoned.update_poisoned(2);
                 } else {
@@ -910,6 +930,12 @@ fn verify_node_io(
             }
             link_file_to_node(node_id, process_checker, file_node)?;
         } else if *ty == EventType::Write as u8 {
+            // Tasks do not declare outputs. Any observed write from a Task is considered its output.
+            if node.get_type() == &RowType::Task {
+                link_output_to_task(node_id, process_checker, file_node)?;
+                continue;
+            }
+            // Rules must write their declared outputs only.
             if output_matches_declared(&outs, file_node) {
                 continue;
             }
@@ -1012,11 +1038,48 @@ fn link_output_to_task(
     if let Ok(dirid) = process_checker.fetch_dirid(file_node) {
         let p = Path::new(file_node);
         if let Some(name) = p.file_name() {
-            if let Ok(from_id) =
-                process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
-            {
-                process_checker.insert_link(task_id, from_id, true)?;
-            }
+            // Try to find existing node id; if not found, insert a GenF node first.
+            let output_id =
+                match process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid) {
+                    Ok(id) => {
+                        // Best-effort: if existing node has no srcid, set it to this task (treat srcid as generic producer)
+                        if let Ok(out_node) = process_checker.fetch_node_by_id(id) {
+                            if out_node.get_srcid() <= 0 {
+                                use tupdb::inserts::LibSqlInserts as _;
+                                let _ = process_checker
+                                    .conn
+                                    .update_srcid_exec(id, task_id)
+                                    .map_err(|e| eyre!(
+                                        "Failed to set srcid for task output '{}': {}",
+                                        file_node, e
+                                    ))?;
+                            }
+                        }
+                        id
+                    }
+                    Err(_) => {
+                        // Create a GenF node with srcid = task_id (treat srcid as generic producer)
+                        let gen_node = Node::new_file_or_genf(
+                            -1,
+                            dirid,
+                            0,
+                            name.to_string_lossy().to_string(),
+                            RowType::GenF,
+                            task_id,
+                        );
+                        // Upsert node into DB so we can link to it
+                        use tupdb::inserts::LibSqlInserts as _;
+                        let inserted = process_checker
+                            .conn
+                            .fetch_upsert_node(&gen_node, || String::new())
+                            .map_err(|e| {
+                                eyre!("Failed to create task output node '{}': {}", file_node, e)
+                            })?;
+                        inserted.get_id()
+                    }
+                };
+            // Create Producer (Task) -> Output edge with uniqueness enforced globally (Rule or Task)
+            process_checker.upsert_output_producer(output_id, task_id, RowType::Task)?;
         }
     }
     Ok(())

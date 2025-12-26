@@ -8,13 +8,13 @@ use std::fmt::Display;
 use std::hash;
 use std::iter;
 use std::ops::{Deref, DerefMut};
-use std::path::{is_separator, Path};
+use std::path::{Path, is_separator};
 use std::str;
 
 //use aho_corasick::AhoCorasick;
 use bstr::{ByteSlice, ByteVec};
 use regex;
-use regex::bytes::{RegexBuilder, Regex};
+use regex::bytes::{Regex, RegexBuilder};
 use tupcompat::platform::get_platform;
 
 //use bstr::{ByteSlice, ByteVec};

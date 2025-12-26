@@ -1,4 +1,6 @@
-use crate::db::{db_path_str, make_node, make_rule_node, make_tup_node,  make_task_node, IOClass, Node, RowType};
+use crate::db::{
+    db_path_str, make_node, make_rule_node, make_task_node, make_tup_node, IOClass, Node, RowType,
+};
 use crate::error::{AnyError, DbResult, SqlResult};
 use rusqlite::ffi;
 use sha2::{Digest, Sha256};
@@ -22,8 +24,6 @@ pub trait LibSqlQueries {
     fn for_each_gen_file<F>(&self, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
-
-
 
     /// Fetch all rule nodes in a tupfile directory
     fn fetch_rule_nodes_by_dir(&self, dir: i64) -> DbResult<Vec<Node>>;
@@ -52,7 +52,8 @@ pub trait LibSqlQueries {
         F: FnMut(Node) -> SqlResult<()>;
 
     fn for_each_subdirectory<F>(&self, dir_id: i64, f: F) -> DbResult<()>
-    where F: FnMut(i64, String) -> SqlResult<()> ;
+    where
+        F: FnMut(i64, String) -> SqlResult<()>;
 
     fn for_each_glob_dir<F>(&self, dir_id: i64, depth: i32, f: F) -> DbResult<()>
     where
@@ -67,7 +68,6 @@ pub trait LibSqlQueries {
     ) -> DbResult<Option<i64>>;
 
     fn fetch_dirid_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64>;
-    
 
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf>;
 
@@ -225,7 +225,8 @@ impl LibSqlQueries for rusqlite::Connection {
     }
 
     fn for_each_subdirectory<F>(&self, dir_id: i64, mut f: F) -> DbResult<()>
-    where F: FnMut(i64, String) -> SqlResult<()>
+    where
+        F: FnMut(i64, String) -> SqlResult<()>,
     {
         self.for_each_subdirectory_inner(dir_id, |row| {
             let dir_id: i64 = row.get(0)?;
@@ -234,7 +235,6 @@ impl LibSqlQueries for rusqlite::Connection {
         })?;
         Ok(())
     }
-
 
     fn for_each_glob_dir<F>(&self, dir_id: i64, depth: i32, mut f: F) -> DbResult<()>
     where
@@ -256,7 +256,7 @@ impl LibSqlQueries for rusqlite::Connection {
         })?;
         Ok(nodes)
     }
-     fn fetch_tasks_to_run(&self) -> DbResult<Vec<Node>> {
+    fn fetch_tasks_to_run(&self) -> DbResult<Vec<Node>> {
         let mut nodes = Vec::new();
         self.for_each_task_to_run_no_targets_inner(|row| {
             let node = make_task_node(row)?;
@@ -396,11 +396,10 @@ impl LibSqlQueries for rusqlite::Connection {
         self.fetch_maybe_changed_globs_inner(|row| {
             f(row.get(0)?).map_err(internal_sqlite_error)?;
             Ok(())
-        }).or_else(|e| {
-            match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok::<(), AnyError>(()),
-                e => Err(e.into()),
-            }
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok::<(), AnyError>(()),
+            e => Err(e.into()),
         })
     }
     fn fetch_modified_globs(&self) -> DbResult<Vec<(i64, String)>> {
