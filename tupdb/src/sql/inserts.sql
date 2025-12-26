@@ -235,7 +235,7 @@ WHERE PresentList.id IS NULL
   AND (NodeType.class = 'FILE_SYS');
 -- <eos>
 -- name: create_tupfile_entities_table_inner!
--- Create a temporary table to store tupfile entities
+-- Create a temporary table to store tupfile entities which have id/type pairs of outputs and rules/tasks that generate them
 CREATE TEMP TABLE TupfileEntities
 (
     id   INTEGER PRIMARY KEY,
@@ -244,14 +244,14 @@ CREATE TEMP TABLE TupfileEntities
 -- <eos>
 
 -- name: add_rules_and_outputs_of_tupfile_entities!
--- Add all rules of parsed tupfiles and their outputs to CurrentTupfiles
+-- Add all rules/tasks of parsed tupfiles and their outputs to CurrentTupfiles, Also add outputs of rules/tasks that are already in CurrentTupfiles
 -- # Parameters
 -- param: tupfile_id : i64- id of the tupfiles to add
 INSERT INTO TupfileEntities (id, type)
 SELECT id, type
 FROM Node
 WHERE srcid = :tupfile_id
-  AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule');
+  AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 
 INSERT INTO TupfileEntities (id, type)
 SELECT id, type
