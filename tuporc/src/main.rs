@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use eyre::{eyre, Result};
+use eyre::{eyre, Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
@@ -49,7 +49,8 @@ pub(crate) struct TermProgress {
 }
 
 fn start_tup_connection() -> Result<TupConnectionPool> {
-    let pool = start_connection(TUP_DB)?;
+    let pool = start_connection(TUP_DB)
+        .wrap_err_with(|| format!("Failed to open tup database at '{}'", TUP_DB))?;
     Ok(pool)
 }
 
@@ -242,8 +243,11 @@ fn main() -> Result<()> {
             }
             Action::ReInit => {
                 {
-                    let pool = start_tup_connection()?;
-                    let conn = pool.get().expect("Failed to get connection");
+                    let pool = start_tup_connection()
+                        .wrap_err("Failed to connect to tup database during reinit")?;
+                    let conn = pool
+                        .get()
+                        .wrap_err("Failed to get database connection from pool")?;
                     // check if there is DirPathBuf table in the database
                     if is_initialized(&conn, "DirPathBuf") {
                         conn.for_each_gen_file(|node| {
@@ -267,7 +271,8 @@ fn main() -> Result<()> {
             }
             Action::Scan => {
                 change_root()?;
-                let pool = start_tup_connection()?;
+                let pool = start_tup_connection()
+                    .wrap_err("Scan action: could not establish connection to .tup/db")?;
                 let root = current_dir()?;
 
                 let term_progress = TermProgress::new("Scanning for files");
@@ -284,7 +289,7 @@ fn main() -> Result<()> {
                 let root = change_root_update_targets(&mut target)?;
                 
                 let pool = start_tup_connection()
-                    .expect("Connection to tup database in .tup/db could not be established");
+                    .wrap_err("Parse action: could not establish connection to .tup/db")?;
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = skip_scan || monitor::is_monitor_running();
                 let tupfiles = scan_and_get_tupfiles(
@@ -363,7 +368,7 @@ fn main() -> Result<()> {
                 let term_progress = TermProgress::new("Building ");
                 {
                     let connection_pool = start_tup_connection()
-                        .expect("Connection to tup database in .tup/db could not be established");
+                        .wrap_err("Update action: could not establish connection to .tup/db")?;
                     let skip_scan = monitor::is_monitor_running();
                     let tupfiles = scan_and_get_tupfiles(
                         &root,
@@ -406,7 +411,7 @@ fn main() -> Result<()> {
                 change_root()?;
                 let root = current_dir()?;
                 let pool = start_tup_connection()
-                    .expect("Connection to tup database in .tup/db could not be established");
+                    .wrap_err("DumpVars action: could not establish connection to .tup/db")?;
                 let term_progress = TermProgress::new("Scanning ");
                 let tupfiles =
                     scan_and_get_all_tupfiles(&root, pool.clone(), &term_progress, skip_scan)
@@ -430,7 +435,7 @@ fn main() -> Result<()> {
                     tupfiles_with_vars
                 };
                 {
-                    let vars_file = File::create("vars.txt")?;
+                    let vars_file = File::create("vars.txt").wrap_err("Failed to open vars.txt for write")?;
                     let mut writer = BufWriter::new(vars_file);
                     use std::io::Write;
                     for (tupfile, val) in tupfiles_with_vars {
@@ -447,12 +452,18 @@ fn main() -> Result<()> {
 }
 
 fn change_root_update_targets(target: &mut Vec<String>) -> Result<PathBuf> {
-    let curdir = current_dir()?;
-    change_root()?;
-    let root = current_dir()?;
+    let curdir = current_dir().wrap_err("Failed to get current directory before changing root")?;
+    change_root().wrap_err("Failed to locate and change to tup root")?;
+    let root = current_dir().wrap_err("Failed to get current directory after changing root")?;
     if root.ne(&curdir) {
         println!("Changed root to {}", root.display());
-        let prefix = curdir.strip_prefix(&root)?;
+        let prefix = curdir
+            .strip_prefix(&root)
+            .wrap_err_with(|| format!(
+                "Failed to strip new root '{}' from previous cwd '{}'",
+                root.display(),
+                curdir.display()
+            ))?;
         // adjust the target paths to be relative to the new root
         let mut new_targets = Vec::new();
         for t in target.iter() {
@@ -490,18 +501,22 @@ fn scan_and_get_tupfiles(
     let file = OpenOptions::new()
         .write(true)
         .create(true) // Create the file if it doesn't exist
-        .open(lock_file_path)?;
+        .open(&lock_file_path)
+        .wrap_err_with(|| format!("Failed to open/create build lock file at '{}'", lock_file_path.display()))?;
     // Apply an exclusive lock
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), connection_pool.clone(), &term_progress)?;
+        scan::scan_root(root.as_path(), connection_pool.clone(), &term_progress)
+            .wrap_err("Scan failed while preparing modified tupfiles list")?;
     }
     term_progress.clear();
     
-    let mut conn = connection_pool.get().expect("Failed to get connection");
+    let mut conn = connection_pool
+        .get()
+        .wrap_err("Failed to get database connection from pool")?;
    // conn.execute("PRAGMA optimize" ,[])?;
     let inspect_dirpath_buf = std::env::var("INSPECT_DIRPATHBUF").is_ok();
     gather_modified_tupfiles(&mut conn, targets, term_progress.clone(), inspect_dirpath_buf)
@@ -526,15 +541,20 @@ fn scan_and_get_all_tupfiles(
     let file = OpenOptions::new()
         .write(true)
         .create(true) // Create the file if it doesn't exist
-        .open(lock_file_path)?;
+        .open(&lock_file_path)
+        .wrap_err_with(|| format!("Failed to open/create build lock file at '{}'", lock_file_path.display()))?;
     // Apply an exclusive lock
     file.try_lock_exclusive()
         .map_err(|_| eyre!("Build was already started!"))?;
 
     // if the monitor is running avoid scanning
     if !skip_scan {
-        scan::scan_root(root.as_path(), pool.clone(), &term_progress)?;
+        scan::scan_root(root.as_path(), pool.clone(), &term_progress)
+            .wrap_err("Scan failed while gathering all tupfiles")?;
     }
     term_progress.clear();
-    parse::gather_tupfiles(pool.get().expect("Failed to get connection"))
+    parse::gather_tupfiles(
+        pool.get()
+            .wrap_err("Failed to get database connection from pool")?
+    )
 }
