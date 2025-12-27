@@ -295,7 +295,7 @@ fn main() -> Result<()> {
                 let root = change_root_update_targets(&mut target)?;
                 if !target.is_empty() {
                     eprintln!("Warning: parse action on specific targets is for debug purposes only,\
-                     and it may not correctly update all dependencies. Use `tup upd` instead.");
+                     and it may not correctly update all dependencies. Use `tup parse` instead.");
                 }
 
                 let pool = start_tup_connection()
