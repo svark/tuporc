@@ -66,8 +66,6 @@ pub trait LibSqlInserts {
     fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()>;
-    fn delete_tupfile_entries_not_in_present_list(&self) -> DbResult<()>;
-    fn delete_orphaned_tupentries(&self) -> DbResult<()>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
@@ -370,15 +368,8 @@ impl LibSqlInserts for Connection {
         self.mark_dependent_tupfiles_of_glob_inner(glob_id)?;
         Ok(())
     }
-    fn delete_tupfile_entries_not_in_present_list(&self) -> DbResult<()> {
-        self.delete_tupfile_entries_not_in_present_list_inner()?;
-        Ok(())
-    }
 
-    fn delete_orphaned_tupentries(&self) -> DbResult<()> {
-        self.delete_orphaned_tupentries_inner()?;
-        Ok(())
-    }
+   
 
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus> {
         if self

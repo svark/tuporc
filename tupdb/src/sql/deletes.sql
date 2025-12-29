@@ -94,8 +94,19 @@ where id not in (
 -- Prune the delete list of PresentList
 -- # Parameters
 DELETE
-from TupfileEntities
-where EXISTS (SELECT 1 from PresentList where id = TupfileEntities.id);
+from ChangeList
+where EXISTS (SELECT 1 from PresentList as P where P.id = ChangeList.id)
+  and is_delete = 1;
+-- <eos>
+
+-- name: delete_tupfile_entries_not_in_present_list_inner!
+-- Delete all tupfile entries that are not in the present list
+-- # Parameters
+INSERT INTO ChangeList (id, type, is_delete)
+SELECT t.id, t.type, 1
+FROM TupfileEntities t
+         LEFT JOIN PresentList p ON t.id = p.id
+WHERE p.id IS NULL;
 -- <eos>
 
 -- name: enrich_delete_list_for_missing_dirs_inner!
@@ -119,6 +130,30 @@ SELECT n.id,
        1
 FROM Node n
          JOIN ChangeList d ON d.is_delete = 1 AND n.dir = d.id;
+-- <eos>
+    
+-- name: delete_orphaned_tupentries_inner!
+-- Delete all nodes that are defined by tupfiles in delete list
+-- # Parameters
+insert or
+REPLACE
+into ChangeList(id, type, is_delete)
+SELECT n.id, n.type, 1
+from Node n
+         JOIN ChangeList dl on dl.is_delete = 1 AND n.srcid = dl.id
+where n.type = (SELECT type_index from NodeType where type = 'Rule')
+  and dl.type = (SELECT type_index from NodeType where type = 'TupF');
+
+-- <eos>
+INSERT or
+REPLACE
+into ChangeList(id, type, is_delete)
+SELECT n.id, n.type, 1
+from Node n
+         JOIN ChangeList dl on dl.is_delete = 1 AND dl.id = n.srcid
+where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
+  and dl.type = (SELECT type_index from NodeType where type = 'Rule');
+
 -- <eos>
 
 -- name: delete_nodes_inner!

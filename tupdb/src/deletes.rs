@@ -10,6 +10,12 @@ pub trait LibSqlDeletes {
     fn delete_monitored_by_generation_id(&self, id: i64) -> Result<usize>;
     fn unmark_modified(&self, id: i64) -> Result<usize>;
     fn delete_nodes(&self) -> Result<usize>;
+
+    fn delete_tupfile_entries_not_in_present_list(&self) -> Result<()>;
+
+    fn delete_orphaned_tupentries(&self) -> Result<()>;
+
+
     fn prune_delete_list_of_present(&self) -> Result<usize>;
     fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize>;
 
@@ -59,6 +65,19 @@ impl LibSqlDeletes for Connection {
         log::debug!("Deleted {} rows from nodes", sz);
         Ok(sz)
     }
+    fn delete_tupfile_entries_not_in_present_list(&self) -> Result<()>
+    {
+        self.delete_tupfile_entries_not_in_present_list_inner()?;
+        log::debug!("Deleted tupfile_entries not in PresentList table");
+        Ok(())
+    }
+    fn delete_orphaned_tupentries(&self) -> Result<()>
+    {
+        self.delete_orphaned_tupentries_inner()?;
+        log::debug!("Deleted orphaned tupfile_entries");
+        Ok(())
+    }
+
 
     fn prune_delete_list_of_present(&self) -> Result<usize> {
         let sz = self.prune_delete_list_of_present_inner()?;
