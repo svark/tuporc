@@ -877,7 +877,8 @@ fn insert_links(
         for tupfile_read in resolved_rules.get_tupfiles_read() {
             link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
         }
-        add_links_from_to_globs(conn, resolved_rules, crossref, &mut link_collector)?;
+        add_links_from_to_globs(conn, resolved_rules, crossref, &mut link_collector)
+            .context("Inserting links from/to globs")?;
         add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
         link_collector.links()
     };
@@ -927,7 +928,7 @@ fn add_links_from_to_globs(
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
     link_collector: &mut LinkCollector,
-) -> Result<(), Report> {
+) -> Result<(), eyre::Report> {
     for glob_desc in resolved_rules.get_globs_read() {
         let (_, glob_dir) = crossref.get_glob_db_id_ok(glob_desc).wrap_err_with(|| {
             eyre!(
@@ -948,7 +949,7 @@ fn add_links_from_to_globs(
                     .map_err(into_any_error)?;
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
-            })?;
+            }).wrap_err_with(|| eyre!("Adding glob paths at {}", glob_dir))?;
         } else {
             link_collector.add_dir_to_glob_link(glob_desc, resolved_rules.get_tupid());
         }
@@ -1032,6 +1033,9 @@ pub fn gather_modified_tupfiles(
             }
             let dir_path = NormalPath::new_from_cow_str(Cow::from(target.as_str()));
             target_dirs_and_names.push(db_path_str(dir_path.as_path()));
+        }
+        for t in target_dirs_and_names.iter() {
+            log::info!("target dir for tupfile parse:{}", t);
         }
     }
     if inspect_dir_path_buf {
@@ -1188,13 +1192,10 @@ fn parse_and_add_rules_to_db(
             .receive_resolved_statements(receiver, insert_to_db_wrap_err)
             .map_err(|error| {
                 let read_write_buffers = parser.read_write_buffers();
-                let tup_node = read_write_buffers.get_tup_path(error.get_tup_descriptor());
-                let tup_node = tup_node.to_string();
-                let display_str = read_write_buffers.display_str(error.get_error_ref());
-                term_progress.abandon(&pb, format!("Error parsing {tup_node}"));
+                let display_str = read_write_buffers.display_str(&error);
+                term_progress.abandon(&pb, "Error resolving statements".to_string());
                 eyre!(
-                    "Unable to resolve statements in tupfile {}:\n{}",
-                    tup_node.as_str(),
+                    "Unable to resolve statements in tupfiles:\n{}",
                     display_str,
                 )
             })?;

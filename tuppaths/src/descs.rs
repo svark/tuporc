@@ -237,7 +237,8 @@ impl PathDescriptor {
                     Ok(PathDescriptor::default())
                 },
                 Component::Prefix(_) =>
-                    Err(Error::new_path_search_error(&format!("attempting to join unexpected path component:{:?}\n Consider only relative paths or paths from tup root for rule building", x)))
+                    Err(Error::new_path_search_error(
+                        &format!("attempting to join unexpected path component:{} ++ {}\n Consider only relative paths or paths from tup root for rule building", self.get_path_to_root().as_path().display(), name.as_ref().display())))
             }
         })
     }
