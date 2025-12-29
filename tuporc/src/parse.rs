@@ -57,13 +57,13 @@ pub enum SrcId {
 }
 #[derive(Debug, Clone)]
 pub(crate) enum NodeToInsert {
-    Rule(RuleDescriptor, TupPathDescriptor),
+    Rule(RuleDescriptor),
     #[allow(dead_code)]
     Tup(TupPathDescriptor),
     Group(GroupPathDescriptor),
     GeneratedFile(PathDescriptor, SrcId),
     Env(EnvDescriptor),
-    Task(TaskDescriptor, TupPathDescriptor),
+    Task(TaskDescriptor),
     #[allow(dead_code)]
     InputFile(PathDescriptor),
     Glob(GlobPathDescriptor, TupPathDescriptor),
@@ -108,7 +108,7 @@ impl NodeToInsert {
     /// get the name of the node to insert in the database
     pub fn get_name(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_rule_str(),
+            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_rule_str(),
             NodeToInsert::Tup(t) => read_write_buffer_objects
                 .get_tup_path(t)
                 .file_name()
@@ -119,7 +119,7 @@ impl NodeToInsert {
                 .file_name()
                 .to_string(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_name(e),
-            NodeToInsert::Task(t, _) => read_write_buffer_objects.get_task(t).to_string(),
+            NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).to_string(),
             NodeToInsert::InputFile(p) => read_write_buffer_objects
                 .get_path(p)
                 .file_name()
@@ -141,12 +141,12 @@ impl NodeToInsert {
 
     pub fn get_id(&self) -> i64 {
         match self {
-            NodeToInsert::Rule(r, _) => r.to_u64() as i64,
+            NodeToInsert::Rule(r) => r.to_u64() as i64,
             NodeToInsert::Tup(t) => t.to_u64() as i64,
             NodeToInsert::Group(g) => g.to_u64() as i64,
             NodeToInsert::GeneratedFile(p, _) => p.to_u64() as i64,
             NodeToInsert::Env(e) => e.to_u64() as i64,
-            NodeToInsert::Task(t, _) => t.to_u64() as i64,
+            NodeToInsert::Task(t) => t.to_u64() as i64,
             NodeToInsert::InputFile(p) => p.to_u64() as i64,
             NodeToInsert::Glob(g, _) => g.to_u64() as i64,
             NodeToInsert::ExcludedFile(p) => p.to_u64() as i64,
@@ -157,12 +157,12 @@ impl NodeToInsert {
 
     pub fn get_row_type(&self) -> RowType {
         match self {
-            NodeToInsert::Rule(_, _) => Rule,
+            NodeToInsert::Rule(_) => Rule,
             NodeToInsert::Tup(_) => TupF,
             NodeToInsert::Group(_) => Group,
             NodeToInsert::GeneratedFile(_, _) => GenF,
             NodeToInsert::Env(_) => Env,
-            NodeToInsert::Task(_, _) => Task,
+            NodeToInsert::Task(_) => Task,
             NodeToInsert::InputFile(_) => File,
             NodeToInsert::Glob(_, _) => Glob,
             NodeToInsert::ExcludedFile(_) => Excluded,
@@ -171,23 +171,31 @@ impl NodeToInsert {
         }
     }
 
-    pub fn get_srcid(&self, cross_ref_maps: &CrossRefMaps) -> Result<i64> {
+    pub fn get_srcid(&self, cross_ref_maps: &CrossRefMaps, read_write_buffer_objects: &ReadWriteBufferObjects) -> Result<i64> {
         match self {
-            NodeToInsert::Rule(r, tupid) => cross_ref_maps
-                .get_tup_db_id(tupid)
-                .map(|x| x.0)
-                .ok_or_eyre(eyre!(
+            NodeToInsert::Rule(r) =>
+                {
+                   let tup_id  = read_write_buffer_objects.get_rule(r).get_tup_file_desc();
+                    cross_ref_maps.get_tup_db_id(&tup_id)
+                        .map(|x| x.0)
+                        .ok_or_eyre(eyre!(
                     "srcid not found for rule: {:?}",
                     r,
-                )),
-            NodeToInsert::Task(t, tupid) => cross_ref_maps
-                .get_tup_db_id(tupid)
+                ))
+                },
+            NodeToInsert::Task(t) =>
+                {
+                    let tupid = read_write_buffer_objects.get_task(t).get_tupfile_desc();
+                    cross_ref_maps
+
+                .get_tup_db_id(&tupid)
                 .map(|x| x.0)
                 .ok_or_eyre(eyre!(
                     "srcid not found for task: {:?} with tup descriptor:{:?}",
                     t,
                     tupid
-                )),
+                ))}
+            ,
             NodeToInsert::GeneratedFile(gen, SrcId::RuleId(id)) => cross_ref_maps
                 .get_rule_db_id(id)
                 .map(|x| x.0)
@@ -211,7 +219,7 @@ impl NodeToInsert {
     }
     pub fn get_display_str(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_display_str(),
+            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_display_str(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_value(e),
             NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_recursive_glob_str(g),
             _ => "".to_string(),
@@ -219,7 +227,7 @@ impl NodeToInsert {
     }
     fn get_flags(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
-            NodeToInsert::Rule(r, _) => read_write_buffer_objects
+            NodeToInsert::Rule(r) => read_write_buffer_objects
                 .get_rule(r)
                 .get_flags()
                 .to_string(),
@@ -231,12 +239,12 @@ impl NodeToInsert {
         read_write_buffer_objects: &ReadWriteBufferObjects,
     ) -> PathDescriptor {
         match self {
-            NodeToInsert::Rule(r, _) => read_write_buffer_objects.get_rule(r).get_parent_id(),
+            NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_parent_id(),
             NodeToInsert::Tup(t) => read_write_buffer_objects.get_tup_parent_id(t),
             NodeToInsert::Group(g) => read_write_buffer_objects.get_group_parent_id(g),
             NodeToInsert::GeneratedFile(p, _) => read_write_buffer_objects.get_parent_id(p),
             NodeToInsert::Env(_) => PathDescriptor::default(),
-            NodeToInsert::Task(t, _) => read_write_buffer_objects.get_task(t).get_parent_id(),
+            NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).get_parent_id(),
             NodeToInsert::InputFile(p) => read_write_buffer_objects.get_parent_id(p),
             NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_glob_prefix(g),
             NodeToInsert::ExcludedFile(e) => read_write_buffer_objects.get_parent_id(e),
@@ -317,7 +325,7 @@ impl NodeToInsert {
                     0,
                     self.get_name(read_write_buffer_objects),
                     self.get_row_type(),
-                    self.get_srcid(crossref)?, // at this point we know that rules have been inserted it is generated
+                    self.get_srcid(crossref, read_write_buffer_objects)?, // at this point we know that rules have been inserted it is generated
                 )
             }
             Env => Node::new_env(
@@ -344,7 +352,7 @@ impl NodeToInsert {
 
     pub fn update_crossref(&self, crossref: &mut CrossRefMaps, id: i64, parid: i64) {
         match self {
-            NodeToInsert::Rule(r, _) => {
+            NodeToInsert::Rule(r) => {
                 crossref.add_rule_xref(r.clone(), id, parid);
             }
             NodeToInsert::Tup(td) => {
@@ -359,7 +367,7 @@ impl NodeToInsert {
             NodeToInsert::Env(e) => {
                 crossref.add_env_xref(e.clone(), id);
             }
-            NodeToInsert::Task(t, _) => {
+            NodeToInsert::Task(t) => {
                 crossref.add_task_xref(t.clone(), id, parid);
             }
             NodeToInsert::InputFile(p) => {
@@ -491,7 +499,7 @@ impl DbPathSearcher {
 
     pub fn update_delete_list(&self) -> Result<()> {
         let conn = self.conn.get()?;
-        conn.deref().delete_tupentries_in_deleted_tupfiles()?;
+        conn.deref().delete_orphaned_tupentries()?;
         Ok(())
     }
 
@@ -749,7 +757,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         {
             let tp = term_progress.clone();
             tp.set_main_with_len("Enriching modified list", 7);
-            conn.delete_tupentries_in_deleted_tupfiles()?;
+            conn.delete_orphaned_tupentries()?;
             let pb_main = term_progress.pb_main.clone();
             pb_main.inc(1);
             conn.add_rules_with_changed_io_to_modify_list()?;
@@ -1552,11 +1560,11 @@ impl Collector {
         Ok(())
     }
 
-    fn collect_rule(&mut self, p: &RuleDescriptor, tupid: &TupPathDescriptor) {
-        self.nodes_to_insert.push(NodeToInsert::Rule(p.clone(), tupid.clone()));
+    fn collect_rule(&mut self, p: &RuleDescriptor) {
+        self.nodes_to_insert.push(NodeToInsert::Rule(p.clone()));
     }
-    fn collect_task(&mut self, p: &TaskDescriptor, tupid: &TupPathDescriptor) {
-        self.nodes_to_insert.push(NodeToInsert::Task(p.clone(), tupid.clone()));
+    fn collect_task(&mut self, p: &TaskDescriptor) {
+        self.nodes_to_insert.push(NodeToInsert::Task(p.clone()));
     }
     fn add_env(&mut self, p: &EnvDescriptor) {
         if self.processed_envs.insert(p.clone()) {
@@ -1594,7 +1602,7 @@ impl Collector {
         let name = task_instance.get_target();
         let tuppath = task_instance.get_parent();
         let tuppathstr = tuppath.as_path();
-        let tupid = task_instance.get_tupfile_desc();
+        //let tupid = task_instance.get_tupfile_desc();
         let line = task_instance.get_task_loc();
         debug!(
             " task to insert: {} at  {} at {}",
@@ -1606,7 +1614,7 @@ impl Collector {
             .unique_rule_check
             .insert(task_instance.get_path().to_string(), line.clone());
         if prevline.is_none() {
-            self.collect_task(task_desc, &tupid);
+            self.collect_task(task_desc);
         } else {
             bail!(
                 "Task at  {}:{} was previously defined at line {}. \
@@ -1624,7 +1632,7 @@ impl Collector {
         let ref ph = self.read_write_buffer_objects;
         let tup_cwd_desc = &rule_formula.get_rule_ref().get_tup_dir();
         let tuppath = ph.get_path(&tup_cwd_desc);
-        let tupid = rule_formula.get_rule_ref().get_tupfile_desc();
+        //let tupid = rule_formula.get_rule_ref().get_tupfile_desc();
         {
             let rule_ref = rule_formula.get_rule_ref();
             if log::log_enabled!(log::Level::Debug) {
@@ -1640,7 +1648,7 @@ impl Collector {
                 .unique_rule_check
                 .insert(dir.to_string() + "/" + name.as_str(), rule_ref.clone());
             if prevline.is_none() {
-                self.collect_rule(rule_desc, &tupid);
+                self.collect_rule(rule_desc);
             } else {
                 bail!(
                     "Rule {} at  {}:{} was previously defined at {}. \

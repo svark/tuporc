@@ -56,14 +56,16 @@ where id = :id
 -- <eos>
 
 -- name: delete_from_normal_link!
--- Delete a link from the database if the from_id or the to_id is in DeleteList
+-- Delete a link from the database if the from_id or the to_id is in ChangeList (is_delete=1)
 -- # Parameters
 DELETE
 FROM NormalLink
-WHERE EXISTS (SELECT 1
-              FROM DeleteList
-              WHERE DeleteList.id = NormalLink.from_id
-                 OR DeleteList.id = NormalLink.to_id);
+WHERE EXISTS (
+    SELECT 1
+    FROM ChangeList CL
+    WHERE CL.is_delete = 1
+      AND (CL.id = NormalLink.from_id OR CL.id = NormalLink.to_id)
+);
 -- <eos>
 
 -- name: delete_from_delete_list_inner!
@@ -81,7 +83,11 @@ where id = :id
 -- # Parameters
 DELETE
 from ChangeList
-where id not in (SELECT id from DeleteList UNION SELECT id from SuccessList);
+where id not in (
+    SELECT id FROM ChangeList WHERE is_delete = 1
+    UNION
+    SELECT id FROM SuccessList
+);
 -- <eos>
 
 -- name: prune_delete_list_of_present_inner!
@@ -92,11 +98,34 @@ from TupfileEntities
 where EXISTS (SELECT 1 from PresentList where id = TupfileEntities.id);
 -- <eos>
 
+-- name: enrich_delete_list_for_missing_dirs_inner!
+-- Add all FILE_SYS nodes whose parent directory id does not exist to ChangeList (is_delete=1)
+-- This captures orphans created when a directory row was deleted without cascading to children.
+INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
+SELECT n.id, n.type, 1
+FROM Node n
+         LEFT JOIN Node d ON d.id = n.dir
+         JOIN NodeType nt ON nt.type_index = n.type
+WHERE d.id IS NULL
+  AND nt.class = 'FILE_SYS'
+  AND NOT (n.dir = 0 AND n.name = '.'); -- do not mark the root row
+-- <eos>
+
+-- name: enrich_delete_list_with_dir_dependents_inner!
+-- Add nodes whose parent directory is marked for deletion into ChangeList (is_delete=1)
+INSERT OR REPLACE INTO ChangeList(id, type, is_delete)
+SELECT n.id,
+       n.type,
+       1
+FROM Node n
+         JOIN ChangeList d ON d.is_delete = 1 AND n.dir = d.id;
+-- <eos>
+
 -- name: delete_nodes_inner!
 -- Delete all nodes from the delete list
 DELETE
 from Node
-where id in (SELECT id from DeleteList);
+where id in (SELECT id from ChangeList where is_delete = 1);
 
 -- <eos>
 -- name: unmark_modified_inner!

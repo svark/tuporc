@@ -24,12 +24,10 @@ REPLACE
 into ChangeList
 SELECT nl.to_id,
        nl.to_type,
-       1 -- DeleteList sticky links trigger a delete on target rule if input to rule is in deletelist
+       1 -- sticky links trigger a delete on target rule if input to rule is in delete set
 from NormalLink nl
-         JOIN ChangeList dl on dl.id = nl.from_id
-WHERE dl.is_delete = 1
-  and                                                                  -- input is deleted
-    nl.to_type = (SELECT type_index from NodeType where type = 'Rule') -- rule
+         JOIN ChangeList dl on dl.id = nl.from_id AND dl.is_delete = 1
+WHERE nl.to_type = (SELECT type_index from NodeType where type = 'Rule') -- rule
   and nl.is_sticky = 1;
 
 INSERT or ignore into ChangeList
@@ -200,7 +198,8 @@ Values (:id, :rtype, 1)
 ON CONFLICT DO UPDATE SET is_delete = 1
 where ChangeList.is_delete = 0;
 -- <eos>
--- name: delete_tupentries_in_deleted_tupfiles_inner!
+    
+-- name: delete_orphaned_tupentries_inner!
 -- Delete all nodes that are defined by tupfiles in delete list
 -- # Parameters
 insert or
@@ -208,16 +207,17 @@ REPLACE
 into ChangeList(id, type, is_delete)
 SELECT n.id, n.type, 1
 from Node n
-         JOIN DeleteList dl on n.srcid = dl.id
+         JOIN ChangeList dl on dl.is_delete = 1 AND n.srcid = dl.id
 where n.type = (SELECT type_index from NodeType where type = 'Rule')
   and dl.type = (SELECT type_index from NodeType where type = 'TupF');
 
+-- <eos>
 INSERT or
 REPLACE
 into ChangeList(id, type, is_delete)
 SELECT n.id, n.type, 1
 from Node n
-         JOIN DeleteList dl on dl.id = n.srcid
+         JOIN ChangeList dl on dl.is_delete = 1 AND dl.id = n.srcid
 where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
   and dl.type = (SELECT type_index from NodeType where type = 'Rule');
 

@@ -742,6 +742,9 @@ fn add_modify_nodes(
     drop(node_at_path_receiver);
     drop(dirid_sender);
     tx.add_not_present_to_delete_list()?;
+    // Enrich deletions for nodes whose parent directory entries are missing (orphans)
+    tx.enrich_delete_list_for_missing_dirs()?; // this ai says is needed for database integrity
+    tx.enrich_delete_list_with_dir_dependents()?;
     tx.delete_nodes()?;
     tx.commit()?;
 

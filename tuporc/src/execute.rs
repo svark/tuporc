@@ -498,8 +498,7 @@ fn exec_nodes_to_run(
     let mut pbars: Vec<ProgressBar> = Vec::new();
     {
         let poisoned = poisoned.clone();
-        ctrlc::set_handler(move || poisoned.force_poisoned())
-            .expect("Error setting Ctrl-C handler");
+        let _ = ctrlc::try_set_handler(move || poisoned.force_poisoned());
     }
     valid_rules.sort_by(|x, y| {
         let xid = x.get_id() as i32;
@@ -512,7 +511,9 @@ fn exec_nodes_to_run(
     let mut dirpaths = Vec::new();
     {
         for r in valid_rules.iter() {
-            let path = conn.fetch_dirpath(r.get_dir())?;
+            let path = conn.fetch_dirpath(r.get_dir()).map_err(|_|
+                AnyError::from(format!("unable to fetch dirpath {} for rule: {}",
+                                       r.get_dir(), r.get_name())))?;
             dirpaths.push(path);
         }
     }

@@ -613,7 +613,7 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
 
 impl MiscStatements for TupConnection {
     fn enrich_modified_list(&self) -> DbResult<()> {
-        self.delete_tupentries_in_deleted_tupfiles()?;
+        self.delete_orphaned_tupentries()?;
         self.add_rules_with_changed_io_to_modify_list()?;
 
         // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs

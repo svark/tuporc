@@ -4,7 +4,6 @@ use tupdb_sql_macro::generate_prepared_statements;
 generate_prepared_statements!("sql/deletes.sql");
 
 pub trait LibSqlDeletes {
-    fn delete_node(&self, id: i64) -> Result<usize>;
     fn delete_link(&self, id: i64) -> Result<usize>;
     fn delete_node_sha(&self, id: i64) -> Result<usize>;
     fn delete_messages(&self) -> Result<usize>;
@@ -14,15 +13,16 @@ pub trait LibSqlDeletes {
     fn prune_delete_list_of_present(&self) -> Result<usize>;
     fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize>;
 
+    /// Enrich DeleteList by adding nodes whose parent directory is already in DeleteList
+    fn enrich_delete_list_with_dir_dependents(&self) -> Result<usize>;
+
+    /// Enrich DeleteList by adding nodes whose parent directories are missing from Node (orphaned dirid)
+    fn enrich_delete_list_for_missing_dirs(&self) -> Result<usize>;
+
     fn drop_tupfile_entries_table(&self) -> Result<()>;
 }
 
 impl LibSqlDeletes for Connection {
-    fn delete_node(&self, id: i64) -> Result<usize> {
-        let sz = self.delete_node_inner(id)?;
-        log::debug!("Deleted {} row(s) from node", sz);
-        Ok(sz)
-    }
 
     fn delete_link(&self, id: i64) -> Result<usize> {
         let sz = self.delete_link_inner(id, id)?;
@@ -69,6 +69,16 @@ impl LibSqlDeletes for Connection {
     fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize> {
         let sz = self.prune_modify_list_of_inputs_and_outputs_inner()?;
         log::debug!("Deleted {} rows from modify_list_of_inputs_and_outputs", sz);
+        Ok(sz)
+    }
+    fn enrich_delete_list_with_dir_dependents(&self) -> Result<usize> {
+        let sz = self.enrich_delete_list_with_dir_dependents_inner()?;
+        log::debug!("Enriched DeleteList with {} children of deleted dirs", sz);
+        Ok(sz)
+    }
+    fn enrich_delete_list_for_missing_dirs(&self) -> Result<usize> {
+        let sz = self.enrich_delete_list_for_missing_dirs_inner()?;
+        log::debug!("Enriched DeleteList with {} nodes having missing parent dirs", sz);
         Ok(sz)
     }
     fn drop_tupfile_entries_table(&self) -> Result<()> {
