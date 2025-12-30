@@ -11,11 +11,13 @@ use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
 use tupdb::db::{
     create_dirpathbuf_temptable, create_presentlist_temptable, create_tuppathbuf_temptable,
-    db_path_str, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef, TupTransaction,
+    db_path_str, MiscStatements, Node, RowType, TupConnection, TupConnectionPool,
+    TupConnectionRef, TupTransaction,
 };
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
@@ -497,17 +499,6 @@ impl DbPathSearcher {
         }
     }
 
-    pub fn delete_orphaned_tupentries(&self) -> Result<()> {
-        let conn = self.conn.get()?;
-        conn.deref().delete_orphaned_tupentries()?;
-        Ok(())
-    }
-
-    pub fn delete_nodes(&self) -> Result<()> {
-        let conn = self.conn.get()?;
-        conn.deref().delete_nodes()?;
-        Ok(())
-    }
 
     pub fn fetch_glob_globs_cb<F>(
         conn: &TupConnectionRef,
@@ -748,11 +739,23 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         return Ok(());
     }
     {
-        let conn = connection.get()?;
+        let mut conn = connection.get()?;
+        let tx = conn.transaction()?;
+        if let Some((_phase, status, _ts)) = tx.get_run_status()? {
+            if status == "in_progress" {
+                tx.mark_missing_not_deleted()?;
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.set_run_status("parse", "in_progress", now)?;
+        tx.commit()?;
         conn.create_tupfile_entries_table()?;
     }
     //conn.prune_modified_list_basic()?;
-    let db = DbPathSearcher::new(connection, root.as_ref());
+    let db = DbPathSearcher::new(connection.clone(), root.as_ref());
     let parser = TupParser::try_new_from(root.as_ref(), db)?;
     {
         let dbref = parser.get_mut_searcher();
@@ -786,10 +789,15 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         }
         conn.mark_tupfile_entries(&tupfile_ids)?;
     }
-    let parser = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
-    let dbref = parser.get_mut_searcher();
-    dbref.deref().delete_orphaned_tupentries()?;
-    dbref.deref().delete_nodes()?;
+    let _ = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
+    {
+        let conn = connection.get()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        conn.set_run_status("parse", "success", now)?;
+    }
     Ok(())
 }
 
@@ -970,49 +978,6 @@ fn add_links_from_to_globs(
     Ok(())
 }
 
-/// adds links from glob patterns specified at each directory that are inputs to rules  to the tupfile directory
-/// We don't directly add links from glob patterns to rules but instead add links from glob patterns to the tupfile so that they are parsed whenever glob patterns are modified
-/// Newer / modified /deleted inputs discovered in glob patterns and added as rule inputs will be process in a re-iterations parsing phase of Tupfile which the glob pattern links to
-#[allow(dead_code)]
-fn add_link_glob_dir_to_rules(
-    conn: &mut TupConnection,
-    rw_buf: &ReadWriteBufferObjects,
-    resolved_rules: &ResolvedRules,
-    crossref: &mut CrossRefMaps,
-) -> Result<(), Report> {
-    let tx = conn.transaction()?;
-    {
-        for rlink in resolved_rules.get_resolved_links() {
-            let tupfile_desc = rlink.get_rule_ref().get_tupfile_desc();
-            let (tupfile_db_id, _) = crossref.get_tup_db_id(&tupfile_desc).ok_or_else(|| {
-                eyre!(
-                    "Tupfile dir not found:{:?} mentioned in rule {:?}",
-                    tupfile_desc,
-                    rlink.get_rule_ref()
-                )
-            })?;
-
-            let mut processed_glob = HashSet::new();
-            rlink.for_each_glob_path_desc(|glob_path_desc| -> Result<(), Error> {
-                //               links_to_add.insert(glob_path_desc, tupfile_db_id);
-                let (glob_pattern_id, _) =
-                    crossref.get_glob_db_id(&glob_path_desc).ok_or_else(|| {
-                        Error::new_path_search_error(format!(
-                            "glob path not found:{:?} in tup db",
-                            rw_buf.get_glob_path(&glob_path_desc).as_path()
-                        ))
-                    })?;
-                if processed_glob.insert(glob_pattern_id) {
-                    tx.insert_link(glob_pattern_id, tupfile_db_id, true.into(), TupF)
-                        .map_err(|e| Error::new_path_search_error(e.to_string()))?;
-                }
-                Ok(())
-            })?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
 
 // Gather all the modified tupfiles within directories specified
 // Processing Tupfiles within small set of directories with leave db in an incomplete state but is useful for debugging
@@ -1214,7 +1179,9 @@ fn parse_and_add_rules_to_db(
                     display_str,
                 )
             })?;
-
+        tx.delete_orphaned_tupentries()?;
+        tx.delete_nodes()?;
+        tx.commit()?;
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
         wg.wait();
@@ -1759,70 +1726,65 @@ fn insert_nodes(
         }
     });
 
-    //let tx = conn.transaction()?;
-    {
-        let parent_descriptors = nodes
-            .iter()
-            .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
+    let parent_descriptors = nodes
+        .iter()
+        .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
 
-        for (parent_desc, rowtype) in parent_descriptors {
-            if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
-             //   let connection_ref = tx.connection();
-                let (parid, parparid) = ensure_parent_inserted(
-                    &tx,
-                    read_write_buf.get(),
-                    crossref,
-                    &rowtype,
-                    &parent_desc,
-                )?;
-                if !parid.is_negative() {
-                    crossref.add_path_xref(parent_desc, parid, parparid);
-                }
-            }
-        }
-        for node_to_insert in &nodes {
-            debug!("inserting node: {:?}", node_to_insert);
-            let node = node_to_insert.get_node(&read_write_buf, crossref)?;
-            let compute_sha = || {
-                let tup_connection_ref = tx.connection();
-                node_to_insert
-                    .compute_node_sha(&tup_connection_ref, read_write_buf.get())
-                    .unwrap_or_default()
-            };
-            let (db_id, db_par_id) = {
-                let upsnode = tx.fetch_upsert_node(&node, compute_sha)?;
-                (upsnode.get_id(), upsnode.get_dir())
-            };
-            if !db_id.is_negative() {
-                node_to_insert.update_crossref(crossref, db_id, db_par_id);
-                let sha = compute_sha();
-                if !sha.is_empty() {
-                    tx.upsert_node_sha(db_id, &sha)?;
-                }
-            } else {
-                log::warn!("Failed to insert node: {:?}", node);
-            }
-        }
-
-        for env_var in envs_to_insert.iter() {
-            let env_val = env_var.get_val_str();
-            let key = env_var.get_key_str();
-            match tx.upsert_env_var(key, env_val) {
-                Ok(ups) => {
-                    let env_id = ups.get_id();
-                    crossref.add_env_xref(env_var.clone(), env_id);
-                    if !ups.is_unchanged() {
-                        tx.mark_modified(env_id, &Env)?;
-                    }
-                    tx.mark_present(env_id, &Env)?;
-                }
-                Err(e) => {
-                    log::warn!("Error while inserting env var: {:?}", e);
-                }
+    for (parent_desc, rowtype) in parent_descriptors {
+        if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
+            let (parid, parparid) = ensure_parent_inserted(
+                tx,
+                read_write_buf.get(),
+                crossref,
+                &rowtype,
+                &parent_desc,
+            )?;
+            if !parid.is_negative() {
+                crossref.add_path_xref(parent_desc, parid, parparid);
             }
         }
     }
-  //  tx.commit()?;
+    for node_to_insert in &nodes {
+        debug!("inserting node: {:?}", node_to_insert);
+        let node = node_to_insert.get_node(&read_write_buf, crossref)?;
+        let compute_sha = || {
+            let tup_connection_ref = tx.connection();
+            node_to_insert
+                .compute_node_sha(&tup_connection_ref, read_write_buf.get())
+                .unwrap_or_default()
+        };
+        let (db_id, db_par_id) = {
+            let upsnode = tx.fetch_upsert_node(&node, compute_sha)?;
+            (upsnode.get_id(), upsnode.get_dir())
+        };
+        if !db_id.is_negative() {
+            node_to_insert.update_crossref(crossref, db_id, db_par_id);
+            let sha = compute_sha();
+            if !sha.is_empty() {
+                tx.upsert_node_sha(db_id, &sha)?;
+            }
+        } else {
+            log::warn!("Failed to insert node: {:?}", node);
+        }
+    }
+
+    for env_var in envs_to_insert.iter() {
+        let env_val = env_var.get_val_str();
+        let key = env_var.get_key_str();
+        match tx.upsert_env_var(key, env_val) {
+            Ok(ups) => {
+                let env_id = ups.get_id();
+                crossref.add_env_xref(env_var.clone(), env_id);
+                if !ups.is_unchanged() {
+                    tx.mark_modified(env_id, &Env)?;
+                }
+                tx.mark_present(env_id, &Env)?;
+            }
+            Err(e) => {
+                log::warn!("Error while inserting env var: {:?}", e);
+            }
+        }
+    }
 
     // some validity checks after inserting nodes to see if the db is consistent
     let rules = resolved_rules.rules_by_tup();
