@@ -228,7 +228,7 @@ INSERT INTO TupfileEntities (id, type)
 SELECT id, type
 FROM Node
 WHERE srcid = :tupfile_id
-  AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
+  AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task' or type='Glob' or type='Excl');
 
 INSERT INTO TupfileEntities (id, type)
 SELECT id, type

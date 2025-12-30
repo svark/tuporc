@@ -758,11 +758,10 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     let db = DbPathSearcher::new(connection.clone(), root.as_ref());
     let parser = TupParser::try_new_from(root.as_ref(), db)?;
     {
-        let dbref = parser.get_mut_searcher();
+        let dbref = parser.get_searcher();
         let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         //conn.enrich_modified_list()?;
-        conn.delete_tupfile_entries_not_in_present_list()?;
         {
             let tp = term_progress.clone();
             tp.set_main_with_len("Enriching modified list", 7);
@@ -1114,7 +1113,7 @@ fn parse_and_add_rules_to_db(
                     term_progress.tick(&pb);
                 }
                 drop(wg);
-                pb.set_message("Done");
+                pb.set_message("Done parsing all tupfiles");
                 Ok(())
             });
             handles.push(join_handle);
@@ -1126,11 +1125,11 @@ fn parse_and_add_rules_to_db(
         //let mut crossref = CrossRefMaps::default();
         let outs = parser.get_outs();
         let parser_c = parser.clone();
-        let psx = parser_c.get_mut_searcher();
-        let mut c = psx.conn.get()?;
-        let mut tx = c.transaction()?;
         let mut insert_to_db =  |resolved_rules: ResolvedRules| -> Result<()> {
             //let conn = &mut binding.conn.get()?;
+            let psx = parser_c.get_searcher();
+            let mut c = psx.conn.get()?;
+            let mut tx = c.transaction()?;
             check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
             insert_nodes(&mut tx, &rwbufs, &resolved_rules, &mut crossref)?;
             let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
@@ -1147,6 +1146,7 @@ fn parse_and_add_rules_to_db(
             insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
         };
 
+        log::info!("Starting to resolve statements from parsed tupfiles");
         pb.set_message("Resolving statements..");
         {
             for tupfile_lua in tupfiles
@@ -1179,11 +1179,22 @@ fn parse_and_add_rules_to_db(
                     display_str,
                 )
             })?;
+        log::info!("Finished resolving statements from parsed tupfiles");
+        pb.set_message("Finalizing database updates..");
+        let psx = parser_c.get_searcher();
+        let mut c = psx.conn.get()?;
+        let tx = c.transaction()?;
+        for n in tupfiles {
+            tx.unmark_modified(n.get_id())?;
+        }
         tx.delete_orphaned_tupentries()?;
+        log::info!("Deleted orphaned tup entries");
         tx.delete_nodes()?;
+        log::info!("Deleted marked nodes");
         tx.commit()?;
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
+        log::info!("Finished parse phase");
         wg.wait();
         for join_handle in handles {
             join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
