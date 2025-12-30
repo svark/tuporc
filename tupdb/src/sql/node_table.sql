@@ -95,6 +95,15 @@ CREATE TABLE MESSAGES
     id      INTEGER PRIMARY KEY AUTOINCREMENT not NULL,
     message CHAR(8)                           not NULL
 );
+
+-- RunStatus tracks the last parse/build run status.
+CREATE TABLE IF NOT EXISTS RunStatus
+(
+    id     INTEGER PRIMARY KEY CHECK (id = 1),
+    phase  TEXT,
+    status TEXT,
+    ts     INTEGER
+);
 -- Setup ModifyList view
 CREATE VIEW ModifyList AS
 SELECT id, type

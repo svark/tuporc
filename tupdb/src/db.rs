@@ -344,6 +344,13 @@ pub trait MiscStatements {
     /// Populate deletelist (DeleteList = ids of type file/dir Node  - ids in PresentList)
     /// Enrich the modified list with more entries determined by dependencies between nodes
     fn enrich_modified_list(&self) -> DbResult<()>;
+
+    /// Set run status for a phase ("parse"/"build"/"update")
+    fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()>;
+    /// Fetch current run status
+    fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>>;
+    /// Mark missing FILE_SYS nodes that are not yet in delete list as deletes.
+    fn mark_missing_not_deleted(&self) -> DbResult<()>;
 }
 
 // Check if the node table exists in .tup/db
@@ -354,6 +361,81 @@ pub fn is_initialized(conn: &Connection, table_name: &str) -> bool {
         stmt.query_row([table_name], |_x| Ok(true)).is_ok()
     } else {
         false
+    }
+}
+
+impl<'a> MiscStatements for TupTransaction<'a> {
+    fn enrich_modified_list(&self) -> DbResult<()> {
+        self.connection().enrich_modified_list()
+    }
+
+    fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()> {
+        self.connection().set_run_status(phase, status, ts)
+    }
+
+    fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>> {
+        self.connection().get_run_status()
+    }
+
+    fn mark_missing_not_deleted(&self) -> DbResult<()> {
+        self.connection().mark_missing_not_deleted()
+    }
+}
+
+impl<'a> MiscStatements for TupConnectionRef<'a> {
+    fn enrich_modified_list(&self) -> DbResult<()> {
+        self.delete_orphaned_tupentries()?;
+        self.add_rules_with_changed_io_to_modify_list()?;
+
+        self.mark_dependent_tupfiles_of_tupfiles()?;
+        for (i, sha) in self.fetch_modified_globs()?.into_iter() {
+            self.update_node_sha_exec(i, sha.as_str())?;
+            self.mark_dependent_tupfiles_of_glob(i)?;
+        }
+
+        self.mark_rules_depending_on_modified_groups()?;
+        self.prune_modify_list_of_inputs_and_outputs()?;
+        self.delete_nodes()?;
+
+        Ok(())
+    }
+
+    fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()> {
+        self.execute(
+            "INSERT OR REPLACE INTO RunStatus (id, phase, status, ts) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![phase, status, ts],
+        )?;
+        Ok(())
+    }
+
+    fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>> {
+        let mut stmt =
+            self.prepare("SELECT phase, status, ts FROM RunStatus WHERE id = 1 LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let phase: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            let ts: i64 = row.get(2)?;
+            Ok(Some((phase, status, ts)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn mark_missing_not_deleted(&self) -> DbResult<()> {
+        self.execute(
+            "INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
+             SELECT n.id, n.type, 1
+             FROM Node n
+             JOIN NodeType nt ON nt.type_index = n.type
+             LEFT JOIN PresentList p ON p.id = n.id
+             LEFT JOIN ChangeList d ON d.id = n.id AND d.is_delete = 1
+             WHERE nt.class = 'FILE_SYS'
+               AND p.id IS NULL
+               AND d.id IS NULL",
+            [],
+        )?;
+        Ok(())
     }
 }
 
@@ -627,6 +709,45 @@ impl MiscStatements for TupConnection {
         self.prune_modify_list_of_inputs_and_outputs()?;
         self.delete_nodes()?;
 
+        Ok(())
+    }
+
+    fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()> {
+        self.execute(
+            "INSERT OR REPLACE INTO RunStatus (id, phase, status, ts) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![phase, status, ts],
+        )?;
+        Ok(())
+    }
+
+    fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>> {
+        let mut stmt =
+            self.prepare("SELECT phase, status, ts FROM RunStatus WHERE id = 1 LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let phase: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            let ts: i64 = row.get(2)?;
+            Ok(Some((phase, status, ts)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn mark_missing_not_deleted(&self) -> DbResult<()> {
+        // Mark FILE_SYS nodes that are absent from PresentList and not already marked delete.
+        self.execute(
+            "INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
+             SELECT n.id, n.type, 1
+             FROM Node n
+             JOIN NodeType nt ON nt.type_index = n.type
+             LEFT JOIN PresentList p ON p.id = n.id
+             LEFT JOIN ChangeList d ON d.id = n.id AND d.is_delete = 1
+             WHERE nt.class = 'FILE_SYS'
+               AND p.id IS NULL
+               AND d.id IS NULL",
+            [],
+        )?;
         Ok(())
     }
 }

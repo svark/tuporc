@@ -29,13 +29,12 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use fs4::fs_std::FileExt;
-use tupdb::db::{
-    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, TupConnectionPool,
-};
+use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, MiscStatements, TupConnectionPool};
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::NormalPath;
 use tupparser::locate_file;
+use std::time::{SystemTime, UNIX_EPOCH};
 static TUP_DB: &str = ".tup/db";
 static IO_DB: &str = ".tup/io.db";
 mod execute;
@@ -378,6 +377,22 @@ fn main() -> Result<()> {
                 {
                     let connection_pool = start_tup_connection()
                         .wrap_err("Update action: could not establish connection to .tup/db")?;
+                    // Track run status and handle interrupted runs.
+                    {
+                        let mut conn = connection_pool.get()?;
+                        let tx = conn.transaction()?;
+                        if let Some((_phase, status, _ts)) = tx.get_run_status()? {
+                            if status == "in_progress" {
+                                tx.mark_missing_not_deleted()?;
+                            }
+                        }
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        tx.set_run_status("update", "in_progress", now)?;
+                        tx.commit()?;
+                    }
                     let skip_scan = monitor::is_monitor_running();
                     let tupfiles = scan_and_get_tupfiles(
                         &root,
@@ -402,6 +417,19 @@ fn main() -> Result<()> {
                         term_progress: term_progress.clone(),
                     };
                     execute::execute_targets(&target, root, &exec_options)?;
+                    // Mark run success
+                    {
+                        let mut conn = start_tup_connection()
+                            .wrap_err("Update action: could not establish connection to .tup/db")?
+                            .get()?;
+                        let tx = conn.transaction()?;
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        tx.set_run_status("update", "success", now)?;
+                        tx.commit()?;
+                    }
                 }
 
                 // receive events from subprocesses.
