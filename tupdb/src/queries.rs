@@ -15,6 +15,8 @@ fn internal_sqlite_error(e: AnyError) -> rusqlite::Error {
 pub trait LibSqlQueries {
     /// Fetch a node by its directory and name
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node>;
+    /// Fetch a node by its directory and name (including delete-marked rows)
+    fn fetch_node_by_dir_and_name_raw(&self, dir: i64, name: &str) -> DbResult<Node>;
 
     /// Iterate over all tupfile nodes
     fn for_each_tupnode<F>(&self, f: F) -> DbResult<()>
@@ -95,6 +97,8 @@ pub trait LibSqlQueries {
     fn fetch_io(&self, proc_id: i32) -> DbResult<Vec<(String, u8)>>;
 
     fn fetch_node_id_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<i64>;
+    /// Fetch the id of a node (including delete-marked rows)
+    fn fetch_node_id_by_dir_and_name_raw(&self, dir: i64, name: &str) -> DbResult<i64>;
 
     fn fetch_parent_rule(&self, node_id: i64) -> DbResult<i64>;
 
@@ -119,6 +123,11 @@ pub trait LibSqlQueries {
 impl LibSqlQueries for rusqlite::Connection {
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node> {
         self.fetch_node_by_dir_and_name_inner(dir, name, |row| Ok(make_node(row)?))
+            .map_err(Into::into)
+    }
+
+    fn fetch_node_by_dir_and_name_raw(&self, dir: i64, name: &str) -> DbResult<Node> {
+        self.fetch_node_by_dir_and_name_raw_inner(dir, name, |row| Ok(make_node(row)?))
             .map_err(Into::into)
     }
 
@@ -436,6 +445,14 @@ impl LibSqlQueries for rusqlite::Connection {
 
     fn fetch_node_id_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<i64> {
         let id = self.fetch_node_id_by_dir_and_name_inner(dir, name, |row| {
+            let id: i64 = row.get(0)?;
+            Ok(id)
+        })?;
+        Ok(id)
+    }
+
+    fn fetch_node_id_by_dir_and_name_raw(&self, dir: i64, name: &str) -> DbResult<i64> {
+        let id = self.fetch_node_id_by_dir_and_name_raw_inner(dir, name, |row| {
             let id: i64 = row.get(0)?;
             Ok(id)
         })?;

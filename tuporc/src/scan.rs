@@ -11,7 +11,6 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
@@ -26,7 +25,7 @@ use indicatif::ProgressBar;
 use parking_lot::Mutex;
 use tupdb::db::{Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef};
 use tupdb::deletes::LibSqlDeletes;
-use tupdb::inserts::{LibSqlInserts, TupinsertsSql};
+use tupdb::inserts::{LibSqlInserts};
 use tupdb::queries::LibSqlQueries;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -347,7 +346,7 @@ fn insert_direntries(
 
         let compute_root_sha = || compute_dir_sha256(root).ok();
 
-        let inserted = conn.fetch_upsert_node(&root_node.get_prepared_node(), || {
+        let inserted = conn.fetch_upsert_node_raw(&root_node.get_prepared_node(), || {
             compute_root_sha().unwrap_or_default()
         })?;
 
@@ -363,7 +362,8 @@ fn insert_direntries(
             .expect("Unable to prepare tup.config node for insertion");
             let pathbuf = root.join(TUP_CONFIG);
             let tup_config_sha = || compute_sha256(pathbuf.clone()).unwrap_or_default();
-            let _ = conn.fetch_upsert_node(&tup_config_node.get_prepared_node(), tup_config_sha)?;
+            let _ =
+                conn.fetch_upsert_node_raw(&tup_config_node.get_prepared_node(), tup_config_sha)?;
         }
     }
 
@@ -611,9 +611,6 @@ impl NodeUpdateState {
             modified,
         }
     }
-    pub(crate) fn get_id(&self) -> i64 {
-        self.existing_node.get_id()
-    }
     pub(crate) fn is_modified(&self) -> bool {
         self.modified
     }
@@ -623,7 +620,7 @@ impl NodeUpdateState {
 }
 
 fn fetch_node_update_state(conn: TupConnectionRef, node: &Node) -> NodeUpdateState {
-    conn.fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
+    conn.fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
         .map_or(
             NodeUpdateState::new(Node::unknown(), true),
             |existing_node| {
@@ -659,49 +656,8 @@ fn needs_update(node: &Node, existing_node: &Node) -> bool {
     }
     false
 }
-#[allow(dead_code)]
-fn check_and_send_modified_nodes(
-    pool: TupConnectionPool,
-    node_at_path: NodeAtPath,
-    node_to_insert_sender: Sender<NodeUpdateState>,
-    dirid_sender: Sender<(HashedPath, i64)>,
-) -> eyre::Result<()> {
-    let mut conn = pool.get()?;
-    {
-        let node = node_at_path.get_prepared_node();
-        let mut retries = 5; // Maximum number of retries
-        while retries > 0 {
-            let tx = conn.deferred_transaction();
-            match tx {
-                Ok(tx) => {
-                    let node_update_sta = fetch_node_update_state(tx.connection(), node);
-                    tx.rollback()?;
-                    if node.get_type() == &RowType::Dir {
-                        let id = node_update_sta.get_id();
-                        if id >= 0 {
-                            dirid_sender.send((node_at_path.get_hashed_path().clone(), id))?;
-                        }
-                    }
-                    node_to_insert_sender.send(node_update_sta)?;
-                    break;
-                }
-                Err(e) if e.is_busy() => {
-                    retries -= 1;
-                    log::warn!("Retrying to gain a read lock on database");
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => {
-                    return Err(eyre!("unable to gain a read lock on database"));
-                }
-            }
-        }
-        drop(node_to_insert_sender);
-        drop(dirid_sender);
-    }
-    Ok(())
-}
-/// For the received nodes which are already in database (uniqueness of name, dir), this will attempt to update their timestamps.
-/// Those not in database will be inserted.
+/// For the received nodes which are already in database (with the same (name, dir)), this will
+/// attempt to update their columns. Those not in database yet will be inserted.
 fn add_modify_nodes(
     conn: &mut TupConnection,
     node_at_path_receiver: Receiver<NodeAtPath>,
@@ -723,7 +679,7 @@ fn add_modify_nodes(
                 let inserted = tx.upsert_node(&node, &existing_node, compute_node_sha)?;
                 inserted.get_id()
             } else {
-                tx.add_to_present_list(existing_node.get_id(), *existing_node.get_type() as u8)?;
+                tx.mark_present(existing_node.get_id(), existing_node.get_type())?;
                 existing_node.get_id()
             };
             if is_dir {
@@ -741,11 +697,12 @@ fn add_modify_nodes(
     }
     drop(node_at_path_receiver);
     drop(dirid_sender);
+    tx.prune_delete_list_of_present()?; // remove nodes marked as present from delete list (maybe from previous scans)
     tx.add_not_present_to_delete_list()?;
     // Enrich deletions for nodes whose parent directory entries are missing (orphans)
     tx.enrich_delete_list_for_missing_dirs()?; // this ai says is needed for database integrity
     tx.enrich_delete_list_with_dir_dependents()?;
-    tx.delete_nodes()?;
+    //tx.delete_nodes()?;
     tx.commit()?;
 
     Ok(())

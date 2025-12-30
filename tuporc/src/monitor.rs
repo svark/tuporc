@@ -12,7 +12,7 @@ use crate::scan::scan_root;
 use crate::{start_tup_connection, TermProgress, IO_DB};
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
-use tupdb::db::{start_connection, RowType, TupConnection};
+use tupdb::db::{start_connection, RowType, TupConnection, TupTransaction};
 //use fs2::FileExt;
 use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
@@ -260,21 +260,14 @@ fn run_monitor(
     tupdb::db::create_dirpathbuf_temptable(conn)?;
     let bo = BufferObjects::new(root);
     let mut cross_ref_maps = CrossRefMaps::default();
-    let mut update_nodes = |path: &Path, added: bool| -> Result<()> {
+    let mut update_nodes = |tx: &TupTransaction, path: &Path, added: bool| -> Result<()> {
         if added {
             let pd = bo
                 .add_abs(path)
                 .expect("failed to add path to buffer objects");
-            let tup_connection_ref = conn.as_ref();
-            crate::parse::insert_path(
-                &tup_connection_ref,
-                &bo,
-                &pd,
-                &mut cross_ref_maps,
-                RowType::File,
-            )?;
+            crate::parse::insert_path(tx, &bo, &pd, &mut cross_ref_maps, RowType::File)?;
         } else {
-            crate::parse::remove_path(conn, &path)?;
+            crate::parse::remove_path_tx(tx, &path)?;
         }
         Ok(())
     };
@@ -294,26 +287,36 @@ fn run_monitor(
             is_file_locked_for_write(".tup/build.lock").unwrap_or(false);
         if build_in_progess != build_in_progess_new_stat {
             if !build_in_progess_new_stat {
-                let monitored_files = conn.fetch_monitored_files(generation_id)?;
-                conn.execute("DELETE from MONITORED_FILES", ())?;
+                let tx = conn.transaction()?;
+                let monitored_files = tx.fetch_monitored_files(generation_id)?;
+                tx.execute("DELETE from MONITORED_FILES", ())?;
                 for (path, added) in monitored_files {
-                    update_nodes(&Path::new(path.as_str()), added)?;
+                    update_nodes(&tx, &Path::new(path.as_str()), added)?;
                 }
+                tx.commit()?;
             }
             generation_id += 1;
             build_in_progess = build_in_progess_new_stat;
         }
+        let mut pending = Vec::new();
         while let Ok((path, added)) = path_receiver.try_recv() {
-            if build_in_progess_new_stat {
-                conn.insert_monitored(
-                    path.as_path().to_string_lossy().as_ref(),
-                    generation_id,
-                    added as _,
-                )
-                .expect("failed to add monitored file to db");
-            } else {
-                update_nodes(&path, added == 1)?;
+            pending.push((path, added));
+        }
+        if !pending.is_empty() {
+            let tx = conn.transaction()?;
+            for (path, added) in pending {
+                if build_in_progess_new_stat {
+                    tx.insert_monitored(
+                        path.as_path().to_string_lossy().as_ref(),
+                        generation_id,
+                        added as _,
+                    )
+                    .expect("failed to add monitored file to db");
+                } else {
+                    update_nodes(&tx, &path, added == 1)?;
+                }
             }
+            tx.commit()?;
         }
     }
     Ok(())

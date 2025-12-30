@@ -6,7 +6,19 @@
 -- param: name : &str - name of the node
 -- returns: i64
 SELECT id
-FROM Node
+FROM LiveNode
+where dir = :dir
+  and name = :name;
+-- <eos>
+
+-- name: fetch_node_id_by_dir_and_name_raw_inner?
+-- Fetch the id of a node (including deleted)
+-- # Parameters
+-- param: dir : i64 - directory of the node as id
+-- param: name : &str - name of the node
+-- returns: i64
+SELECT id
+FROM RawNode
 where dir = :dir
   and name = :name;
 -- <eos>
@@ -17,7 +29,7 @@ where dir = :dir
 -- param: id : i64 - id of the node
 -- returns: Node
 SELECT *
-FROM Node
+FROM LiveNode
 where id = :id
 LIMIT 1;
 -- <eos>
@@ -27,7 +39,7 @@ LIMIT 1;
 -- param: id : i64 - id of the node
 -- returns: String
 SELECT name
-FROM Node
+FROM LiveNode
 where id = :id
 LIMIT 1;
 -- <eos>
@@ -39,7 +51,19 @@ LIMIT 1;
 -- param: name : &str - name of the node
 -- returns: Node
 SELECT *
-FROM Node
+FROM LiveNode
+where dir = :dir
+  and name = :name;
+-- <eos>
+
+-- name: fetch_node_by_dir_and_name_raw_inner?
+-- Fetch a node by directory id and name (including deleted)
+-- # Parameters
+-- param: dir : i64 - directory id
+-- param: name : &str - name of the node
+-- returns: Node
+SELECT *
+FROM RawNode
 where dir = :dir
   and name = :name;
 -- <eos>
@@ -49,7 +73,7 @@ where dir = :dir
 -- # Parameters
 -- param: dir : i64 - directory id
 SELECT id
-FROM Node
+FROM LiveNode
 where dir = :dir
   and type = (SELECT type_index from NodeType where type = 'Rule');
 -- <eos>
@@ -57,7 +81,7 @@ where dir = :dir
 -- name: for_each_gen_file_inner&
 -- Fetch all the nodes
 SELECT n.id, n.dir, n.type, dpb.name || '/' || n.name, n.mtime_ns
-from Node n
+from LiveNode n
          JOIN DirPathBuf dpb on n.dir = dpb.id
 where n.type = (SELECT type_index from NodeType where type = 'GenF');
 -- <eos>
@@ -68,7 +92,7 @@ where n.type = (SELECT type_index from NodeType where type = 'GenF');
 -- param: node_id : i64 - id of the node
 -- returns: String
 SELECT flags
-from Node
+from LiveNode
 where id = :node_id;
 -- <eos>
 
@@ -78,7 +102,7 @@ where id = :node_id;
 -- param: node_id : i64 - id of the node
 -- returns: i64
 SELECT srcid
-from Node
+from LiveNode
 where id = :node_id;
 -- <eos>
 
@@ -88,7 +112,7 @@ where id = :node_id;
 -- param: dir_id : i64 - id of the directory
 -- returns: i64
 SELECT id
-from Node
+from LiveNode
 where type = (SELECT type_index from NodeType where type = 'Glob')
   and dir = :dir_id;
 -- <eos>
@@ -142,8 +166,8 @@ where dir in
              (WITH RECURSIVE dependents(x) AS (SELECT :rule_id
                                                UNION
                                                SELECT to_id
-                                               FROM NormalLink
-                                                        JOIN dependents ON NormalLink.from_id = x)
+                                               FROM LiveNormalLink
+                                                        JOIN dependents ON LiveNormalLink.from_id = x)
               SELECT DISTINCT x
               FROM dependents));
 -- <eos>
@@ -169,7 +193,7 @@ SELECT Node.id,
        Node.type,
        (DirPathBuf.name || '/' || Node.name) name,
        Node.mtime_ns                         mtime_ns
-from NODE
+from LiveNode as Node
          inner join DirPathBuf on (Node.dir = DirPathBuf.id)
 where Node.srcid = :rule_id
   and Node.type = (SELECT type_index from NodeType where type = 'GenF');
@@ -184,9 +208,9 @@ SELECT Node.id   as                          id,
        Node.type as                          type,
        (DirPathBuf.name || '/' || Node.name) AS name,
        Node.mtime_ns                         AS mtime_ns
-from NODE
+from LiveNode as Node
          join DirPathBuf on (Node.dir = DirPathBuf.id)
-         join NormalLink nl on (Node.id = nl.from_id)
+         join LiveNormalLink nl on (Node.id = nl.from_id)
 where (Node.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
   and nl.to_id = :node_id;
 -- <eos>
@@ -198,8 +222,8 @@ where (Node.type in (SELECT type_index from NodeType where class = 'FILE_SYS'))
 -- param: group: &str - name of the group
 -- returns: i64
 SELECT id
-from Node n
-         JOIN NormalLink nl on (n.id = nl.from_id)
+from LiveNode n
+         JOIN LiveNormalLink nl on (n.id = nl.from_id)
 where n.type in (SELECT type_index from NodeType where type = 'Group')
   and nl.to_id = :rule_id
   and n.name = :group
@@ -212,10 +236,10 @@ LIMIT 1;
 -- # Parameters
 -- param: glob_id : i64 - id of the glob node
 SELECT n.id
-FROM Node as n
+FROM LiveNode as n
          JOIN DirPathBuf as dpb ON n.dir = dpb.id
-         JOIN NormalLink as gwd ON dpb.id = gwd.from_id
-         JOIN Node as n2 ON gwd.from_id = n2.id
+         JOIN LiveNormalLink as gwd ON dpb.id = gwd.from_id
+         JOIN LiveNode as n2 ON gwd.from_id = n2.id
 WHERE n.name GLOB n2.name
   AND dpb.name GLOB n2.display_str
   AND gwd.to_id = :glob_id
@@ -229,7 +253,7 @@ WHERE n.name GLOB n2.name
 -- param: dirpath : &str - path of the directory
 -- returns: Node
 SELECT *
-FROM Node n
+FROM LiveNode n
          JOIN DirPathBuf dpb on dpb.id = n.dir
 where n.name = :name
   and dpb.name = :dirpath
@@ -252,7 +276,7 @@ where pid = :pid;
 -- param: name: &str - env variable name
 -- returns: (i64, String)
 Select id, display_str
-from Node
+from LiveNode
 where name = :name
   and dir = -2
 LIMIT 1;
@@ -263,8 +287,8 @@ LIMIT 1;
 -- # Parameters
 -- param: rule_id : i64 - id of the rule
 SELECT name
-from Node as n
-         join NormalLink as nl on n.id = nl.to_id
+from LiveNode as n
+         join LiveNormalLink as nl on n.id = nl.to_id
 where nl.from_id = :rule_id
   and n.dir = -2;
 -- <eos>
@@ -297,26 +321,26 @@ limit 1;
 WITH RECURSIVE parentDirectories as (
     -- anchor member: start with the current directory entry
     Select id, name, dir
-    From node
+    From LiveNode
     Where id = :dir
 
     Union All
 
     -- continue to find parent directories until dir = 0
     Select n.id, n.name, n.dir
-    From node n
+    From LiveNode n
              Inner Join parentDirectories pd on n.id = pd.dir
     Where pd.dir != 0)
 Select f.name, f.dir
 From parentDirectories pd
-         Join node f on f.dir = pd.id and f.name = :name
+         Join LiveNode f on f.dir = pd.id and f.name = :name
 LIMIT 1;
 -- <eos>
 
 -- name: for_each_rule_to_run_no_targets_inner&
 -- Fetch the rules to run with no targets
 SELECT n.id, n.dir, n.name, n.display_str, n.flags, n.srcid
-from Node n
+from LiveNode n
          JOIN ModifyList ML on n.id = ML.id
 where ML.type = 1;
 -- 1 is the  node type for a rule
@@ -325,7 +349,7 @@ where ML.type = 1;
 -- name: for_each_task_to_run_no_targets_inner&
 -- Fetch the tasks to run with no targets
 SELECT n.id, n.dir, n.name, n.display_str, n.flags, n.srcid
-from Node n
+from LiveNode n
          JOIN ModifyList ML on n.id = ML.id
 where ML.type = 10;
 -- 10 is the  node type for a task
@@ -335,13 +359,13 @@ where ML.type = 10;
 -- name: for_each_link_inner&
 -- Fetch the links
 SELECT from_id, to_id
-from NormalLink;
+from LiveNormalLink;
 -- <eos>
 
 -- name: fetch_maybe_changed_globs_inner&
 -- Fetch the globs with modified search directories
 SELECT DISTINCT gwd.to_id
-from NormalLink as gwd
+from LiveNormalLink as gwd
          JOIN ChangeList as cl on gwd.from_id = cl.id
 where gwd.to_type = (SELECT type_index from NodeType where type = 'Glob');
 -- <eos>
@@ -367,7 +391,7 @@ WITH RECURSIVE sub_tree AS (
              JOIN sub_tree st ON dt.dir = st.id
         AND (st.depth < :glob_depth))
 SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
-FROM Node n
+FROM LiveNode n
          JOIN sub_tree as st on n.dir = st.id
 WHERE n.name GLOB :glob_pattern
   AND st.name GLOB :glob_dir_pattern
@@ -381,7 +405,7 @@ ORDER BY n.id;
 -- param: glob_dir_id : i64 - id of the directory containing the glob
 -- param: glob_pattern : &str - glob pattern to match file names
 SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
-FROM Node n
+FROM LiveNode n
          join DIRPATHBUF as st on st.id = n.dir
 WHERE st.id = :glob_dir_id
   and n.name GLOB :glob_pattern
@@ -393,7 +417,7 @@ ORDER BY n.id;
 -- Find immediate subdirectories of a directory
 -- # Parameters
 -- param: dir_id : i64 - id of the directory
-SELECT id, name FROM Node WHERE dir = :dir_id AND (type in (SELECT type_index from NodeType where type LIKE 'Dir%'));
+SELECT id, name FROM LiveNode WHERE dir = :dir_id AND (type in (SELECT type_index from NodeType where type LIKE 'Dir%'));
 -- <eos>
 
 -- name: for_each_glob_dir_inner&

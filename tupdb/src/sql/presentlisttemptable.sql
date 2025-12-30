@@ -1,5 +1,5 @@
 DROP TABLE IF EXISTS PresentList;
-CREATE TEMP TABLE PresentList
+CREATE TABLE PresentList
 (
     id   INTEGER PRIMARY KEY not NULL,
     type INTEGER

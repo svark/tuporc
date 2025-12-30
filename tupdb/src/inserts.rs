@@ -38,6 +38,12 @@ pub trait LibSqlInserts {
         node: &Node,
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError>;
+    /// Same as fetch_upsert_node but does not hide delete-marked rows (used during scan).
+    fn fetch_upsert_node_raw(
+        &self,
+        node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError>;
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
@@ -66,6 +72,7 @@ pub trait LibSqlInserts {
     fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()>;
+    fn replace_node_sha(&self, node_id: i64, sha: impl FnMut() -> String) -> DbResult<UpsertStatus>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
@@ -230,6 +237,16 @@ impl LibSqlInserts for Connection {
             .unwrap_or(Node::unknown());
         self.upsert_node(node, &existing_node, compute_sha)
     }
+    fn fetch_upsert_node_raw(
+        &self,
+        node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError> {
+        let existing_node = self
+            .fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
+            .unwrap_or(Node::unknown());
+        self.upsert_node(node, &existing_node, compute_sha)
+    }
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()> {
         self.add_to_modify_list(id, *rtype as u8)?;
         Ok(())
@@ -369,17 +386,40 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-   
+    fn replace_node_sha(&self, node_id: i64, mut sha: impl FnMut() -> String) -> DbResult<UpsertStatus>
+    {
+        let s =  self.fetch_saved_nodesha256(node_id);
+        if s.is_err()
+        {
+            Ok(UpsertStatus::Unchanged(node_id))
+
+        } else {
+            let oldsha = sha();
+            if oldsha.ne(&s.unwrap()) {
+                self.update_node_sha_exec(node_id, oldsha.as_str())?;
+                Ok(UpsertStatus::Updated(node_id))
+            }else {
+                Ok(UpsertStatus::Unchanged(node_id))
+            }
+        }
+    }
 
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus> {
-        if self
+        enum Status { Present, Absent, PresentButDiff }
+        let s =  self
             .fetch_saved_nodesha256(node_id)
-            .map_or(true, |old_sha| sha.ne(&old_sha))
-        {
-            self.update_node_sha_exec(node_id, sha)?;
-            Ok(UpsertStatus::Inserted(node_id))
-        } else {
-            Ok(UpsertStatus::Unchanged(node_id))
+            .map_or(Status::Absent,
+                    |oldsha| if oldsha.ne(sha) { Status::PresentButDiff } else { Status::Present });
+        match s {
+            Status::Absent => {
+                self.update_node_sha_exec(node_id, sha)?;
+                Ok(UpsertStatus::Inserted(node_id))
+            },
+            Status::PresentButDiff => {
+                self.update_node_sha_exec(node_id, sha)?;
+                Ok(UpsertStatus::Updated(node_id))
+            },
+            Status::Present => Ok(UpsertStatus::Unchanged(node_id)),
         }
     }
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()> {

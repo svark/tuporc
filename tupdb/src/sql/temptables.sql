@@ -1,10 +1,10 @@
-DROP TABLE IF EXISTS PresentList;
-CREATE TEMP TABLE PresentList
+CREATE TABLE IF NOT EXISTS PresentList
 (
     id   INTEGER PRIMARY KEY not NULL,
     type INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_PresentList_id ON PresentList(id);
+DELETE FROM PresentList;
 
 DROP TABLE IF EXISTS SuccessList;
 Create Table SuccessList

@@ -497,9 +497,15 @@ impl DbPathSearcher {
         }
     }
 
-    pub fn update_delete_list(&self) -> Result<()> {
+    pub fn delete_orphaned_tupentries(&self) -> Result<()> {
         let conn = self.conn.get()?;
         conn.deref().delete_orphaned_tupentries()?;
+        Ok(())
+    }
+
+    pub fn delete_nodes(&self) -> Result<()> {
+        let conn = self.conn.get()?;
+        conn.deref().delete_nodes()?;
         Ok(())
     }
 
@@ -753,7 +759,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         //conn.enrich_modified_list()?;
-
+        conn.delete_tupfile_entries_not_in_present_list()?;
         {
             let tp = term_progress.clone();
             tp.set_main_with_len("Enriching modified list", 7);
@@ -776,13 +782,14 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             pb_main.inc(1);
             conn.prune_modify_list_of_inputs_and_outputs()?;
             pb_main.inc(1);
-            conn.delete_nodes()?;
             pb_main.finish_with_message("Done enriching modified list");
         }
         conn.mark_tupfile_entries(&tupfile_ids)?;
     }
-    parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
-
+    let parser = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
+    let dbref = parser.get_mut_searcher();
+    dbref.deref().delete_orphaned_tupentries()?;
+    dbref.deref().delete_nodes()?;
     Ok(())
 }
 
@@ -875,7 +882,7 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
 }
 
 fn insert_links(
-    conn: &mut TupConnection,
+    tx: &mut TupTransaction,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
@@ -885,12 +892,11 @@ fn insert_links(
         for tupfile_read in resolved_rules.get_tupfiles_read() {
             link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
         }
-        add_links_from_to_globs(conn, resolved_rules, crossref, &mut link_collector)
+        add_links_from_to_globs(&tx.connection(), resolved_rules, crossref, &mut link_collector)
             .context("Inserting links from/to globs")?;
         add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
         link_collector.links()
     };
-    let tx = conn.transaction()?;
     {
         for l in links {
             insert_link(&tx, l, crossref).wrap_err_with(|| {
@@ -902,7 +908,6 @@ fn insert_links(
             })?;
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -932,7 +937,7 @@ fn add_links_from_to_rules_and_groups(
 }
 
 fn add_links_from_to_globs(
-    conn: &mut TupConnection,
+    conn: &TupConnectionRef,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
     link_collector: &mut LinkCollector,
@@ -1084,7 +1089,7 @@ fn parse_and_add_rules_to_db(
     mut parser: TupParser<DbPathSearcher>,
     tupfiles: &[Node],
     term_progress: &TermProgress,
-) -> Result<()> {
+) -> Result<TupParser<DbPathSearcher>> {
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let (sender, receiver) = crossbeam::channel::unbounded();
     term_progress.set_message("Parsing Tupfiles");
@@ -1156,16 +1161,18 @@ fn parse_and_add_rules_to_db(
         //let mut crossref = CrossRefMaps::default();
         let outs = parser.get_outs();
         let parser_c = parser.clone();
-        let mut insert_to_db = move |resolved_rules: ResolvedRules| -> Result<()> {
-            let binding = parser_c.get_mut_searcher();
-            let conn = &mut binding.conn.get()?;
-            check_uniqueness_of_parent_rule(conn, &rwbufs, &outs, &mut crossref)?;
-            insert_nodes(conn, &rwbufs, &resolved_rules, &mut crossref)?;
-            let _ = insert_links(conn, &resolved_rules, &mut crossref)?;
+        let psx = parser_c.get_mut_searcher();
+        let mut c = psx.conn.get()?;
+        let mut tx = c.transaction()?;
+        let mut insert_to_db =  |resolved_rules: ResolvedRules| -> Result<()> {
+            //let conn = &mut binding.conn.get()?;
+            check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
+            insert_nodes(&mut tx, &rwbufs, &resolved_rules, &mut crossref)?;
+            let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
             let (dbid, _) = crossref
                 .get_tup_db_id(resolved_rules.get_tupid())
                 .expect("tupfile dbid fetch failed");
-            conn.unmark_modified(dbid)?;
+            tx.unmark_modified(dbid)?;
             Ok(())
         };
         let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
@@ -1217,21 +1224,19 @@ fn parse_and_add_rules_to_db(
         Ok(())
     })
     .expect("Thread error while fetching resolved rules from tupfiles")?;
-    let ps = parser.get_mut_searcher();
-    ps.deref().update_delete_list()?;
-    Ok(())
+    Ok(parser)
 }
 
 /// checks that in  parsed tup files, no two  rules/tasks produce the same output
 fn check_uniqueness_of_parent_rule(
-    conn: &mut TupConnection,
+    conn: &TupConnectionRef,
     read_buf: &ReadWriteBufferObjects,
     outs: &impl OutputHandler,
     crossref: &mut CrossRefMaps,
 ) -> Result<()> {
     for o in outs.get_output_files().iter() {
         let np = read_buf.get_path(o);
-        if let Ok(node) = find_by_path(np.as_path(), &conn.as_ref()) {
+        if let Ok(node) = find_by_path(np.as_path(), conn) {
             // Identify the current rule (producer) from parser context
             let current_parent_rule_ref = outs
                 .get_parent_rule(o)
@@ -1281,11 +1286,11 @@ fn find_node_id_by_path(conn: &TupConnectionRef, path: &Path) -> Result<i64, Any
 }
 
 /// removes the path from the database
-pub(crate) fn remove_path<P: AsRef<Path>>(conn: &TupConnection, path: P) -> Result<()> {
-    let connection_ref = conn.as_ref();
+/// uses the transaction's connection and does not commit.
+pub(crate) fn remove_path_tx<P: AsRef<Path>>(tx: &TupTransaction, path: P) -> Result<()> {
+    let connection_ref = tx.connection();
     if let Ok(node) = find_by_path(path.as_ref(), &connection_ref) {
-        //  add it to the deletelist table
-        conn.mark_deleted(node.get_id(), node.get_type())?;
+        tx.mark_deleted(node.get_id(), node.get_type())?;
     }
     Ok(())
 }
@@ -1293,7 +1298,7 @@ pub(crate) fn remove_path<P: AsRef<Path>>(conn: &TupConnection, path: P) -> Resu
 /// inserts a path into the database,
 /// After insertion, the path also appears in crossref maps as a bimap source and target <-> db_id
 pub(crate) fn insert_path(
-    conn: &TupConnectionRef,
+    tx: &TupTransaction,
     path_buffers: &impl PathBuffers,
     pd: &PathDescriptor,
     cross_ref_maps: &mut CrossRefMaps,
@@ -1317,7 +1322,7 @@ pub(crate) fn insert_path(
                 Ok((path_db_id, path_parent_db_id, path_so_far.join(name))) // call insert once and reuse
             } else {
                 let (nid, dir) = insert_node_in_dir(
-                    conn,
+                    tx,
                     name.to_string_lossy(),
                     path_so_far.as_path(),
                     dir,
@@ -1330,7 +1335,7 @@ pub(crate) fn insert_path(
     )?;
     let name = pd.get_file_name_os_str();
     insert_node_in_dir(
-        conn,
+        tx,
         name.to_string_lossy(),
         path_buffers.get_path_ref(pd),
         nid,
@@ -1340,7 +1345,7 @@ pub(crate) fn insert_path(
 
 /// inserts a node into the database. This is an upsert operation and will not modify the node if it already exists with same values
 fn insert_node_in_dir(
-    conn: &TupConnectionRef,
+    tx: &TupTransaction,
     name: Cow<str>,
     path: &Path,
     dir: i64,
@@ -1358,7 +1363,7 @@ fn insert_node_in_dir(
     {
         let in_node = node_at_path.get_prepared_node();
         let pbuf = node_at_path.get_hashed_path().clone();
-        let node = conn.fetch_upsert_node(in_node, || compute_path_hash(is_dir, pbuf.clone()))?;
+        let node = tx.fetch_upsert_node_raw(in_node, || compute_path_hash(is_dir, pbuf.clone()))?;
         Ok((node.get_id(), dir))
     } else {
         log::warn!("Error while inserting path: {:?}", path);
@@ -1376,7 +1381,7 @@ pub(crate) fn compute_path_hash(is_dir: bool, pbuf: HashedPath) -> String {
 
 /// Before we insert a child node, insert its parent and record its db id in cross_ref_maps against parent's PathDescriptor
 fn ensure_parent_inserted(
-    conn: &TupConnectionRef,
+    tx: &TupTransaction,
     path_buffers: &impl PathBuffers,
     cross_ref_maps: &mut CrossRefMaps,
     rtype: &RowType,
@@ -1396,12 +1401,12 @@ fn ensure_parent_inserted(
         return Ok((dir, pardir));
     }
 
-    let (dir, pardir) = find_by_path(parent_path.as_path(), conn)
+    let (dir, pardir) = find_by_path(parent_path.as_path(), &tx.connection())
         .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
             // try adding parent directory if not in db
             let (dir, pardir) =
-                insert_path(conn, path_buffers, parent, cross_ref_maps, pardir_type)?;
+                insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type)?;
             Ok((dir, pardir))
         })?;
     Ok((dir, pardir))
@@ -1673,7 +1678,7 @@ impl Collector {
 
 /// nodes to insert after rules have been resolved
 fn insert_nodes(
-    conn: &mut TupConnection,
+    tx: &mut TupTransaction,
     read_write_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
@@ -1754,7 +1759,7 @@ fn insert_nodes(
         }
     });
 
-    let tx = conn.transaction()?;
+    //let tx = conn.transaction()?;
     {
         let parent_descriptors = nodes
             .iter()
@@ -1762,9 +1767,9 @@ fn insert_nodes(
 
         for (parent_desc, rowtype) in parent_descriptors {
             if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
-                let connection_ref = tx.connection();
+             //   let connection_ref = tx.connection();
                 let (parid, parparid) = ensure_parent_inserted(
-                    &connection_ref,
+                    &tx,
                     read_write_buf.get(),
                     crossref,
                     &rowtype,
@@ -1817,7 +1822,7 @@ fn insert_nodes(
             }
         }
     }
-    tx.commit()?;
+  //  tx.commit()?;
 
     // some validity checks after inserting nodes to see if the db is consistent
     let rules = resolved_rules.rules_by_tup();

@@ -105,6 +105,35 @@ CREATE VIEW DeleteList AS
 SELECT id, type
 from ChangeList
 where is_delete = 1;
+
+-- Persisted list of currently present filesystem nodes (rebuilt each scan/parse).
+CREATE TABLE IF NOT EXISTS PresentList
+(
+    id   INTEGER PRIMARY KEY not NULL,
+    type INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_PresentList_id ON PresentList(id);
+
+-- Raw views (no filtering) for scan-time queries.
+CREATE VIEW RawNode AS
+SELECT *
+FROM Node;
+
+CREATE VIEW RawNormalLink AS
+SELECT from_id, to_id, is_sticky, to_type
+FROM NormalLink;
+
+-- LiveNode/LiveNormalLink filter out rows marked for deletion in ChangeList.
+CREATE VIEW LiveNode AS
+SELECT *
+FROM Node n
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.is_delete = 1);
+
+CREATE VIEW LiveNormalLink AS
+SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type
+FROM NormalLink nl
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.is_delete = 1)
+  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.is_delete = 1);
 --- Pragma settings for the database
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
