@@ -906,11 +906,12 @@ fn insert_links(
     };
     {
         for l in links {
-            insert_link(&tx, l, crossref).wrap_err_with(|| {
+            insert_link(&tx, l, crossref).map_err(|e| {
                 eyre!(
-                    "error while inserting link {:?} in tupfile {:?}",
+                    "error while inserting link {:?} in tupfile {:?} due to :{}",
                     l,
-                    resolved_rules.get_tupid()
+                    resolved_rules.get_tupid(),
+                    e
                 )
             })?;
         }
@@ -1137,6 +1138,7 @@ fn parse_and_add_rules_to_db(
                 .get_tup_db_id(resolved_rules.get_tupid())
                 .expect("tupfile dbid fetch failed");
             tx.unmark_modified(dbid)?;
+            tx.commit()?;
             Ok(())
         };
         let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
