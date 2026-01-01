@@ -572,7 +572,9 @@ impl DbPathSearcher {
                 fetch_row,
                 2,
             )?;
-            return Ok(num_matches);
+            if num_matches != 0 {
+                return Ok(num_matches);
+            }
         }
         log::warn!("no rows found for any glob pattern: {:?}", glob_paths);
         Err(AnyError::query_returned_no_rows())
@@ -694,6 +696,11 @@ impl PathSearcher for DbPathSearcher {
     fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
         OutputHandler::merge(&mut self.psx, p, o)
     }
+    fn is_dir(&self, pd: &PathDescriptor) -> (bool, i64) {
+        let conn = self.conn.get().expect("connection not found");
+        conn.fetch_dirid_by_path(pd.get_path_ref()).map(|id| (true, id))
+            .unwrap_or((false, -1))
+    }
 }
 
 pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
@@ -741,11 +748,6 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     {
         let mut conn = connection.get()?;
         let tx = conn.transaction()?;
-        if let Some((_phase, status, _ts)) = tx.get_run_status()? {
-            if status == "in_progress" {
-                tx.mark_missing_not_deleted()?;
-            }
-        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

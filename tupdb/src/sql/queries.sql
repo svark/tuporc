@@ -386,11 +386,11 @@ WITH RECURSIVE sub_tree AS (
     UNION ALL
 
     -- Recursive step: Find children that are directories
-    SELECT st.id, st.dir, st.name, st.depth + 1 AS depth
+    SELECT dt.id, dt.dir, dt.name, st.depth + 1 AS depth
     FROM DirPathBuf dt
              JOIN sub_tree st ON dt.dir = st.id
         AND (st.depth < :glob_depth))
-SELECT n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
+SELECT DISTINCT  n.id, n.dir, n.type, st.name || '/' || n.name, n.mtime_ns
 FROM LiveNode n
          JOIN sub_tree as st on n.dir = st.id
 WHERE n.name GLOB :glob_pattern

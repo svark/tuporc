@@ -23,7 +23,7 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use parking_lot::Mutex;
-use tupdb::db::{Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef};
+use tupdb::db::{MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef};
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::inserts::{LibSqlInserts};
 use tupdb::queries::LibSqlQueries;
@@ -579,7 +579,13 @@ fn insert_direntries(
             eyre::bail!(e.to_string())
         }
         Ok(())
-    })
+    })?;
+    // PresentList is fully populated after scan; now mark missing filesystem nodes.
+    {
+        let conn = pool.get().expect("unable to get connection from pool");
+        conn.mark_missing_not_deleted()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {

@@ -344,12 +344,12 @@ impl LibSqlQueries for rusqlite::Connection {
             .parent()
             .map(|p| p.components().count())
             .unwrap_or_default();
-        if depth > 1 {
+        if depth >= 1 {
             let glob_file_pattern = path.file_name().unwrap().to_string_lossy();
             let glob_dir_pattern = path.parent().unwrap().to_string_lossy();
             self.for_each_glob_match_inner(
                 glob_dirid,
-                depth as i64,
+                (depth + 1) as i64,
                 glob_file_pattern.as_ref(),
                 glob_dir_pattern.as_ref(),
                 |row| {

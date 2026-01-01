@@ -735,6 +735,15 @@ impl MiscStatements for TupConnection {
     }
 
     fn mark_missing_not_deleted(&self) -> DbResult<()> {
+        // If PresentList is empty, treating everything as missing would mark the whole tree
+        // for deletion. Skip in that case and let the next scan rebuild.
+        let present_count: i64 = self
+            .query_row("SELECT COUNT(1) FROM PresentList", [], |row| row.get(0))
+            .unwrap_or(0);
+        if present_count == 0 {
+            log::warn!("PresentList is empty; skipping mark_missing_not_deleted to avoid mass deletes");
+            return Ok(());
+        }
         // Mark FILE_SYS nodes that are absent from PresentList and not already marked delete.
         self.execute(
             "INSERT OR REPLACE INTO ChangeList (id, type, is_delete)

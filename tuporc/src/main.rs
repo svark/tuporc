@@ -381,11 +381,6 @@ fn main() -> Result<()> {
                     {
                         let mut conn = connection_pool.get()?;
                         let tx = conn.transaction()?;
-                        if let Some((_phase, status, _ts)) = tx.get_run_status()? {
-                            if status == "in_progress" {
-                                tx.mark_missing_not_deleted()?;
-                            }
-                        }
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
