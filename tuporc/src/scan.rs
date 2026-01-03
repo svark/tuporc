@@ -23,9 +23,11 @@ use eyre::eyre;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use parking_lot::Mutex;
-use tupdb::db::{MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef};
+use tupdb::db::{
+    MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef,
+};
 use tupdb::deletes::LibSqlDeletes;
-use tupdb::inserts::{LibSqlInserts};
+use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -630,16 +632,10 @@ fn fetch_node_update_state(conn: TupConnectionRef, node: &Node) -> NodeUpdateSta
         .map_or(
             NodeUpdateState::new(Node::unknown(), true),
             |existing_node| {
-                if needs_update(node, &existing_node) {
-                    NodeUpdateState {
-                        existing_node,
-                        modified: true,
-                    }
-                } else {
-                    NodeUpdateState {
-                        existing_node,
-                        modified: false,
-                    }
+                let modified = needs_update(node, &existing_node);
+                NodeUpdateState {
+                    existing_node,
+                    modified,
                 }
             },
         )

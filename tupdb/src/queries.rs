@@ -127,6 +127,7 @@ impl LibSqlQueries for rusqlite::Connection {
     }
 
     fn fetch_node_by_dir_and_name_raw(&self, dir: i64, name: &str) -> DbResult<Node> {
+        debug_assert!(dir >= 0, "directory id missing");
         self.fetch_node_by_dir_and_name_raw_inner(dir, name, |row| Ok(make_node(row)?))
             .map_err(Into::into)
     }

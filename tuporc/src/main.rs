@@ -124,11 +124,11 @@ impl TermProgress {
             pb.tick();
         }
         if let Some(l) = self.pb_main.length() {
-            if l > pb.position() {
-                pb.inc(1);
+            if l > self.pb_main.position() {
+                self.pb_main.inc(1);
             }
         } else {
-            pb.tick();
+            self.pb_main.tick();
         }
     }
 
@@ -208,6 +208,9 @@ enum Action {
         keep_going: bool,
         #[arg(short = 'j', long = "num-jobs", default_value = "0")]
         num_jobs: usize,
+        /// Skip scanning the filesystem before build
+        #[clap(short = 's', long = "skip-scan", default_value = "false")]
+        skip_scan: bool,
     },
     #[clap(about = "Monitor the filesystem for changes")]
     Monitor {
@@ -236,6 +239,7 @@ fn main() -> Result<()> {
             target: Vec::new(),
             keep_going: false,
             num_jobs: 0,
+            skip_scan: false,
         })
     }) {
         match act {
@@ -319,6 +323,7 @@ fn main() -> Result<()> {
                 mut target,
                 keep_going,
                 num_jobs,
+                skip_scan,
             } => {
                 #[cfg(windows)]
                 {
@@ -388,7 +393,7 @@ fn main() -> Result<()> {
                         tx.set_run_status("update", "in_progress", now)?;
                         tx.commit()?;
                     }
-                    let skip_scan = monitor::is_monitor_running();
+                    let skip_scan = monitor::is_monitor_running() || skip_scan;
                     let tupfiles = scan_and_get_tupfiles(
                         &root,
                         connection_pool.clone(),
