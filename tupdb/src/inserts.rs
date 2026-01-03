@@ -72,7 +72,8 @@ pub trait LibSqlInserts {
     fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()>;
     fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()>;
-    fn replace_node_sha(&self, node_id: i64, sha: impl FnMut() -> String) -> DbResult<UpsertStatus>;
+    fn replace_node_sha(&self, node_id: i64, sha: impl FnMut() -> String)
+        -> DbResult<UpsertStatus>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
@@ -127,7 +128,7 @@ impl LibSqlInserts for Connection {
         &self,
         node: &Node,
         existing_node: &Node,
-        mut compute_sha256: impl FnMut() -> String,
+        compute_sha256: impl FnMut() -> String,
     ) -> Result<(), AnyError> {
         let mut modify = false;
         // verify that columns of this row are the same as `node`'s, if not update them
@@ -158,10 +159,8 @@ impl LibSqlInserts for Connection {
             );
             self.update_mtime_ns(node.get_mtime(), existing_node.get_id())?;
             modify = true;
-            let sha256 = compute_sha256();
-            if self
-                .upsert_node_sha(existing_node.get_id(), sha256.as_str())?
-                .is_unchanged()
+            if self.replace_node_sha(existing_node.get_id(), compute_sha256).map(|x|
+                x.is_unchanged() ).unwrap_or(false)
             {
                 modify = false;
             }
@@ -386,39 +385,49 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn replace_node_sha(&self, node_id: i64, mut sha: impl FnMut() -> String) -> DbResult<UpsertStatus>
-    {
-        let s =  self.fetch_saved_nodesha256(node_id);
-        if s.is_err()
-        {
+    fn replace_node_sha(
+        &self,
+        node_id: i64,
+        mut sha: impl FnMut() -> String,
+    ) -> DbResult<UpsertStatus> {
+        let s = self.fetch_saved_nodesha256(node_id);
+        if s.is_err() {
             Ok(UpsertStatus::Unchanged(node_id))
-
         } else {
             let oldsha = sha();
             if oldsha.ne(&s.unwrap()) {
                 self.update_node_sha_exec(node_id, oldsha.as_str())?;
                 Ok(UpsertStatus::Updated(node_id))
-            }else {
+            } else {
                 Ok(UpsertStatus::Unchanged(node_id))
             }
         }
     }
 
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus> {
-        enum Status { Present, Absent, PresentButDiff }
-        let s =  self
+        enum Status {
+            Present,
+            Absent,
+            PresentButDiff,
+        }
+        let s = self
             .fetch_saved_nodesha256(node_id)
-            .map_or(Status::Absent,
-                    |oldsha| if oldsha.ne(sha) { Status::PresentButDiff } else { Status::Present });
+            .map_or(Status::Absent, |oldsha| {
+                if oldsha.ne(sha) {
+                    Status::PresentButDiff
+                } else {
+                    Status::Present
+                }
+            });
         match s {
             Status::Absent => {
                 self.update_node_sha_exec(node_id, sha)?;
                 Ok(UpsertStatus::Inserted(node_id))
-            },
+            }
             Status::PresentButDiff => {
                 self.update_node_sha_exec(node_id, sha)?;
                 Ok(UpsertStatus::Updated(node_id))
-            },
+            }
             Status::Present => Ok(UpsertStatus::Unchanged(node_id)),
         }
     }

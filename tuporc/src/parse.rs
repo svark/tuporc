@@ -1137,7 +1137,6 @@ fn parse_and_add_rules_to_db(
             let psx = parser_c.get_searcher();
             let mut c = psx.conn.get()?;
             let mut tx = c.transaction()?;
-            check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
             insert_nodes(
                 &mut tx,
                 &rwbufs,
@@ -1146,6 +1145,7 @@ fn parse_and_add_rules_to_db(
                 term_progress,
                 Some(&pb_insert),
             )?;
+            check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
             let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
             let (dbid, _) = crossref
                 .get_tup_db_id(resolved_rules.get_tupid())
@@ -1295,43 +1295,56 @@ pub(crate) fn insert_path(
     cross_ref_maps: &mut CrossRefMaps,
     rtype: RowType,
 ) -> Result<(i64, i64)> {
-    let parent_pd = path_buffers.get_parent_id(pd);
-    if parent_pd.is_root() {
-        return Ok((0, 0));
+    if let Some((id, parent_id)) = cross_ref_maps.get_path_db_id(pd) {
+        return Ok((id, parent_id));
     }
+    let parent_pd = path_buffers.get_parent_id(pd);
     let rtype_parent = if rtype.is_generated() {
         DirGen // if the node parent is not inserted yet, it is a generated directory
     } else {
         Dir
     };
-    let (nid, _dir, _) = parent_pd.components().try_fold(
-        (0i64, -1, path_buffers.get_root_dir().to_path_buf()),
-        |acc, c| -> Result<(i64, i64, PathBuf)> {
-            let (dir, _, path_so_far) = acc;
-            let name = c.get_file_name_os_str();
-            if let Some((path_db_id, path_parent_db_id)) = cross_ref_maps.get_path_db_id(&c) {
-                Ok((path_db_id, path_parent_db_id, path_so_far.join(name))) // call insert once and reuse
-            } else {
-                let (nid, dir) = insert_node_in_dir(
-                    tx,
-                    name.to_string_lossy(),
-                    path_so_far.as_path(),
-                    dir,
-                    &rtype_parent,
-                )?;
-                cross_ref_maps.add_path_xref(c.clone(), nid, dir);
-                Ok((nid, dir, path_so_far.join(name)))
-            }
-        },
-    )?;
+
+    // Walk the parent components, inserting any missing directory with the correct parent id/path.
+    let (mut cur_parent_id, mut cur_path) =
+        (0i64, path_buffers.get_root_dir().to_path_buf());
+    for comp in parent_pd.components() {
+        let name = comp.get_file_name_os_str();
+        if comp.is_root() || name == "." {
+            continue; // skip synthetic root or explicit "."
+        }
+        cur_path.push(name);
+        let next_id = if let Some((path_db_id, _)) = cross_ref_maps.get_path_db_id(&comp) {
+            path_db_id
+        } else {
+            let (inserted_id, _) = insert_node_in_dir(
+                tx,
+                name.to_string_lossy(),
+                cur_path.as_path(),
+                cur_parent_id,
+                &rtype_parent,
+            )?;
+            cross_ref_maps.add_path_xref(comp.clone(), inserted_id, cur_parent_id);
+            inserted_id
+        };
+        cur_parent_id = next_id;
+    }
+
+    // Finally insert the path itself (if still missing) and record it.
+    if let Some((id, parent_id)) = cross_ref_maps.get_path_db_id(pd) {
+        return Ok((id, parent_id));
+    }
+
     let name = pd.get_file_name_os_str();
-    insert_node_in_dir(
+    let (nid, _) = insert_node_in_dir(
         tx,
         name.to_string_lossy(),
         path_buffers.get_path_ref(pd),
-        nid,
+        cur_parent_id,
         &rtype,
-    )
+    )?;
+    cross_ref_maps.add_path_xref(pd.clone(), nid, cur_parent_id);
+    Ok((nid, cur_parent_id))
 }
 
 /// inserts a node into the database. This is an upsert operation and will not modify the node if it already exists with same values
