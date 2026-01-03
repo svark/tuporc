@@ -4,6 +4,7 @@ use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
+use indicatif::ProgressBar;
 use log::debug;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1128,13 +1129,23 @@ fn parse_and_add_rules_to_db(
         //let mut crossref = CrossRefMaps::default();
         let outs = parser.get_outs();
         let parser_c = parser.clone();
+        let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
+        pb_insert.set_length(1);
+        pb_insert.set_position(0);
         let mut insert_to_db =  |resolved_rules: ResolvedRules| -> Result<()> {
             //let conn = &mut binding.conn.get()?;
             let psx = parser_c.get_searcher();
             let mut c = psx.conn.get()?;
             let mut tx = c.transaction()?;
             check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
-            insert_nodes(&mut tx, &rwbufs, &resolved_rules, &mut crossref)?;
+            insert_nodes(
+                &mut tx,
+                &rwbufs,
+                &resolved_rules,
+                &mut crossref,
+                term_progress,
+                Some(&pb_insert),
+            )?;
             let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
             let (dbid, _) = crossref
                 .get_tup_db_id(resolved_rules.get_tupid())
@@ -1188,14 +1199,12 @@ fn parse_and_add_rules_to_db(
         let psx = parser_c.get_searcher();
         let mut c = psx.conn.get()?;
         let tx = c.transaction()?;
-        for n in tupfiles {
-            tx.unmark_modified(n.get_id())?;
-        }
         tx.delete_orphaned_tupentries()?;
         log::info!("Deleted orphaned tup entries");
         tx.delete_nodes()?;
         log::info!("Deleted marked nodes");
         tx.commit()?;
+        pb_insert.finish_and_clear();
         term_progress.finish(&pb, "Done parsing tupfiles");
         term_progress.clear();
         log::info!("Finished parse phase");
@@ -1664,6 +1673,8 @@ fn insert_nodes(
     read_write_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
+    term_progress: &TermProgress,
+    pb_insert: Option<&ProgressBar>,
 ) -> Result<()> {
     //let rules_in_tup_file = resolved_rules.rules_by_tup();
 
@@ -1741,6 +1752,14 @@ fn insert_nodes(
         }
     });
 
+    let total_steps = nodes.len() + envs_to_insert.len();
+    if let Some(pb) = pb_insert {
+        let len = std::cmp::max(1, total_steps as u64);
+        pb.set_length(len);
+        pb.set_position(0);
+        pb.set_message("Inserting nodes");
+    }
+
     let parent_descriptors = nodes
         .iter()
         .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
@@ -1781,6 +1800,9 @@ fn insert_nodes(
         } else {
             log::warn!("Failed to insert node: {:?}", node);
         }
+        if let Some(pb) = pb_insert {
+            term_progress.tick(pb);
+        }
     }
 
     for env_var in envs_to_insert.iter() {
@@ -1798,6 +1820,16 @@ fn insert_nodes(
             Err(e) => {
                 log::warn!("Error while inserting env var: {:?}", e);
             }
+        }
+        if let Some(pb) = pb_insert {
+            term_progress.tick(pb);
+        }
+    }
+
+    if let Some(pb) = pb_insert {
+        pb.set_message(format!("Inserted {} items", total_steps));
+        if total_steps > 0 {
+            pb.set_position(total_steps as u64);
         }
     }
 

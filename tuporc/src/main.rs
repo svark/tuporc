@@ -93,6 +93,17 @@ impl TermProgress {
         self.mb.add(pb)
     }
 
+    pub fn make_child_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
+        let pb = ProgressBar::new(len);
+        pb.set_style(
+            ProgressStyle::with_template("{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}")
+                .unwrap(),
+        );
+        pb.set_message(msg);
+        self.mb.add(pb.clone());
+        pb
+    }
+
     pub fn set_main_with_len(mut self, msg: &'static str, len: u64) -> TermProgress {
         let pb_main = ProgressBar::new(len);
         let sty_main =
@@ -117,14 +128,14 @@ impl TermProgress {
 
     pub fn tick(&self, pb: &ProgressBar) {
         if let Some(l) = pb.length() {
-            if l > pb.position() {
+            if l < pb.position() {
                 pb.inc(1);
             }
         } else {
             pb.tick();
         }
         if let Some(l) = self.pb_main.length() {
-            if l > self.pb_main.position() {
+            if l < self.pb_main.position() {
                 self.pb_main.inc(1);
             }
         } else {
