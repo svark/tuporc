@@ -3,6 +3,7 @@ use crate::scan::{HashedPath, MAX_THRS_DIRS};
 use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::sync::WaitGroup;
+use crossbeam::thread::ScopedJoinHandle;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
 use indicatif::ProgressBar;
 use log::debug;
@@ -29,7 +30,7 @@ use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, 
 use tupparser::buffers::{OutputHolder, PathBuffers};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::transform::{compute_dir_sha256, compute_sha256};
+use tupparser::transform::{compute_dir_sha256, compute_glob_sha256, compute_sha256, StatementsToResolve};
 use tupparser::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, PathDescriptor, RuleDescriptor,
     RuleRefDescriptor, TaskDescriptor, TupPathDescriptor,
@@ -268,9 +269,7 @@ impl NodeToInsert {
             sha
         };
         let compute_sha_for_glob = |p: &PathDescriptor| {
-            let sha =
-                tupparser::transform::compute_glob_sha256(&ConnWrapper::new(conn), path_buffers, p)
-                    .ok();
+            let sha = compute_glob_sha256(&ConnWrapper::new(conn), path_buffers, p).ok();
             debug!("sha for {:?} is {:?}", p, sha);
             sha
         };
@@ -1364,7 +1363,7 @@ fn insert_node_in_dir(
     rtype: &RowType,
 ) -> Result<(i64, i64)> {
     let pbuf = path.to_owned();
-    let hashed_path = crate::scan::HashedPath::from(pbuf);
+    let hashed_path = HashedPath::from(pbuf);
     let mut metadata = fs::metadata(path).ok();
     if metadata.as_ref().map_or(false, |m| m.is_symlink()) {
         metadata = fs::symlink_metadata(path).ok();
