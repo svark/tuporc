@@ -1137,6 +1137,13 @@ fn parse_and_add_rules_to_db(
             let psx = parser_c.get_searcher();
             let mut c = psx.conn.get()?;
             let mut tx = c.transaction()?;
+            let insert_label = format!(
+                "Inserting nodes for {}",
+                rwbufs
+                .get_tup_path(resolved_rules.get_tupid())
+                .as_path()
+                .display()
+            );
             insert_nodes(
                 &mut tx,
                 &rwbufs,
@@ -1144,6 +1151,7 @@ fn parse_and_add_rules_to_db(
                 &mut crossref,
                 term_progress,
                 Some(&pb_insert),
+                insert_label.as_str(),
             )?;
             check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
             let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
@@ -1688,6 +1696,7 @@ fn insert_nodes(
     crossref: &mut CrossRefMaps,
     term_progress: &TermProgress,
     pb_insert: Option<&ProgressBar>,
+    insert_label: &str,
 ) -> Result<()> {
     //let rules_in_tup_file = resolved_rules.rules_by_tup();
 
@@ -1770,7 +1779,7 @@ fn insert_nodes(
         let len = std::cmp::max(1, total_steps as u64);
         pb.set_length(len);
         pb.set_position(0);
-        pb.set_message("Inserting nodes");
+        pb.set_message(insert_label.to_string());
     }
 
     let parent_descriptors = nodes
@@ -1840,7 +1849,8 @@ fn insert_nodes(
     }
 
     if let Some(pb) = pb_insert {
-        pb.set_message(format!("Inserted {} items", total_steps));
+        pb.set_message(format!("✔ Done {}", insert_label));
+
         if total_steps > 0 {
             pb.set_position(total_steps as u64);
         }
