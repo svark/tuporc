@@ -2,8 +2,9 @@
 use crate::scan::{HashedPath, MAX_THRS_DIRS};
 use crate::TermProgress;
 use bimap::BiMap;
+use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::WaitGroup;
-use crossbeam::thread::ScopedJoinHandle;
+use crossbeam::thread::Scope;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
 use indicatif::ProgressBar;
 use log::debug;
@@ -13,13 +14,13 @@ use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::Arc;
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
 use tupdb::db::{
     create_dirpathbuf_temptable, create_presentlist_temptable, create_tuppathbuf_temptable,
-    db_path_str, MiscStatements, Node, RowType, TupConnection, TupConnectionPool,
-    TupConnectionRef, TupTransaction,
+    db_path_str, MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef,
+    TupTransaction,
 };
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::error::{AnyError, DbResult};
@@ -30,13 +31,27 @@ use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, 
 use tupparser::buffers::{OutputHolder, PathBuffers};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
-use tupparser::transform::{compute_dir_sha256, compute_glob_sha256, compute_sha256, StatementsToResolve};
+use tupparser::transform::{
+    compute_dir_sha256, compute_glob_sha256, compute_sha256, StatementsToResolve,
+};
 use tupparser::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, PathDescriptor, RuleDescriptor,
     RuleRefDescriptor, TaskDescriptor, TupPathDescriptor,
 };
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 use RowType::Group;
+
+fn parse_cancel_flag() -> &'static Arc<AtomicBool> {
+    static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    CANCEL_FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let handler_flag = flag.clone();
+        if let Err(e) = ctrlc::try_set_handler(move || handler_flag.store(true, Ordering::SeqCst)) {
+            log::warn!("Ctrl-C handler already set: {}", e);
+        }
+        flag
+    })
+}
 
 // CrossRefMaps maps paths, groups and rules discovered during parsing with those found in database
 // These are two ways maps, so you can query both ways
@@ -175,31 +190,30 @@ impl NodeToInsert {
         }
     }
 
-    pub fn get_srcid(&self, cross_ref_maps: &CrossRefMaps, read_write_buffer_objects: &ReadWriteBufferObjects) -> Result<i64> {
+    pub fn get_srcid(
+        &self,
+        cross_ref_maps: &CrossRefMaps,
+        read_write_buffer_objects: &ReadWriteBufferObjects,
+    ) -> Result<i64> {
         match self {
-            NodeToInsert::Rule(r) =>
-                {
-                   let tup_id  = read_write_buffer_objects.get_rule(r).get_tup_file_desc();
-                    cross_ref_maps.get_tup_db_id(&tup_id)
-                        .map(|x| x.0)
-                        .ok_or_eyre(eyre!(
-                    "srcid not found for rule: {:?}",
-                    r,
-                ))
-                },
-            NodeToInsert::Task(t) =>
-                {
-                    let tupid = read_write_buffer_objects.get_task(t).get_tupfile_desc();
-                    cross_ref_maps
-
-                .get_tup_db_id(&tupid)
-                .map(|x| x.0)
-                .ok_or_eyre(eyre!(
-                    "srcid not found for task: {:?} with tup descriptor:{:?}",
-                    t,
-                    tupid
-                ))}
-            ,
+            NodeToInsert::Rule(r) => {
+                let tup_id = read_write_buffer_objects.get_rule(r).get_tup_file_desc();
+                cross_ref_maps
+                    .get_tup_db_id(&tup_id)
+                    .map(|x| x.0)
+                    .ok_or_eyre(eyre!("srcid not found for rule: {:?}", r,))
+            }
+            NodeToInsert::Task(t) => {
+                let tupid = read_write_buffer_objects.get_task(t).get_tupfile_desc();
+                cross_ref_maps
+                    .get_tup_db_id(&tupid)
+                    .map(|x| x.0)
+                    .ok_or_eyre(eyre!(
+                        "srcid not found for task: {:?} with tup descriptor:{:?}",
+                        t,
+                        tupid
+                    ))
+            }
             NodeToInsert::GeneratedFile(gen, SrcId::RuleId(id)) => cross_ref_maps
                 .get_rule_db_id(id)
                 .map(|x| x.0)
@@ -499,7 +513,6 @@ impl DbPathSearcher {
         }
     }
 
-
     pub fn fetch_glob_globs_cb<F>(
         conn: &TupConnectionRef,
         ph: &impl PathBuffers,
@@ -698,7 +711,8 @@ impl PathSearcher for DbPathSearcher {
     }
     fn is_dir(&self, pd: &PathDescriptor) -> (bool, i64) {
         let conn = self.conn.get().expect("connection not found");
-        conn.fetch_dirid_by_path(pd.get_path_ref()).map(|id| (true, id))
+        conn.fetch_dirid_by_path(pd.get_path_ref())
+            .map(|id| (true, id))
             .unwrap_or((false, -1))
     }
 }
@@ -734,6 +748,7 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
         Ok(states_after_parse)
     }
 }
+
 /// handle the tup parse command which assumes files in db and adds rules and makes links joining input and output to/from rule statements
 pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     connection: TupConnectionPool,
@@ -901,8 +916,13 @@ fn insert_links(
         for tupfile_read in resolved_rules.get_tupfiles_read() {
             link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
         }
-        add_links_from_to_globs(&tx.connection(), resolved_rules, crossref, &mut link_collector)
-            .context("Inserting links from/to globs")?;
+        add_links_from_to_globs(
+            &tx.connection(),
+            resolved_rules,
+            crossref,
+            &mut link_collector,
+        )
+        .context("Inserting links from/to globs")?;
         add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
         link_collector.links()
     };
@@ -951,7 +971,7 @@ fn add_links_from_to_globs(
     resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
     link_collector: &mut LinkCollector,
-) -> Result<(), eyre::Report> {
+) -> Result<(), Report> {
     for glob_desc in resolved_rules.get_globs_read() {
         let (_, glob_dir) = crossref.get_glob_db_id_ok(glob_desc).wrap_err_with(|| {
             eyre!(
@@ -963,6 +983,7 @@ fn add_links_from_to_globs(
         let glob_path = GlobPath::build_from(&PathDescriptor::default(), glob_desc)?;
         let non_pattern_path = glob_path.get_non_pattern_prefix_desc();
         let depth = glob_desc.components().count() - non_pattern_path.components().count();
+        let tup_desc = resolved_rules.get_tupid();
         if depth > 1 {
             conn.for_each_glob_dir(glob_dir, depth as i32, |dir| -> DbResult<()> {
                 let tup_cwd = PathDescriptor::default();
@@ -972,14 +993,14 @@ fn add_links_from_to_globs(
                     .map_err(into_any_error)?;
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
-            }).wrap_err_with(|| eyre!("Adding glob paths at {}", glob_dir))?;
+            })
+            .wrap_err_with(|| eyre!("Adding glob paths at {} from {}", glob_dir, tup_desc.get_path_ref()))?;
         } else {
             link_collector.add_dir_to_glob_link(glob_desc, resolved_rules.get_tupid());
         }
     }
     Ok(())
 }
-
 
 // Gather all the modified tupfiles within directories specified
 // Processing Tupfiles within small set of directories with leave db in an incomplete state but is useful for debugging
@@ -1057,6 +1078,8 @@ fn parse_and_add_rules_to_db(
     tupfiles: &[Node],
     term_progress: &TermProgress,
 ) -> Result<TupParser<DbPathSearcher>> {
+    let cancel_flag = parse_cancel_flag();
+    cancel_flag.store(false, Ordering::SeqCst);
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let (sender, receiver) = crossbeam::channel::unbounded();
     term_progress.set_message("Parsing Tupfiles");
@@ -1068,164 +1091,220 @@ fn parse_and_add_rules_to_db(
         crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
     }
     crossbeam::thread::scope(|s| -> Result<()> {
-        let wg = WaitGroup::new();
-        let poisoned = Arc::new(AtomicBool::new(false));
-        let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
-        let mut handles = Vec::new();
-        for thread_index in 0..num_threads {
-            let mut parser_clone = parser.clone();
-            let sender = sender.clone();
-            let wg = wg.clone();
-            let pb = term_progress.make_progress_bar("_");
-            let poisoned = poisoned.clone();
-            let join_handle = s.spawn(move |_| -> Result<()> {
-                for tupfile in tupfiles
-                    .iter()
-                    .filter(|x| !x.get_name().ends_with(".lua"))
-                    .cloned()
-                    .skip(thread_index)
-                    .step_by(num_threads)
-                {
-                    if poisoned.load(Ordering::SeqCst) {
-                        drop(wg);
-                        return Ok(());
-                    }
-                    let tupfile_name = tupfile.get_name();
-                    debug!("Parsing :{}", tupfile_name);
-                    pb.set_message(format!("Parsing :{tupfile_name}"));
-                    let res = parser_clone
-                        .parse_tupfile(tupfile.get_name(), sender.clone())
-                        .map_err(|error| {
-                            let rwbuf = parser_clone.read_write_buffers();
-                            let display_str = rwbuf.display_str(&error);
-                            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-                            poisoned.store(true, Ordering::SeqCst);
-                            // drop(wg);
-                            eyre!(
-                                "Error while parsing tupfile: {}:\n {} due to \n{}",
-                                tupfile.get_name(),
-                                display_str,
-                                error
-                            )
-                        });
-                    if let Err(e) = res {
-                        drop(wg);
-                        return Err(e);
-                    }
-                    pb.set_message(format!("Done parsing {}", tupfile.get_name()));
-                    term_progress.tick(&pb);
-                }
-                drop(wg);
-                pb.set_message("Done parsing all tupfiles");
-                Ok(())
-            });
-            handles.push(join_handle);
-        }
-        drop(sender);
-
-        let pb = term_progress.get_main();
-        let rwbufs = parser.read_write_buffers().clone();
-        //let mut crossref = CrossRefMaps::default();
-        let outs = parser.get_outs();
-        let parser_c = parser.clone();
-        let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
-        pb_insert.set_length(1);
-        pb_insert.set_position(0);
-        let mut insert_to_db =  |resolved_rules: ResolvedRules| -> Result<()> {
-            //let conn = &mut binding.conn.get()?;
-            let psx = parser_c.get_searcher();
-            let mut c = psx.conn.get()?;
-            let mut tx = c.transaction()?;
-            let insert_label = format!(
-                "Inserting nodes for {}",
-                rwbufs
-                .get_tup_path(resolved_rules.get_tupid())
-                .as_path()
-                .display()
-            );
-            insert_nodes(
-                &mut tx,
-                &rwbufs,
-                &resolved_rules,
-                &mut crossref,
-                term_progress,
-                Some(&pb_insert),
-                insert_label.as_str(),
-            )?;
-            check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
-            let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
-            let (dbid, _) = crossref
-                .get_tup_db_id(resolved_rules.get_tupid())
-                .expect("tupfile dbid fetch failed");
-            tx.unmark_modified(dbid)?;
-            tx.commit()?;
-            Ok(())
-        };
-        let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
-            if resolved_rules.is_empty() {
-                return Ok(());
-            }
-            insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
-        };
-
-        log::info!("Starting to resolve statements from parsed tupfiles");
-        pb.set_message("Resolving statements..");
-        {
-            for tupfile_lua in tupfiles
-                .iter()
-                .filter(|x| x.get_name().ends_with(".lua"))
-                .cloned()
-            {
-                let path = tupfile_lua.get_name();
-                pb.set_message(format!("Parsing :{}", path));
-                let resolved_rules = parser.parse(path).map_err(|e| {
-                    term_progress.abandon(&pb, format!("Error parsing {path}"));
-                    eyre!("Error: {}", parser.read_write_buffers().display_str(&e))
-                })?;
-                //new_resolved_rules.push(resolved_rules);
-                insert_to_db_wrap_err(resolved_rules)?;
-                term_progress.tick(&pb);
-                pb.set_message(format!("Done parsing {}", path));
-            }
-        }
-
-        pb.set_message("Resolving statements..");
-        parser
-            .receive_resolved_statements(receiver, insert_to_db_wrap_err)
-            .map_err(|error| {
-                let read_write_buffers = parser.read_write_buffers();
-                let display_str = read_write_buffers.display_str(&error);
-                term_progress.abandon(&pb, "Error resolving statements".to_string());
-                eyre!(
-                    "Unable to resolve statements in tupfiles:\n{}",
-                    display_str,
-                )
-            })?;
-        log::info!("Finished resolving statements from parsed tupfiles");
-        pb.set_message("Finalizing database updates..");
-        let psx = parser_c.get_searcher();
-        let mut c = psx.conn.get()?;
-        let tx = c.transaction()?;
-        tx.delete_orphaned_tupentries()?;
-        log::info!("Deleted orphaned tup entries");
-        tx.delete_nodes()?;
-        log::info!("Deleted marked nodes");
-        tx.commit()?;
-        pb_insert.finish_and_clear();
-        term_progress.finish(&pb, "Done parsing tupfiles");
-        term_progress.clear();
-        log::info!("Finished parse phase");
-        wg.wait();
-        for join_handle in handles {
-            join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
-        }
-        Ok(())
+        parse_in_scope(
+            s,
+            &mut parser,
+            tupfiles,
+            term_progress,
+            sender,
+            receiver,
+            &mut crossref,
+        )
     })
     .expect("Thread error while fetching resolved rules from tupfiles")?;
     Ok(parser)
 }
 
-/// checks that in  parsed tup files, no two  rules/tasks produce the same output
+// Spawn multiple threads to parse tupfiles in parallel within a scope
+fn parse_in_scope<'a, 'b>(
+    s: &Scope<'a>,
+    parser: &mut TupParser<DbPathSearcher>,
+    tupfiles: &'b [Node],
+    term_progress: &'b TermProgress,
+    sender: Sender<StatementsToResolve>,
+    receiver: Receiver<StatementsToResolve>,
+    mut crossref: &mut CrossRefMaps,
+) -> Result<(), Report>
+where
+    'b: 'a,
+{
+    let wg = WaitGroup::new();
+    let poisoned = Arc::new(AtomicBool::new(false));
+    let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
+    let mut handles = Vec::new();
+    for thread_index in 0..num_threads {
+        let parser_clone = parser.clone();
+        let sender = sender.clone();
+        let wg = wg.clone();
+        let pb = term_progress.make_progress_bar("_");
+        let poisoned = poisoned.clone();
+        let join_handle = s.spawn(move |_| -> Result<()> {
+             parse_subset(
+                tupfiles,
+                term_progress,
+                num_threads,
+                thread_index,
+                parser_clone,
+                sender,
+                wg,
+                &pb,
+                poisoned,
+            )
+        });
+        handles.push(join_handle);
+    }
+    drop(sender);
+
+    let pb = term_progress.get_main();
+    let rwbufs = parser.read_write_buffers().clone();
+    //let mut crossref = CrossRefMaps::default();
+    let outs = parser.get_outs();
+    let parser_c = parser.clone();
+    let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
+    pb_insert.set_length(1);
+    pb_insert.set_position(0);
+    let mut insert_to_db = |resolved_rules: ResolvedRules| -> Result<()> {
+        //let conn = &mut binding.conn.get()?;
+        let psx = parser_c.get_searcher();
+        let mut c = psx.conn.get()?;
+        let mut tx = c.transaction()?;
+        let insert_label = format!(
+            "Inserting nodes for {}",
+            rwbufs
+                .get_tup_path(resolved_rules.get_tupid())
+                .as_path()
+                .display()
+        );
+        log::info!("{}", insert_label);
+        let cancel = parse_cancel_flag();
+        if cancel.load(Ordering::SeqCst) {
+            term_progress.abandon(&pb_insert, "Interrupted");
+            return Err(eyre!("Parse interrupted by Ctrl-C"));
+        }
+
+        insert_nodes(
+            &mut tx,
+            &rwbufs,
+            &resolved_rules,
+            &mut crossref,
+            term_progress,
+            Some(&pb_insert),
+            insert_label.as_str(),
+        )?;
+        check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
+        let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
+        let (dbid, _) = crossref
+            .get_tup_db_id(resolved_rules.get_tupid())
+            .expect("tupfile dbid fetch failed");
+        tx.unmark_modified(dbid)?;
+        tx.commit()?;
+        Ok(())
+    };
+    let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
+        if resolved_rules.is_empty() {
+            return Ok(());
+        }
+        insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
+    };
+
+    log::info!("Starting to resolve statements from parsed tupfiles");
+    pb.set_message("Resolving statements..");
+    {
+        for tupfile_lua in tupfiles
+            .iter()
+            .filter(|x| x.get_name().ends_with(".lua"))
+            .cloned()
+        {
+            let path = tupfile_lua.get_name();
+            pb.set_message(format!("Parsing :{}", path));
+            let resolved_rules = parser.parse(path).map_err(|e| {
+                term_progress.abandon(&pb, format!("Error parsing {path}"));
+                eyre!("Error: {}", parser.read_write_buffers().display_str(&e))
+            })?;
+            //new_resolved_rules.push(resolved_rules);
+            insert_to_db_wrap_err(resolved_rules)?;
+            term_progress.tick(&pb);
+            pb.set_message(format!("Done parsing {}", path));
+        }
+    }
+
+    pb.set_message("Resolving statements..");
+    parser
+        .receive_resolved_statements(receiver, insert_to_db_wrap_err)
+        .map_err(|error| {
+            let read_write_buffers = parser.read_write_buffers();
+            let display_str = read_write_buffers.display_str(&error);
+            term_progress.abandon(&pb, "Error resolving statements".to_string());
+            eyre!("Unable to resolve statements in tupfiles:\n{}", display_str,)
+        })?;
+    log::info!("Finished resolving statements from parsed tupfiles");
+    pb.set_message("Finalizing database updates..");
+    let psx = parser_c.get_searcher();
+    let mut c = psx.conn.get()?;
+    let tx = c.transaction()?;
+    tx.delete_orphaned_tupentries()?;
+    log::info!("Deleted orphaned tup entries");
+    tx.delete_nodes()?;
+    log::info!("Deleted marked nodes");
+    tx.commit()?;
+    pb_insert.finish_and_clear();
+    term_progress.finish(&pb, "Done parsing tupfiles");
+    term_progress.clear();
+    log::info!("Finished parse phase");
+    wg.wait();
+    for join_handle in handles {
+        join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
+    }
+    Ok(())
+}
+
+// parse a subset of tupfiles assigned to this thread
+fn parse_subset(
+    tupfiles: &[Node],
+    term_progress: &TermProgress,
+    num_threads: usize,
+    thread_index: usize,
+    mut parser_clone: TupParser<DbPathSearcher>,
+    sender: Sender<StatementsToResolve>,
+    wg: WaitGroup,
+    pb: &ProgressBar,
+    poisoned: Arc<AtomicBool>,
+) -> Result<()> {
+    for tupfile in tupfiles
+        .iter()
+        .filter(|x| !x.get_name().ends_with(".lua"))
+        .cloned()
+        .skip(thread_index)
+        .step_by(num_threads)
+    {
+        if poisoned.load(Ordering::SeqCst) {
+            drop(wg);
+            bail!("Parsing aborted due to error or cancellation");
+        }
+        let tupfile_name = tupfile.get_name();
+        log::info!("Parsing :{}", tupfile_name);
+        pb.set_message(format!("Parsing :{tupfile_name}"));
+        let res = parser_clone
+            .parse_tupfile(tupfile.get_name(), sender.clone())
+            .map_err(|error| {
+                let rwbuf = parser_clone.read_write_buffers();
+                let display_str = rwbuf.display_str(&error);
+                term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
+                poisoned.store(true, Ordering::SeqCst);
+                // drop(wg);
+                eyre!(
+                    "Error while parsing tupfile: {}:\n {} due to \n{}",
+                    tupfile.get_name(),
+                    display_str,
+                    error
+                )
+            });
+        if let Err(e) = res {
+            drop(wg);
+            log::error!("Error {e} \n found parsing tupfile :{}", tupfile_name);
+            return Err(e);
+        }
+        pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+        log::info!("Finished parsing :{}", tupfile_name);
+        term_progress.tick(&pb);
+    }
+    drop(wg);
+    pb.set_message("Done parsing all tupfiles");
+    log::info!("Finished parsing all tupfiles");
+    Ok(())
+}
+
+/// checks tno two rules/tasks produce the same output
 fn check_uniqueness_of_parent_rule(
     conn: &TupConnectionRef,
     read_buf: &ReadWriteBufferObjects,
@@ -1248,13 +1327,12 @@ fn check_uniqueness_of_parent_rule(
                 if !conn.check_is_in_update_universe(prev_producer_id)? {
                     let old_rule_name = conn.fetch_node_name(prev_producer_id)?;
                     return Err(eyre!(format!(
-                                    "File was previously marked as generated from a producer:{} \
+                        "File was previously marked as generated from a producer:{} \
                                     but is now being generated in {}",
-                                    old_rule_name,
-                                    current_parent_rule_ref.to_string()
-                                )));
+                        old_rule_name,
+                        current_parent_rule_ref.to_string()
+                    )));
                 }
-
             }
         }
     }
@@ -1313,8 +1391,7 @@ pub(crate) fn insert_path(
     };
 
     // Walk the parent components, inserting any missing directory with the correct parent id/path.
-    let (mut cur_parent_id, mut cur_path) =
-        (0i64, path_buffers.get_root_dir().to_path_buf());
+    let (mut cur_parent_id, mut cur_path) = (0i64, path_buffers.get_root_dir().to_path_buf());
     for comp in parent_pd.components() {
         let name = comp.get_file_name_os_str();
         if comp.is_root() || name == "." {
@@ -1416,8 +1493,7 @@ fn ensure_parent_inserted(
         .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
             // try adding parent directory if not in db
-            let (dir, pardir) =
-                insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type)?;
+            let (dir, pardir) = insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type)?;
             Ok((dir, pardir))
         })?;
     Ok((dir, pardir))
@@ -1774,32 +1850,32 @@ fn insert_nodes(
     });
 
     let total_steps = nodes.len() + envs_to_insert.len();
+    let il = insert_label.to_string();
     if let Some(pb) = pb_insert {
         let len = std::cmp::max(1, total_steps as u64);
         pb.set_length(len);
         pb.set_position(0);
-        pb.set_message(insert_label.to_string());
+        pb.set_message(Cow::Owned(il));
     }
+
+
 
     let parent_descriptors = nodes
         .iter()
         .map(|n| (n.get_parent_id(read_write_buf), n.get_type()));
+    //check_cancel()?;
 
     for (parent_desc, rowtype) in parent_descriptors {
         if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
-            let (parid, parparid) = ensure_parent_inserted(
-                tx,
-                read_write_buf.get(),
-                crossref,
-                &rowtype,
-                &parent_desc,
-            )?;
+            let (parid, parparid) =
+                ensure_parent_inserted(tx, read_write_buf.get(), crossref, &rowtype, &parent_desc)?;
             if !parid.is_negative() {
                 crossref.add_path_xref(parent_desc, parid, parparid);
             }
         }
     }
     for node_to_insert in &nodes {
+        //check_cancel()?;
         debug!("inserting node: {:?}", node_to_insert);
         let node = node_to_insert.get_node(&read_write_buf, crossref)?;
         let compute_sha = || {
@@ -1846,6 +1922,7 @@ fn insert_nodes(
             term_progress.tick(pb);
         }
     }
+    //check_cancel()?;
 
     if let Some(pb) = pb_insert {
         pb.set_message(format!("✔ Done {}", insert_label));
