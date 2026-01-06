@@ -1051,7 +1051,7 @@ fn link_output_to_task(
                                 use tupdb::inserts::LibSqlInserts as _;
                                 let _ = process_checker
                                     .conn
-                                    .update_srcid_exec(id, task_id)
+                                    .update_srcid(id, task_id)
                                     .map_err(|e| eyre!(
                                         "Failed to set srcid for task output '{}': {}",
                                         file_node, e

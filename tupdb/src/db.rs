@@ -343,7 +343,7 @@ impl Node {
 pub trait MiscStatements {
     /// Populate deletelist (DeleteList = ids of type file/dir Node  - ids in PresentList)
     /// Enrich the modified list with more entries determined by dependencies between nodes
-    fn enrich_modified_list(&self) -> DbResult<()>;
+    fn enrich_modify_list(&self) -> DbResult<()>;
 
     /// Set run status for a phase ("parse"/"build"/"update")
     fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()>;
@@ -365,8 +365,8 @@ pub fn is_initialized(conn: &Connection, table_name: &str) -> bool {
 }
 
 impl<'a> MiscStatements for TupTransaction<'a> {
-    fn enrich_modified_list(&self) -> DbResult<()> {
-        self.connection().enrich_modified_list()
+    fn enrich_modify_list(&self) -> DbResult<()> {
+        self.connection().enrich_modify_list()
     }
 
     fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()> {
@@ -383,18 +383,18 @@ impl<'a> MiscStatements for TupTransaction<'a> {
 }
 
 impl<'a> MiscStatements for TupConnectionRef<'a> {
-    fn enrich_modified_list(&self) -> DbResult<()> {
-        self.delete_orphaned_tupentries()?;
-        self.add_rules_with_changed_io_to_modify_list()?;
+    fn enrich_modify_list(&self) -> DbResult<()> {
+        self.mark_orphans_to_delete()?;
+        self.mark_rules_with_changed_io()?;
 
-        self.mark_dependent_tupfiles_of_tupfiles()?;
+        self.mark_tupfile_deps()?;
         for (i, sha) in self.fetch_modified_globs()?.into_iter() {
-            self.update_node_sha_exec(i, sha.as_str())?;
-            self.mark_dependent_tupfiles_of_glob(i)?;
+            self.update_node_sha(i, sha.as_str())?;
+            self.mark_glob_deps(i)?;
         }
 
-        self.mark_rules_depending_on_modified_groups()?;
-        self.prune_modify_list_of_inputs_and_outputs()?;
+        self.mark_group_deps()?;
+        self.prune_modify_list()?;
         self.delete_nodes()?;
 
         Ok(())
@@ -694,19 +694,19 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
 }
 
 impl MiscStatements for TupConnection {
-    fn enrich_modified_list(&self) -> DbResult<()> {
-        self.delete_orphaned_tupentries()?;
-        self.add_rules_with_changed_io_to_modify_list()?;
+    fn enrich_modify_list(&self) -> DbResult<()> {
+        self.mark_orphans_to_delete()?;
+        self.mark_rules_with_changed_io()?;
 
         // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
-        self.mark_dependent_tupfiles_of_tupfiles()?; //-- included tup files -> Tupfile
+        self.mark_tupfile_deps()?; //-- included tup files -> Tupfile
         for (i, sha) in self.fetch_modified_globs()?.into_iter() {
-            self.update_node_sha_exec(i, sha.as_str())?;
-            self.mark_dependent_tupfiles_of_glob(i)?; // modified glob -> Tupfile
+            self.update_node_sha(i, sha.as_str())?;
+            self.mark_glob_deps(i)?; // modified glob -> Tupfile
         }
 
-        self.mark_rules_depending_on_modified_groups()?;
-        self.prune_modify_list_of_inputs_and_outputs()?;
+        self.mark_group_deps()?;
+        self.prune_modify_list()?;
         self.delete_nodes()?;
 
         Ok(())

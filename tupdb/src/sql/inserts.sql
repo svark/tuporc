@@ -94,7 +94,7 @@ Set mtime_ns = :mtime_ns
 where id = :id;
 -- <eos>
 
--- name: update_type!
+-- name: update_node_type_raw!
 -- Update node type
 -- # Parameters
 -- param: rtype: u8 - new type of the node

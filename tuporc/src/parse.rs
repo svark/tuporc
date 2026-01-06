@@ -778,32 +778,38 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let dbref = parser.get_searcher();
         let conn = dbref.conn.get()?;
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
-        //conn.enrich_modified_list()?;
+        //conn.enrich_modify_list()?;
         {
             let tp = term_progress.clone();
-            tp.set_main_with_len("Enriching modified list", 7);
-            conn.delete_orphaned_tupentries()?;
+            tp.set_main_with_len("Enriching modify list", 7);
+            conn.mark_orphans_to_delete()?;
             let pb_main = term_progress.pb_main.clone();
             pb_main.inc(1);
-            conn.add_rules_with_changed_io_to_modify_list()?;
+            conn.mark_rules_with_changed_io()
+                .context("Mark rules with changed I/O")?;
             pb_main.inc(1);
 
             // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
-            conn.mark_dependent_tupfiles_of_tupfiles()?; //-- included tup files -> Tupfile
+            conn.mark_tupfile_deps()
+                .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
             pb_main.inc(1);
             for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
-                conn.update_node_sha_exec(i, sha.as_str())?;
-                conn.mark_dependent_tupfiles_of_glob(i)?; // modified glob -> Tupfile
+                conn.update_node_sha(i, sha.as_str())?;
+                conn.mark_glob_deps(i)
+                    .context("Mark glob dependencies")?; // modified glob -> Tupfile
             }
             pb_main.inc(1);
 
-            conn.mark_rules_depending_on_modified_groups()?;
+            conn.mark_group_deps()
+                .context("Mark group dependencies")?;
             pb_main.inc(1);
-            conn.prune_modify_list_of_inputs_and_outputs()?;
+            conn.prune_modify_list()
+                .context("Prune modify list")?;
             pb_main.inc(1);
-            pb_main.finish_with_message("Done enriching modified list");
+            pb_main.finish_with_message("Done enriching modify list");
         }
-        conn.mark_tupfile_entries(&tupfile_ids)?;
+        conn.mark_tupfile_outputs(&tupfile_ids)
+            .context("Mark tupfile outputs")?;
     }
     let _ = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
     {
@@ -922,7 +928,7 @@ fn insert_links(
             crossref,
             &mut link_collector,
         )
-        .context("Inserting links from/to globs")?;
+            .context("Inserting links from/to globs")?;
         add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
         link_collector.links()
     };
@@ -994,7 +1000,13 @@ fn add_links_from_to_globs(
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
             })
-            .wrap_err_with(|| eyre!("Adding glob paths at {} from {}", glob_dir, tup_desc.get_path_ref()))?;
+                .wrap_err_with(|| {
+                    eyre!(
+                    "Adding glob paths at {} from {}",
+                    glob_dir,
+                    tup_desc.get_path_ref()
+                )
+                })?;
         } else {
             link_collector.add_dir_to_glob_link(glob_desc, resolved_rules.get_tupid());
         }
@@ -1050,8 +1062,8 @@ pub fn gather_modified_tupfiles(
         debug!("tupfile to parse:{}", n.get_name());
         if target_dirs_and_names.is_empty()
             || target_dirs_and_names
-                .iter()
-                .any(|x| n.get_name().strip_prefix(x.as_str()).is_some())
+            .iter()
+            .any(|x| n.get_name().strip_prefix(x.as_str()).is_some())
         {
             tupfiles.push(n);
         }
@@ -1101,7 +1113,7 @@ fn parse_and_add_rules_to_db(
             &mut crossref,
         )
     })
-    .expect("Thread error while fetching resolved rules from tupfiles")?;
+        .expect("Thread error while fetching resolved rules from tupfiles")?;
     Ok(parser)
 }
 
@@ -1129,7 +1141,7 @@ where
         let pb = term_progress.make_progress_bar("_");
         let poisoned = poisoned.clone();
         let join_handle = s.spawn(move |_| -> Result<()> {
-             parse_subset(
+            parse_subset(
                 tupfiles,
                 term_progress,
                 num_threads,
@@ -1232,8 +1244,8 @@ where
     let psx = parser_c.get_searcher();
     let mut c = psx.conn.get()?;
     let tx = c.transaction()?;
-    tx.delete_orphaned_tupentries()?;
-    log::info!("Deleted orphaned tup entries");
+    tx.mark_orphans_to_delete()?;
+    log::info!("Marked orphaned entries to delete");
     tx.delete_nodes()?;
     log::info!("Deleted marked nodes");
     tx.commit()?;
@@ -1587,7 +1599,7 @@ impl LinkCollector {
             .insert(Link::TupfileToRule(t.clone(), rd.clone()));
     }
 
-    pub(crate) fn links(&self) -> impl Iterator<Item = &Link> {
+    pub(crate) fn links(&self) -> impl Iterator<Item=&Link> {
         self.links.iter()
     }
 }
@@ -1857,8 +1869,6 @@ fn insert_nodes(
         pb.set_position(0);
         pb.set_message(Cow::Owned(il));
     }
-
-
 
     let parent_descriptors = nodes
         .iter()

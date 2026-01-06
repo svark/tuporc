@@ -48,12 +48,12 @@ pub trait LibSqlInserts {
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_deleted(&self, id: i64, rtype: &RowType) -> Result<()>;
-    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<()>;
-    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<()>;
-    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<()>;
-    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<()>;
-    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<()>;
-    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<()>;
+    fn update_mtime(&self, nodeid: i64, mtime: i64) -> DbResult<()>;
+    fn update_node_type(&self, nodeid: i64, row_type: RowType) -> DbResult<()>;
+    fn update_display_str(&self, nodeid: i64, display_str: &str) -> DbResult<()>;
+    fn update_flags(&self, nodeid: i64, flags: &str) -> DbResult<()>;
+    fn update_srcid(&self, nodeid: i64, srcid: i64) -> DbResult<()>;
+    fn update_node_sha(&self, nodeid: i64, sha: &str) -> DbResult<()>;
     fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()>;
     /// Insert or validate a unique Output -> Producer link (Producer can be Rule or Task).
     /// Enforces that a given output node has at most one producer globally (Rule or Task).
@@ -65,13 +65,13 @@ pub trait LibSqlInserts {
         producer_type: RowType,
     ) -> DbResult<()>;
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
-    fn mark_tupfile_entries(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
+    fn mark_tupfile_outputs(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
     fn create_tupfile_entries_table(&self) -> DbResult<()>;
-    fn add_not_present_to_delete_list(&self) -> DbResult<()>;
-    fn add_rules_with_changed_io_to_modify_list(&self) -> DbResult<()>;
-    fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()>;
-    fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()>;
-    fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()>;
+    fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
+    fn mark_rules_with_changed_io(&self) -> DbResult<()>;
+    fn mark_group_deps(&self) -> DbResult<()>;
+    fn mark_tupfile_deps(&self) -> DbResult<()>;
+    fn mark_glob_deps(&self, glob_id: i64) -> DbResult<()>;
     fn replace_node_sha(&self, node_id: i64, sha: impl FnMut() -> String)
         -> DbResult<UpsertStatus>;
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
@@ -145,8 +145,8 @@ impl LibSqlInserts for Connection {
                     existing_node.get_type(),
                     node.get_type()
                 );
-                //node_statements.update_type(existing_node.get_id(), *node.get_type())?;
-                self.update_type(*node.get_type() as u8, existing_node.get_id())?;
+                //node_statements.update_node_type(existing_node.get_id(), *node.get_type())?;
+                self.update_node_type(existing_node.get_id(), *node.get_type())?;
                 // modify = true;
             }
         }
@@ -173,7 +173,6 @@ impl LibSqlInserts for Connection {
                 existing_node.get_display_str(),
                 node.get_display_str()
             );
-            //node_statements.update_display_str_exec(existing_node.get_id(), node.get_display_str())?;
             self.update_node_display_str(node.get_display_str(), existing_node.get_id())?;
             modify = true;
         }
@@ -185,7 +184,6 @@ impl LibSqlInserts for Connection {
                 node.get_flags()
             );
             self.update_node_flags(node.get_flags(), existing_node.get_id())?;
-            //node_statements.update_flags_exec(existing_node.get_id(), node.get_flags())?;
             modify = true;
         }
         if existing_node.get_srcid() != node.get_srcid() {
@@ -195,7 +193,6 @@ impl LibSqlInserts for Connection {
                 existing_node.get_srcid(),
                 node.get_srcid()
             );
-            //node_statements.update_srcid_exec(existing_node.get_id(), node.get_srcid())?;
             self.update_node_srcid(node.get_srcid(), existing_node.get_id())?;
             modify = true;
         }
@@ -263,29 +260,29 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn update_mtime_exec(&self, nodeid: i64, mtime: i64) -> DbResult<()> {
+    fn update_mtime(&self, nodeid: i64, mtime: i64) -> DbResult<()> {
         self.update_mtime_ns(nodeid, mtime)?;
         Ok(())
     }
 
-    fn update_type_exec(&self, nodeid: i64, row_type: RowType) -> DbResult<()> {
-        self.update_type(row_type as u8, nodeid)?;
+    fn update_node_type(&self, nodeid: i64, row_type: RowType) -> DbResult<()> {
+        self.update_node_type_raw(row_type as u8, nodeid)?;
         Ok(())
     }
 
-    fn update_display_str_exec(&self, nodeid: i64, display_str: &str) -> DbResult<()> {
+    fn update_display_str(&self, nodeid: i64, display_str: &str) -> DbResult<()> {
         self.update_node_display_str(display_str, nodeid)?;
         Ok(())
     }
-    fn update_flags_exec(&self, nodeid: i64, flags: &str) -> DbResult<()> {
+    fn update_flags(&self, nodeid: i64, flags: &str) -> DbResult<()> {
         self.update_node_flags(flags, nodeid)?;
         Ok(())
     }
-    fn update_srcid_exec(&self, nodeid: i64, srcid: i64) -> DbResult<()> {
+    fn update_srcid(&self, nodeid: i64, srcid: i64) -> DbResult<()> {
         self.update_node_srcid(nodeid, srcid)?;
         Ok(())
     }
-    fn update_node_sha_exec(&self, nodeid: i64, sha: &str) -> DbResult<()> {
+    fn update_node_sha(&self, nodeid: i64, sha: &str) -> DbResult<()> {
         self.insert_or_replace_node_sha(nodeid, sha)?;
         Ok(())
     }
@@ -352,7 +349,7 @@ impl LibSqlInserts for Connection {
         self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
         Ok(())
     }
-    fn mark_tupfile_entries(&self, tupfile_ids: &Vec<i64>) -> DbResult<()> {
+    fn mark_tupfile_outputs(&self, tupfile_ids: &Vec<i64>) -> DbResult<()> {
         for tupfile_id in tupfile_ids {
             self.add_rules_and_outputs_of_tupfile_entities(*tupfile_id)?;
         }
@@ -364,23 +361,23 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn add_not_present_to_delete_list(&self) -> DbResult<()> {
+    fn mark_absent_nodes_to_delete(&self) -> DbResult<()> {
         self.add_not_present_to_delete_list_inner()?;
         Ok(())
     }
-    fn add_rules_with_changed_io_to_modify_list(&self) -> DbResult<()> {
+    fn mark_rules_with_changed_io(&self) -> DbResult<()> {
         self.add_rules_with_changed_io_to_modify_list_inner()?;
         Ok(())
     }
-    fn mark_rules_depending_on_modified_groups(&self) -> DbResult<()> {
+    fn mark_group_deps(&self) -> DbResult<()> {
         self.mark_rules_depending_on_modified_groups_inner()?;
         Ok(())
     }
-    fn mark_dependent_tupfiles_of_tupfiles(&self) -> DbResult<()> {
+    fn mark_tupfile_deps(&self) -> DbResult<()> {
         self.mark_dependent_tupfiles_of_tupfiles_inner()?;
         Ok(())
     }
-    fn mark_dependent_tupfiles_of_glob(&self, glob_id: i64) -> DbResult<()> {
+    fn mark_glob_deps(&self, glob_id: i64) -> DbResult<()> {
         self.mark_dependent_tupfiles_of_glob_inner(glob_id)?;
         Ok(())
     }
@@ -396,7 +393,7 @@ impl LibSqlInserts for Connection {
         } else {
             let oldsha = sha();
             if oldsha.ne(&s.unwrap()) {
-                self.update_node_sha_exec(node_id, oldsha.as_str())?;
+                self.update_node_sha(node_id, oldsha.as_str())?;
                 Ok(UpsertStatus::Updated(node_id))
             } else {
                 Ok(UpsertStatus::Unchanged(node_id))
@@ -421,11 +418,11 @@ impl LibSqlInserts for Connection {
             });
         match s {
             Status::Absent => {
-                self.update_node_sha_exec(node_id, sha)?;
+                self.update_node_sha(node_id, sha)?;
                 Ok(UpsertStatus::Inserted(node_id))
             }
             Status::PresentButDiff => {
-                self.update_node_sha_exec(node_id, sha)?;
+                self.update_node_sha(node_id, sha)?;
                 Ok(UpsertStatus::Updated(node_id))
             }
             Status::Present => Ok(UpsertStatus::Unchanged(node_id)),

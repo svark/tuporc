@@ -699,11 +699,11 @@ fn add_modify_nodes(
     }
     drop(node_at_path_receiver);
     drop(dirid_sender);
-    tx.prune_delete_list_of_present()?; // remove nodes marked as present from delete list (maybe from previous scans)
-    tx.add_not_present_to_delete_list()?;
+    tx.prune_delete_list()?; // remove nodes marked as present from delete list (maybe from previous scans)
+    tx.mark_absent_nodes_to_delete()?;
     // Enrich deletions for nodes whose parent directory entries are missing (orphans)
-    tx.enrich_delete_list_for_missing_dirs()?; // this ai says is needed for database integrity
-    tx.enrich_delete_list_with_dir_dependents()?;
+    tx.mark_missing_dirs_to_delete()?; // this ai says is needed for database integrity
+    tx.mark_dir_dependents_to_delete()?;
     //tx.delete_nodes()?;
     tx.commit()?;
 

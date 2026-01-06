@@ -11,19 +11,19 @@ pub trait LibSqlDeletes {
     fn unmark_modified(&self, id: i64) -> Result<usize>;
     fn delete_nodes(&self) -> Result<usize>;
 
-    fn delete_tupfile_entries_not_in_present_list(&self) -> Result<()>;
+    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>;
 
-    fn delete_orphaned_tupentries(&self) -> Result<()>;
+    fn mark_orphans_to_delete(&self) -> Result<()>;
 
 
-    fn prune_delete_list_of_present(&self) -> Result<usize>;
-    fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize>;
+    fn prune_delete_list(&self) -> Result<usize>;
+    fn prune_modify_list(&self) -> Result<usize>;
 
     /// Enrich DeleteList by adding nodes whose parent directory is already in DeleteList
-    fn enrich_delete_list_with_dir_dependents(&self) -> Result<usize>;
+    fn mark_dir_dependents_to_delete(&self) -> Result<usize>;
 
     /// Enrich DeleteList by adding nodes whose parent directories are missing from Node (orphaned dirid)
-    fn enrich_delete_list_for_missing_dirs(&self) -> Result<usize>;
+    fn mark_missing_dirs_to_delete(&self) -> Result<usize>;
 
     fn drop_tupfile_entries_table(&self) -> Result<()>;
 }
@@ -65,13 +65,13 @@ impl LibSqlDeletes for Connection {
         log::debug!("Deleted {} rows from nodes", sz);
         Ok(sz)
     }
-    fn delete_tupfile_entries_not_in_present_list(&self) -> Result<()>
+    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>
     {
         self.delete_tupfile_entries_not_in_present_list_inner()?;
         log::debug!("Deleted tupfile_entries not in PresentList table");
         Ok(())
     }
-    fn delete_orphaned_tupentries(&self) -> Result<()>
+    fn mark_orphans_to_delete(&self) -> Result<()>
     {
         self.delete_orphaned_tupentries_inner()?;
         log::debug!("Deleted orphaned tupfile_entries");
@@ -79,23 +79,23 @@ impl LibSqlDeletes for Connection {
     }
 
 
-    fn prune_delete_list_of_present(&self) -> Result<usize> {
+    fn prune_delete_list(&self) -> Result<usize> {
         let sz = self.prune_delete_list_of_present_inner()?;
         log::debug!("Deleted {} rows from delete_list_of_present", sz);
         Ok(sz)
     }
 
-    fn prune_modify_list_of_inputs_and_outputs(&self) -> Result<usize> {
+    fn prune_modify_list(&self) -> Result<usize> {
         let sz = self.prune_modify_list_of_inputs_and_outputs_inner()?;
         log::debug!("Deleted {} rows from modify_list_of_inputs_and_outputs", sz);
         Ok(sz)
     }
-    fn enrich_delete_list_with_dir_dependents(&self) -> Result<usize> {
+    fn mark_dir_dependents_to_delete(&self) -> Result<usize> {
         let sz = self.enrich_delete_list_with_dir_dependents_inner()?;
         log::debug!("Enriched DeleteList with {} children of deleted dirs", sz);
         Ok(sz)
     }
-    fn enrich_delete_list_for_missing_dirs(&self) -> Result<usize> {
+    fn mark_missing_dirs_to_delete(&self) -> Result<usize> {
         let sz = self.enrich_delete_list_for_missing_dirs_inner()?;
         log::debug!("Enriched DeleteList with {} nodes having missing parent dirs", sz);
         Ok(sz)
