@@ -270,6 +270,11 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                         }
                         Ok(0usize)
                     }
+                } else if param_names.is_empty() {
+                    quote! {
+                        let sz = self.execute(#query_str, [])?;
+                        Ok(sz)
+                    }
                 } else {
                     quote! {
                         let mut stmt = self.prepare_cached(#query_str)?;

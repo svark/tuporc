@@ -10,7 +10,7 @@ pub trait LibSqlDeletes {
     fn delete_monitored_by_generation_id(&self, id: i64) -> Result<usize>;
     fn unmark_modified(&self, id: i64) -> Result<usize>;
     fn delete_nodes(&self) -> Result<usize>;
-    fn delete_orphan_dirgen_nodes(&self) -> Result<usize>;
+    fn mark_orphan_dirgen_nodes(&self) -> Result<usize>;
 
     fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>;
 
@@ -65,8 +65,8 @@ impl LibSqlDeletes for Connection {
         Ok(sz)
     }
 
-    fn delete_orphan_dirgen_nodes(&self) -> Result<usize> {
-        let sz = self.delete_orphan_dirgen_nodes_inner()?;
+    fn mark_orphan_dirgen_nodes(&self) -> Result<usize> {
+        let sz = self.mark_orphan_dirgen_nodes_inner()?;
         log::debug!("Deleted {} orphan DirGen nodes", sz);
         Ok(sz)
     }

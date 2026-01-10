@@ -451,3 +451,11 @@ FROM sub_tree;
 -- returns: bool
 SELECT EXISTS(SELECT 1 FROM TupfileEntities WHERE id = :id);
 -- <eos>
+
+-- name: has_rules_tasks_or_globs_inner?
+-- Check if there are rules, tasks or globs in the database
+-- returns: i64
+SELECT 1
+FROM Node
+WHERE type IN (SELECT type_index FROM NodeType WHERE type IN ('Rule', 'Task', 'Glob'));
+--- <eos>

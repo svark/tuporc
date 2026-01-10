@@ -1,9 +1,9 @@
+use crate::db::RowType::TupF;
 use crate::db::{Node, RowType};
 use crate::error::{AnyError, DbResult};
 use crate::queries::LibSqlQueries;
 use rusqlite::{Connection, Result};
 use tupdb_sql_macro::generate_prepared_statements;
-
 /*
 Format for sql statements:
 -- name: <function_name> [!?->]
@@ -27,7 +27,7 @@ pub trait LibSqlInserts {
         node: &Node,
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
-    ) -> Result<(), AnyError>;
+    ) -> Result<bool, AnyError>;
     /// `upsert_node` is akin to the sqlite upsert operation
     /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
     /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
@@ -36,6 +36,7 @@ pub trait LibSqlInserts {
         node: &Node,
         existing_node: &Node,
         compute_sha: impl FnMut() -> String,
+        is_fresh_db: bool,
     ) -> Result<Node, AnyError>;
     fn upsert_node(
         &self,
@@ -149,7 +150,7 @@ impl LibSqlInserts for Connection {
         node: &Node,
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
-    ) -> Result<(), AnyError> {
+    ) -> Result<bool, AnyError> {
         let mut modify = false;
         // verify that columns of this row are the same as `node`'s, if not update them
         if existing_node.get_type().ne(&node.get_type()) {
@@ -218,16 +219,39 @@ impl LibSqlInserts for Connection {
             self.update_node_srcid(node.get_srcid(), existing_node.get_id())?;
             modify = true;
         }
-        if modify {
-            self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
-        }
+
         self.mark_present(existing_node.get_id(), existing_node.get_type())?;
-        Ok(())
+        Ok(modify)
     }
 
-    /// `upsert_node` is akin to the sqlite upsert operation
-    /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
-    /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
+    // same as upsert_node but uses compact insert (avoids display_str, flags, srcid)
+    fn upsert_node_compact(
+        &self,
+        node: &Node,
+        existing_node: &Node,
+        compute_sha: impl FnMut() -> String,
+        is_fresh_db: bool,
+    ) -> Result<Node, AnyError> {
+        let allow_modify = !is_fresh_db || node.get_type().eq(&TupF);
+        if existing_node.is_valid() {
+            let modify = self.update_columns(node, &existing_node, compute_sha)?;
+            if modify && allow_modify {
+                self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
+            }
+            Ok(Node::copy_from(existing_node.get_id(), node))
+        } else {
+            let node = self
+                .insert_node_compact(node)
+                .map(|i| Node::copy_from(i, node))?;
+            if allow_modify {
+                self.mark_modified(node.get_id(), node.get_type())?;
+            }
+            self.mark_present(node.get_id(), node.get_type())?;
+            // node sha is not computed unless needed for a rule
+            Ok::<Node, AnyError>(node)
+        }
+    }
+
     fn upsert_node(
         &self,
         node: &Node,
@@ -235,30 +259,13 @@ impl LibSqlInserts for Connection {
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError> {
         if existing_node.is_valid() {
-            self.update_columns(node, &existing_node, compute_sha)?;
+            let modify = self.update_columns(node, &existing_node, compute_sha)?;
+            if modify {
+                self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
+            }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
             let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
-            self.mark_modified(node.get_id(), node.get_type())?;
-            self.mark_present(node.get_id(), node.get_type())?;
-            // node sha is not computed unless needed for a rule
-            Ok::<Node, AnyError>(node)
-        }
-    }
-    // same as upsert_node but uses compact insert (avoids display_str, flags, srcid)
-    fn upsert_node_compact(
-        &self,
-        node: &Node,
-        existing_node: &Node,
-        compute_sha: impl FnMut() -> String,
-    ) -> Result<Node, AnyError> {
-        if existing_node.is_valid() {
-            self.update_columns(node, &existing_node, compute_sha)?;
-            Ok(Node::copy_from(existing_node.get_id(), node))
-        } else {
-            let node = self
-                .insert_node_compact(node)
-                .map(|i| Node::copy_from(i, node))?;
             self.mark_modified(node.get_id(), node.get_type())?;
             self.mark_present(node.get_id(), node.get_type())?;
             // node sha is not computed unless needed for a rule

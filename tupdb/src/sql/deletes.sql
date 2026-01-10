@@ -119,7 +119,8 @@ FROM Node n
          JOIN NodeType nt ON nt.type_index = n.type
 WHERE d.id IS NULL
   AND nt.class = 'FILE_SYS'
-  AND NOT (n.dir = 0 AND n.name = '.'); -- do not mark the root row
+-- do not mark the root row
+  AND NOT (n.dir = 0 AND n.name = '.');
 -- <eos>
 
 -- name: enrich_delete_list_with_dir_dependents_inner!
@@ -206,7 +207,7 @@ WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Glob')
                   WHERE Node.id = NormalLink.from_id);
 -- <eos>
 
--- name: delete_orphan_dirgen_nodes_inner!
+-- name: mark_orphan_dirgen_nodes_inner!
 -- Delete DirGen nodes that are orphaned (no non-DirGen descendants)
 WITH RECURSIVE
     has_non_dirgen_descendant(id) AS (
@@ -218,14 +219,18 @@ WITH RECURSIVE
         WHERE n.id != 0
     ),
     orphan_dirgens AS (
-        SELECT id,type FROM LiveNode
-        WHERE type = (SELECT type_index FROM NodeType WHERE type = 'DirGen')
-        EXCEPT
-        SELECT id FROM has_non_dirgen_descendant
+        SELECT ld.id, ld.type
+        FROM LiveNode ld
+        WHERE ld.type = (SELECT type_index FROM NodeType WHERE type = 'DirGen')
+          AND NOT EXISTS (
+                SELECT 1
+                FROM has_non_dirgen_descendant h
+                WHERE h.id = ld.id
+            )
     )
 Insert or REPLACE
 into ChangeList(id, type, is_delete)
-SELECT n.id, n.type, 1 from has_non_dirgen_descendant
+SELECT id, type, 1 from orphan_dirgens;
 -- <eos>
 
 -- name: prune_modify_list_of_inputs_and_outputs_inner!

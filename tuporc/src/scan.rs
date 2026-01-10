@@ -1,5 +1,6 @@
 use crate::RowType::File;
 use std::borrow::Borrow;
+use std::cmp::PartialEq;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -32,6 +33,7 @@ use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
+
 const MAX_THRS_NODES: u8 = 4;
 pub const MAX_THRS_DIRS: usize = 24;
 
@@ -42,7 +44,12 @@ pub(crate) fn scan_root(
     conn: TupConnectionPool,
     term_progress: &TermProgress,
 ) -> eyre::Result<()> {
-    insert_direntries(root, conn, term_progress)
+    // Detect a fresh database with no rules/tasks/globs so we can avoid marking every file modified.
+    let is_fresh_db = {
+        let c = conn.get().expect("unable to get connection from pool");
+        c.has_no_rules_task_or_globs().unwrap_or(false)
+    };
+    insert_direntries(root, conn, term_progress, is_fresh_db)
 }
 
 /// mtime stored wrt 1-1-1970
@@ -328,6 +335,7 @@ fn insert_direntries(
     root: &Path,
     pool: TupConnectionPool,
     term_progress: &TermProgress,
+    is_fresh_db: bool,
 ) -> eyre::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     log::debug!("Inserting/updating directory entries to db");
@@ -524,7 +532,13 @@ fn insert_direntries(
                 let err = error.clone();
                 s.spawn(move |_| {
                     let mut conn = pool.get().expect("unable to get connection from pool");
-                    let res = add_modify_nodes(&mut conn, nodereceiver, dirid_sender, &pb)
+                    let res = add_modify_nodes(
+                        &mut conn,
+                        nodereceiver,
+                        dirid_sender,
+                        &pb,
+                        is_fresh_db,
+                    )
                         .wrap_err("adding/modifying nodes");
                     log::debug!("finished adding nodes");
                     if res.is_err() {
@@ -608,20 +622,28 @@ pub(crate) fn build_ignore(root: &Path) -> eyre::Result<Gitignore> {
         .map_err(|e| eyre!("unable to build tupignore: {:?}", e))?;
     Ok(ign)
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NodeState {
+    Absent,
+    Modified,
+    UnModified,
+}
+
+#[derive(Debug, Clone)]
 struct NodeUpdateState {
     pub existing_node: Node,
-    pub modified: bool,
+    pub node_state: NodeState,
 }
 
 impl NodeUpdateState {
-    pub fn new(existing_node: Node, modified: bool) -> NodeUpdateState {
+    pub fn new(existing_node: Node, node_state: NodeState) -> NodeUpdateState {
         NodeUpdateState {
             existing_node,
-            modified,
+            node_state,
         }
     }
-    pub(crate) fn is_modified(&self) -> bool {
-        self.modified
+    pub(crate) fn is_modified_or_new(&self) -> bool {
+        self.node_state == NodeState::Modified || self.node_state == NodeState::Absent
     }
     pub(crate) fn get_existing_node(&self) -> Node {
         self.existing_node.clone()
@@ -631,12 +653,16 @@ impl NodeUpdateState {
 fn fetch_node_update_state(conn: TupConnectionRef, node: &Node) -> NodeUpdateState {
     conn.fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
         .map_or(
-            NodeUpdateState::new(Node::unknown(), true),
+            NodeUpdateState::new(Node::unknown(), NodeState::Absent),
             |existing_node| {
                 let modified = needs_update(node, &existing_node);
                 NodeUpdateState {
                     existing_node,
-                    modified,
+                    node_state: if modified {
+                        NodeState::Modified
+                    } else {
+                        NodeState::UnModified
+                    },
                 }
             },
         )
@@ -666,6 +692,7 @@ fn add_modify_nodes(
     node_at_path_receiver: Receiver<NodeAtPath>,
     dirid_sender: Sender<(HashedPath, i64)>,
     progressbar: &ProgressBar,
+    is_fresh_db: bool,
 ) -> eyre::Result<()> {
     let tx = conn.transaction()?;
     {
@@ -677,9 +704,10 @@ fn add_modify_nodes(
             let node_state = fetch_node_update_state(tx.connection(), node);
             let existing_node = node_state.get_existing_node();
             let is_dir = node.get_type() == &RowType::Dir;
-            let id = if node_state.is_modified() {
+            let id = if node_state.is_modified_or_new() {
                 let compute_node_sha = || compute_path_hash(is_dir, pbuf.clone());
-                let inserted = tx.upsert_node_compact(&node, &existing_node, compute_node_sha)?;
+                let inserted =
+                    tx.upsert_node_compact(&node, &existing_node, compute_node_sha, is_fresh_db)?;
                 inserted.get_id()
             } else {
                 tx.mark_present(existing_node.get_id(), existing_node.get_type())?;
@@ -708,6 +736,8 @@ fn add_modify_nodes(
         .wrap_err("Marking empty generated dirs as deleted")?; // this ai says is needed for database integrity
     tx.mark_dir_dependents_to_delete()
         .wrap_err("Marking nodes of deleted dirs as deleted")?;
+    tx.mark_orphan_dirgen_nodes()
+        .wrap_err("Marking orphaned generated dirs")?;
     //tx.delete_nodes()?;
     tx.commit()?;
 

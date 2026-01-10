@@ -119,6 +119,8 @@ pub trait LibSqlQueries {
     fn fetch_flags(&self, rule_id: i64) -> DbResult<String>;
 
     fn fetch_monitored_files(&self, gen_id: i64) -> DbResult<Vec<(String, bool)>>;
+
+    fn has_no_rules_task_or_globs(&self) -> DbResult<bool>;
 }
 impl LibSqlQueries for rusqlite::Connection {
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node> {
@@ -534,5 +536,13 @@ impl LibSqlQueries for rusqlite::Connection {
             Ok(())
         })?;
         Ok(files)
+    }
+
+    fn has_no_rules_task_or_globs(&self) -> DbResult<bool> {
+        match self.has_rules_tasks_or_globs_inner(|_r: &rusqlite::Row| Ok(())) {
+            Ok(_) => Ok(false), // found at least one row
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
     }
 }
