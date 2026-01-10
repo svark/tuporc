@@ -21,6 +21,17 @@ struct SqlQuery {
     fn_type: SqlFunctionType,
 }
 
+/// Detects if the SQL text contains multiple statements (split by ';' after trimming).
+/// This is used to decide whether to run a batch instead of a prepared statement.
+fn is_batch_sql(query: &str) -> bool {
+    let statements = query
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .count();
+    statements > 1
+}
+
 fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
     let mut queries = Vec::new();
     let blocks = content.split("-- <eos>").filter(|block| !block.is_empty());
@@ -118,12 +129,19 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
     for query in queries {
         let fn_name = format_ident!("{}", query.name);
         let query_str = query.query.clone();
+        let is_batch = is_batch_sql(&query_str);
+        let batch_statements: Vec<String> = query_str
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         let return_str = if query.query_returns.is_empty() {
             "()".to_string()
         } else {
             query.query_returns.clone()
         };
-        use syn::parse_str;
+        use syn::{parse_str, Index};
 
         let return_type: syn::Type = parse_str(&return_str).expect("Failed to parse return type");
 
@@ -230,8 +248,30 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                     fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize>;
                 });
 
-                impl_functions.push(quote! {
-                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize> {
+                let impl_body = if is_batch {
+                    let batch_len = Index::from(batch_statements.len());
+                    let stmts_array: Vec<proc_macro2::TokenStream> =
+                        batch_statements.iter().map(|s| quote! { #s }).collect();
+
+                    quote! {
+                        const BATCH_STMTS: [&str; #batch_len] = [#(#stmts_array),*];
+                        for stmt in BATCH_STMTS.iter() {
+                            if stmt.contains(':') {
+                                self.execute(
+                                    stmt,
+                                    dynamic_named_params! {#(
+                                          #param_names
+                                       ),*
+                                    },
+                                )?;
+                            } else {
+                                self.execute(stmt, [])?;
+                            }
+                        }
+                        Ok(0usize)
+                    }
+                } else {
+                    quote! {
                         let mut stmt = self.prepare_cached(#query_str)?;
                         let sz: usize = stmt.execute(
                             dynamic_named_params! {#(
@@ -240,6 +280,12 @@ pub fn generate_prepared_statements(input: TokenStream) -> TokenStream {
                             }
                         )?;
                         Ok(sz)
+                    }
+                };
+
+                impl_functions.push(quote! {
+                    fn #fn_name(&self, #(#param_types),*) -> rusqlite::Result<usize> {
+                        #impl_body
                     }
                 });
             }

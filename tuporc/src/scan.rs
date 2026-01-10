@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
+use crate::eyre::WrapErr;
 use crate::parse::compute_path_hash;
 use crate::{is_tupfile, TermProgress};
 use crossbeam::channel::{never, tick, Receiver, Sender};
@@ -31,7 +32,6 @@ use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 use tupparser::transform::{compute_dir_sha256, compute_sha256};
 use walkdir::{DirEntry, WalkDir};
-
 const MAX_THRS_NODES: u8 = 4;
 pub const MAX_THRS_DIRS: usize = 24;
 
@@ -300,17 +300,6 @@ fn walkdir_from(
         .unwrap();
 }
 
-fn create_node_at_path<S: AsRef<str>>(
-    dirid: i64,
-    file_name: S,
-    p: HashedPath,
-    mtime: i64,
-    rtype: RowType,
-) -> NodeAtPath {
-    let node = Node::new(0, dirid, mtime, file_name.as_ref().to_string(), rtype);
-    NodeAtPath::new(node, p)
-}
-
 // prepare node for insertion into db
 pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     dirid: i64,
@@ -318,12 +307,21 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     p: HashedPath,
     metadata: Option<Metadata>,
     rtype: &RowType,
+    srcid: i64,
 ) -> Option<NodeAtPath> {
     let mtime = metadata
         .and_then(time_since_unix_epoch)
         .unwrap_or(Duration::from_secs(0))
         .subsec_nanos() as i64;
-    Some(create_node_at_path(dirid, file_name, p, mtime, *rtype))
+    let node = Node::new_withsrc(
+        0,
+        dirid,
+        mtime,
+        file_name.as_ref().to_string(),
+        *rtype,
+        srcid,
+    );
+    Some(NodeAtPath::new(node, p))
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
@@ -343,6 +341,7 @@ fn insert_direntries(
             HashedPath::from(root.to_path_buf()),
             mt,
             &RowType::Dir,
+            -1,
         )
         .expect("Unable to prepare root node for insertion");
 
@@ -360,6 +359,7 @@ fn insert_direntries(
                 HashedPath::from(root.join(TUP_CONFIG)),
                 mt,
                 &File,
+                -1,
             )
             .expect("Unable to prepare tup.config node for insertion");
             let pathbuf = root.join(TUP_CONFIG);
@@ -499,7 +499,7 @@ fn insert_direntries(
                                 if is_tupfile(file_name.as_ref()) { RowType::TupF } else { File }
                             };
                             let node_at_path =
-                                prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype);
+                                prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype, -1);
                             if let Some(node_at_path) = node_at_path {
                                 ns.send(node_at_path).expect("Failed to send prepared node");
                             }
@@ -524,7 +524,8 @@ fn insert_direntries(
                 let err = error.clone();
                 s.spawn(move |_| {
                     let mut conn = pool.get().expect("unable to get connection from pool");
-                    let res = add_modify_nodes(&mut conn, nodereceiver, dirid_sender, &pb);
+                    let res = add_modify_nodes(&mut conn, nodereceiver, dirid_sender, &pb)
+                        .wrap_err("adding/modifying nodes");
                     log::debug!("finished adding nodes");
                     if res.is_err() {
                         log::error!("Error:{:?}", res);
@@ -678,7 +679,7 @@ fn add_modify_nodes(
             let is_dir = node.get_type() == &RowType::Dir;
             let id = if node_state.is_modified() {
                 let compute_node_sha = || compute_path_hash(is_dir, pbuf.clone());
-                let inserted = tx.upsert_node(&node, &existing_node, compute_node_sha)?;
+                let inserted = tx.upsert_node_compact(&node, &existing_node, compute_node_sha)?;
                 inserted.get_id()
             } else {
                 tx.mark_present(existing_node.get_id(), existing_node.get_type())?;
@@ -699,11 +700,14 @@ fn add_modify_nodes(
     }
     drop(node_at_path_receiver);
     drop(dirid_sender);
-    tx.prune_delete_list()?; // remove nodes marked as present from delete list (maybe from previous scans)
-    tx.mark_absent_nodes_to_delete()?;
+    tx.prune_delete_list().wrap_err("Building deleted list")?; // remove nodes marked as present from delete list (maybe from previous scans)
+    tx.mark_absent_nodes_to_delete()
+        .wrap_err("Marking absent nodes as deleted")?;
     // Enrich deletions for nodes whose parent directory entries are missing (orphans)
-    tx.mark_missing_dirs_to_delete()?; // this ai says is needed for database integrity
-    tx.mark_dir_dependents_to_delete()?;
+    tx.mark_missing_dirs_to_delete()
+        .wrap_err("Marking empty generated dirs as deleted")?; // this ai says is needed for database integrity
+    tx.mark_dir_dependents_to_delete()
+        .wrap_err("Marking nodes of deleted dirs as deleted")?;
     //tx.delete_nodes()?;
     tx.commit()?;
 

@@ -265,7 +265,7 @@ fn run_monitor(
             let pd = bo
                 .add_abs(path)
                 .expect("failed to add path to buffer objects");
-            crate::parse::insert_path(tx, &bo, &pd, &mut cross_ref_maps, RowType::File)?;
+            crate::parse::insert_path(tx, &bo, &pd, &mut cross_ref_maps, RowType::File, -1)?;
         } else {
             crate::parse::remove_path_tx(tx, &path)?;
         }

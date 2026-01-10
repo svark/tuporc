@@ -20,6 +20,7 @@ Format for sql statements:
 generate_prepared_statements!("sql/inserts.sql");
 pub trait LibSqlInserts {
     fn insert_node(&self, n: &Node) -> DbResult<i64>;
+    fn insert_node_compact(&self, n: &Node) -> DbResult<i64>;
     fn upsert_env_var(&self, name: &str, value: &str) -> DbResult<UpsertStatus>;
     fn update_columns(
         &self,
@@ -27,6 +28,15 @@ pub trait LibSqlInserts {
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
     ) -> Result<(), AnyError>;
+    /// `upsert_node` is akin to the sqlite upsert operation
+    /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
+    /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
+    fn upsert_node_compact(
+        &self,
+        node: &Node,
+        existing_node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError>;
     fn upsert_node(
         &self,
         node: &Node,
@@ -113,6 +123,16 @@ impl LibSqlInserts for Connection {
         )?;
         Ok(r)
     }
+    fn insert_node_compact(&self, n: &Node) -> DbResult<i64> {
+        let r = self.insert_node_compact_inner(
+            n.get_dir(),
+            n.get_name(),
+            n.get_mtime(),
+            *n.get_type() as u8,
+        )?;
+        Ok(r)
+    }
+
     fn upsert_env_var(&self, name: &str, value: &str) -> DbResult<UpsertStatus> {
         if let Some((id, val)) = self.fetch_env(name).ok() {
             if val == value {
@@ -159,8 +179,10 @@ impl LibSqlInserts for Connection {
             );
             self.update_mtime_ns(node.get_mtime(), existing_node.get_id())?;
             modify = true;
-            if self.replace_node_sha(existing_node.get_id(), compute_sha256).map(|x|
-                x.is_unchanged() ).unwrap_or(false)
+            if self
+                .replace_node_sha(existing_node.get_id(), compute_sha256)
+                .as_ref()
+                .is_ok_and(UpsertStatus::is_unchanged)
             {
                 modify = false;
             }
@@ -217,6 +239,26 @@ impl LibSqlInserts for Connection {
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
             let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
+            self.mark_modified(node.get_id(), node.get_type())?;
+            self.mark_present(node.get_id(), node.get_type())?;
+            // node sha is not computed unless needed for a rule
+            Ok::<Node, AnyError>(node)
+        }
+    }
+    // same as upsert_node but uses compact insert (avoids display_str, flags, srcid)
+    fn upsert_node_compact(
+        &self,
+        node: &Node,
+        existing_node: &Node,
+        compute_sha: impl FnMut() -> String,
+    ) -> Result<Node, AnyError> {
+        if existing_node.is_valid() {
+            self.update_columns(node, &existing_node, compute_sha)?;
+            Ok(Node::copy_from(existing_node.get_id(), node))
+        } else {
+            let node = self
+                .insert_node_compact(node)
+                .map(|i| Node::copy_from(i, node))?;
             self.mark_modified(node.get_id(), node.get_type())?;
             self.mark_present(node.get_id(), node.get_type())?;
             // node sha is not computed unless needed for a rule
@@ -387,17 +429,13 @@ impl LibSqlInserts for Connection {
         node_id: i64,
         mut sha: impl FnMut() -> String,
     ) -> DbResult<UpsertStatus> {
-        let s = self.fetch_saved_nodesha256(node_id);
-        if s.is_err() {
-            Ok(UpsertStatus::Unchanged(node_id))
+        let s = self.fetch_saved_nodesha256(node_id)?;
+        let oldsha = sha();
+        if oldsha.ne(&s) {
+            self.update_node_sha(node_id, oldsha.as_str())?;
+            Ok(UpsertStatus::Updated(node_id))
         } else {
-            let oldsha = sha();
-            if oldsha.ne(&s.unwrap()) {
-                self.update_node_sha(node_id, oldsha.as_str())?;
-                Ok(UpsertStatus::Updated(node_id))
-            } else {
-                Ok(UpsertStatus::Unchanged(node_id))
-            }
+            Ok(UpsertStatus::Unchanged(node_id))
         }
     }
 

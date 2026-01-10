@@ -10,11 +10,11 @@ pub trait LibSqlDeletes {
     fn delete_monitored_by_generation_id(&self, id: i64) -> Result<usize>;
     fn unmark_modified(&self, id: i64) -> Result<usize>;
     fn delete_nodes(&self) -> Result<usize>;
+    fn delete_orphan_dirgen_nodes(&self) -> Result<usize>;
 
     fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>;
 
     fn mark_orphans_to_delete(&self) -> Result<()>;
-
 
     fn prune_delete_list(&self) -> Result<usize>;
     fn prune_modify_list(&self) -> Result<usize>;
@@ -29,7 +29,6 @@ pub trait LibSqlDeletes {
 }
 
 impl LibSqlDeletes for Connection {
-
     fn delete_link(&self, id: i64) -> Result<usize> {
         let sz = self.delete_link_inner(id, id)?;
         log::debug!("Deleted {} row(s) from link", sz);
@@ -65,19 +64,23 @@ impl LibSqlDeletes for Connection {
         log::debug!("Deleted {} rows from nodes", sz);
         Ok(sz)
     }
-    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>
-    {
+
+    fn delete_orphan_dirgen_nodes(&self) -> Result<usize> {
+        let sz = self.delete_orphan_dirgen_nodes_inner()?;
+        log::debug!("Deleted {} orphan DirGen nodes", sz);
+        Ok(sz)
+    }
+
+    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()> {
         self.delete_tupfile_entries_not_in_present_list_inner()?;
         log::debug!("Deleted tupfile_entries not in PresentList table");
         Ok(())
     }
-    fn mark_orphans_to_delete(&self) -> Result<()>
-    {
+    fn mark_orphans_to_delete(&self) -> Result<()> {
         self.delete_orphaned_tupentries_inner()?;
         log::debug!("Deleted orphaned tupfile_entries");
         Ok(())
     }
-
 
     fn prune_delete_list(&self) -> Result<usize> {
         let sz = self.prune_delete_list_of_present_inner()?;
@@ -97,7 +100,10 @@ impl LibSqlDeletes for Connection {
     }
     fn mark_missing_dirs_to_delete(&self) -> Result<usize> {
         let sz = self.enrich_delete_list_for_missing_dirs_inner()?;
-        log::debug!("Enriched DeleteList with {} nodes having missing parent dirs", sz);
+        log::debug!(
+            "Enriched DeleteList with {} nodes having missing parent dirs",
+            sz
+        );
         Ok(sz)
     }
     fn drop_tupfile_entries_table(&self) -> Result<()> {

@@ -61,6 +61,18 @@ into NormalLink (from_id, to_id, is_sticky, to_type)
 Values (:from_id, :to_id, :is_sticky, :to_type)
 ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :is_sticky AND to_type = :to_type;
 -- <eos>
+
+-- name: insert_node_compact_inner ->
+-- Insert a node into the database with minimal parameters
+-- # Parameters
+-- param: dir : i64 - id of the directory in which the node is located
+-- param: name : &str - name of the node
+-- param: mtime_ns : i64 - modification time of the node
+-- param: rtype: u8 - type of the node
+INSERT  into Node (dir, name, mtime_ns, type)
+Values (:dir, :name, :mtime_ns, :rtype);
+-- <eos>
+
 -- name: insert_node_inner ->
 -- Insert a node into the database
 -- # Parameters
@@ -72,7 +84,7 @@ ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :is_sticky AND to_type = 
 -- param: flags : &str - flags for the node
 -- param: srcid : i64 - id of the directory containing tupfile that generated the node
 INSERT into Node (dir, name, mtime_ns, type, display_str, flags, srcid)
-Values (:dir, :name, :mtime_ns, :rtype, :display_str, :flags, :srcid);
+Values (:dir, :name, :mtime_ns, :rtype, :display_str, :flags, NULLIF(:srcid, -1));
 -- <eos>
 
 -- name: insert_env_var_inner ->
@@ -151,7 +163,7 @@ where id = :id;
 -- param: srcid : i64 - new source id
 -- param: id : i64 - id of the node to update
 UPDATE Node
-Set srcid = :srcid
+Set srcid = NULLIF(:srcid, -1)
 where id = :id;
 
 -- <eos>

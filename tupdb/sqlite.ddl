@@ -7,7 +7,8 @@ CREATE TABLE Node
     mtime_ns    INTEGER DEFAULT 0,                          -- mtime of file/dir
     display_str VARCHAR(4096),                              -- string to display in the UI
     flags       VARCHAR(256),-- flags for the node
-    srcid       INTEGER default -1,                         -- id of the dir (which has Tupfile) that generated this node
+    srcid       INTEGER default NULL,                         -- id of the dir (which has Tupfile) that generated this node
+    FOREIGN KEY (srcid) references Node (id) ON DELETE SET NULL,
     UNIQUE (dir, name)                                      --- dir and name make a unique pair for a node
 );
 CREATE TABLE sqlite_sequence

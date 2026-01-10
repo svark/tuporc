@@ -442,6 +442,8 @@ FROM sub_tree;
 
 -- <eos>
 
+
+    
 -- name: check_is_in_update_universe_inner?
 -- Check if the given id is in the update universe
 -- # Parameters

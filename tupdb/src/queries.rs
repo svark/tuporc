@@ -378,7 +378,7 @@ impl LibSqlQueries for rusqlite::Connection {
     fn compute_glob_sha(&self, glob_id: i64) -> DbResult<String> {
         let mut sha = String::new();
         let mut hasher = Sha256::new();
-        self.for_node_with_id(glob_id, |n| {
+        self.for_node_with_id(glob_id, |n: Node| {
             let glob_name = n.get_name();
             let glob_dir_pattern = n.get_display_str();
             let glob_dir_id = n.get_dir();
@@ -390,7 +390,7 @@ impl LibSqlQueries for rusqlite::Connection {
             self.fetch_glob_matches(
                 &path,
                 &format!("{}/{}", glob_dir_pattern, glob_name),
-                |matching_node| {
+                |matching_node: Node| {
                     hasher.update(matching_node.get_name().as_bytes()); // name here is the full path from build root
                     Ok(())
                 },

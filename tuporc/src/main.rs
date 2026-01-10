@@ -29,12 +29,15 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfiles_in_db_for_dump};
 use fs4::fs_std::FileExt;
-use tupdb::db::{delete_db, init_db, is_initialized, log_sqlite_version, start_connection, MiscStatements, TupConnectionPool};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tupdb::db::{
+    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, MiscStatements,
+    TupConnectionPool,
+};
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::NormalPath;
 use tupparser::locate_file;
-use std::time::{SystemTime, UNIX_EPOCH};
 static TUP_DB: &str = ".tup/db";
 static IO_DB: &str = ".tup/io.db";
 mod execute;
@@ -255,10 +258,11 @@ fn main() -> Result<()> {
     }) {
         match act {
             Action::Init => {
-                init_db()?;
+                init_db().wrap_err("Failed to initialize .tup/db")?;
             }
             Action::ReInit => {
                 {
+                    change_root()?;
                     let pool = start_tup_connection()
                         .wrap_err("Failed to connect to tup database during reinit")?;
                     let conn = pool
@@ -286,8 +290,8 @@ fn main() -> Result<()> {
                         })?;
                     }
                 }
-                delete_db()?;
-                init_db()?;
+                delete_db().wrap_err("Reinit: failed to delete existing .tup directory")?;
+                init_db().wrap_err("Reinit: failed to initialize .tup/db")?;
             }
             Action::Scan => {
                 change_root()?;
@@ -308,8 +312,10 @@ fn main() -> Result<()> {
             } => {
                 let root = change_root_update_targets(&mut target)?;
                 if !target.is_empty() {
-                    eprintln!("Warning: parse action on specific targets is for debug purposes only,\
-                     and it may not correctly update all dependencies. Use `tup parse` instead.");
+                    eprintln!(
+                        "Warning: parse action on specific targets is for debug purposes only,\
+                     and it may not correctly update all dependencies. Use `tup parse` instead."
+                    );
                 }
 
                 let pool = start_tup_connection()

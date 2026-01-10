@@ -378,8 +378,9 @@ impl ProcReceivers {
 fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
     let dir = std::env::current_dir()?;
     let bo = BufferObjects::new(root);
-    let dir_desc = bo.add_abs(&dir)
-        .map_err( |e| Error::with_context(e, "While adding current directory to path list".to_string()))?;
+    let dir_desc = bo.add_abs(&dir).map_err(|e| {
+        Error::with_context(e, "While adding current directory to path list".to_string())
+    })?;
     let mut dir_ids = Vec::new();
     for t in targets {
         let path_desc = dir_desc.join(t.as_str())?;
@@ -511,9 +512,13 @@ fn exec_nodes_to_run(
     let mut dirpaths = Vec::new();
     {
         for r in valid_rules.iter() {
-            let path = conn.fetch_dirpath(r.get_dir()).map_err(|_|
-                AnyError::from(format!("unable to fetch dirpath {} for rule: {}",
-                                       r.get_dir(), r.get_name())))?;
+            let path = conn.fetch_dirpath(r.get_dir()).map_err(|_| {
+                AnyError::from(format!(
+                    "unable to fetch dirpath {} for rule: {}",
+                    r.get_dir(),
+                    r.get_name()
+                ))
+            })?;
             dirpaths.push(path);
         }
     }
@@ -1049,13 +1054,15 @@ fn link_output_to_task(
                         if let Ok(out_node) = process_checker.fetch_node_by_id(id) {
                             if out_node.get_srcid() <= 0 {
                                 use tupdb::inserts::LibSqlInserts as _;
-                                let _ = process_checker
-                                    .conn
-                                    .update_srcid(id, task_id)
-                                    .map_err(|e| eyre!(
-                                        "Failed to set srcid for task output '{}': {}",
-                                        file_node, e
-                                    ))?;
+                                let _ = process_checker.conn.update_srcid(id, task_id).map_err(
+                                    |e| {
+                                        eyre!(
+                                            "Failed to set srcid for task output '{}': {}",
+                                            file_node,
+                                            e
+                                        )
+                                    },
+                                )?;
                             }
                         }
                         id

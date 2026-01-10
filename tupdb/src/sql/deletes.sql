@@ -206,6 +206,28 @@ WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Glob')
                   WHERE Node.id = NormalLink.from_id);
 -- <eos>
 
+-- name: delete_orphan_dirgen_nodes_inner!
+-- Delete DirGen nodes that are orphaned (no non-DirGen descendants)
+WITH RECURSIVE
+    has_non_dirgen_descendant(id) AS (
+        SELECT id FROM LiveNode WHERE type != (SELECT type_index FROM NodeType WHERE type = 'DirGen')
+        UNION
+        SELECT n.dir
+        FROM LiveNode n
+                 JOIN has_non_dirgen_descendant ON n.id = has_non_dirgen_descendant.id
+        WHERE n.id != 0
+    ),
+    orphan_dirgens AS (
+        SELECT id,type FROM LiveNode
+        WHERE type = (SELECT type_index FROM NodeType WHERE type = 'DirGen')
+        EXCEPT
+        SELECT id FROM has_non_dirgen_descendant
+    )
+Insert or REPLACE
+into ChangeList(id, type, is_delete)
+SELECT n.id, n.type, 1 from has_non_dirgen_descendant
+-- <eos>
+
 -- name: prune_modify_list_of_inputs_and_outputs_inner!
 -- Prune the modify list of inputs and outputs of rules that are already in the modify list
 -- Call this after the dependent rules have been added to the modify list or delete list

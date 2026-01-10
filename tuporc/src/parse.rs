@@ -46,7 +46,10 @@ fn parse_cancel_flag() -> &'static Arc<AtomicBool> {
     CANCEL_FLAG.get_or_init(|| {
         let flag = Arc::new(AtomicBool::new(false));
         let handler_flag = flag.clone();
-        if let Err(e) = ctrlc::try_set_handler(move || handler_flag.store(true, Ordering::SeqCst)) {
+        if let Err(e) = ctrlc::try_set_handler(move || {
+            eprintln!("Ctrl-C pressed, cancelling...");
+            handler_flag.store(true, Ordering::SeqCst)
+        }) {
             log::warn!("Ctrl-C handler already set: {}", e);
         }
         flag
@@ -332,7 +335,7 @@ impl NodeToInsert {
                 self.get_name(read_write_buffer_objects),
                 self.get_display_str(read_write_buffer_objects),
                 self.get_flags(read_write_buffer_objects),
-                0,
+                self.get_srcid(crossref, read_write_buffer_objects)? as _,
             ),
             TupF | File | GenF | Glob => {
                 Node::new_file_or_genf(
@@ -361,7 +364,7 @@ impl NodeToInsert {
                 self.get_name(read_write_buffer_objects),
                 "".to_string(),
                 "".to_string(),
-                0,
+                self.get_srcid(crossref, read_write_buffer_objects)? as _,
             ),
         })
     }
@@ -795,16 +798,13 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             pb_main.inc(1);
             for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
                 conn.update_node_sha(i, sha.as_str())?;
-                conn.mark_glob_deps(i)
-                    .context("Mark glob dependencies")?; // modified glob -> Tupfile
+                conn.mark_glob_deps(i).context("Mark glob dependencies")?; // modified glob -> Tupfile
             }
             pb_main.inc(1);
 
-            conn.mark_group_deps()
-                .context("Mark group dependencies")?;
+            conn.mark_group_deps().context("Mark group dependencies")?;
             pb_main.inc(1);
-            conn.prune_modify_list()
-                .context("Prune modify list")?;
+            conn.prune_modify_list().context("Prune modify list")?;
             pb_main.inc(1);
             pb_main.finish_with_message("Done enriching modify list");
         }
@@ -928,7 +928,7 @@ fn insert_links(
             crossref,
             &mut link_collector,
         )
-            .context("Inserting links from/to globs")?;
+        .context("Inserting links from/to globs")?;
         add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
         link_collector.links()
     };
@@ -1000,13 +1000,13 @@ fn add_links_from_to_globs(
                 link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
                 Ok(())
             })
-                .wrap_err_with(|| {
-                    eyre!(
+            .wrap_err_with(|| {
+                eyre!(
                     "Adding glob paths at {} from {}",
                     glob_dir,
                     tup_desc.get_path_ref()
                 )
-                })?;
+            })?;
         } else {
             link_collector.add_dir_to_glob_link(glob_desc, resolved_rules.get_tupid());
         }
@@ -1062,8 +1062,8 @@ pub fn gather_modified_tupfiles(
         debug!("tupfile to parse:{}", n.get_name());
         if target_dirs_and_names.is_empty()
             || target_dirs_and_names
-            .iter()
-            .any(|x| n.get_name().strip_prefix(x.as_str()).is_some())
+                .iter()
+                .any(|x| n.get_name().strip_prefix(x.as_str()).is_some())
         {
             tupfiles.push(n);
         }
@@ -1113,7 +1113,7 @@ fn parse_and_add_rules_to_db(
             &mut crossref,
         )
     })
-        .expect("Thread error while fetching resolved rules from tupfiles")?;
+    .expect("Thread error while fetching resolved rules from tupfiles")?;
     Ok(parser)
 }
 
@@ -1391,6 +1391,7 @@ pub(crate) fn insert_path(
     pd: &PathDescriptor,
     cross_ref_maps: &mut CrossRefMaps,
     rtype: RowType,
+    srcid: i64,
 ) -> Result<(i64, i64)> {
     if let Some((id, parent_id)) = cross_ref_maps.get_path_db_id(pd) {
         return Ok((id, parent_id));
@@ -1419,6 +1420,7 @@ pub(crate) fn insert_path(
                 cur_path.as_path(),
                 cur_parent_id,
                 &rtype_parent,
+                -1,
             )?;
             cross_ref_maps.add_path_xref(comp.clone(), inserted_id, cur_parent_id);
             inserted_id
@@ -1438,6 +1440,7 @@ pub(crate) fn insert_path(
         path_buffers.get_path_ref(pd),
         cur_parent_id,
         &rtype,
+        srcid,
     )?;
     cross_ref_maps.add_path_xref(pd.clone(), nid, cur_parent_id);
     Ok((nid, cur_parent_id))
@@ -1450,6 +1453,7 @@ fn insert_node_in_dir(
     path: &Path,
     dir: i64,
     rtype: &RowType,
+    srcid: i64,
 ) -> Result<(i64, i64)> {
     let pbuf = path.to_owned();
     let hashed_path = HashedPath::from(pbuf);
@@ -1458,9 +1462,14 @@ fn insert_node_in_dir(
         metadata = fs::symlink_metadata(path).ok();
     }
     let is_dir = metadata.as_ref().map_or(false, |m| m.is_dir());
-    if let Some(node_at_path) =
-        crate::scan::prepare_node_at_path(dir, name.clone(), hashed_path.clone(), metadata, &rtype)
-    {
+    if let Some(node_at_path) = crate::scan::prepare_node_at_path(
+        dir,
+        name.clone(),
+        hashed_path.clone(),
+        metadata,
+        &rtype,
+        srcid,
+    ) {
         let in_node = node_at_path.get_prepared_node();
         let pbuf = node_at_path.get_hashed_path().clone();
         let node = tx.fetch_upsert_node_raw(in_node, || compute_path_hash(is_dir, pbuf.clone()))?;
@@ -1505,7 +1514,8 @@ fn ensure_parent_inserted(
         .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
             // try adding parent directory if not in db
-            let (dir, pardir) = insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type)?;
+            let (dir, pardir) =
+                insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type, -1)?;
             Ok((dir, pardir))
         })?;
     Ok((dir, pardir))
@@ -1599,7 +1609,7 @@ impl LinkCollector {
             .insert(Link::TupfileToRule(t.clone(), rd.clone()));
     }
 
-    pub(crate) fn links(&self) -> impl Iterator<Item=&Link> {
+    pub(crate) fn links(&self) -> impl Iterator<Item = &Link> {
         self.links.iter()
     }
 }
@@ -1791,6 +1801,16 @@ fn insert_nodes(
     //let mut paths_to_update: HashMap<i64, i64> = HashMap::new();  we dont update nodes until rules are executed.
     let mut envs_to_insert = HashSet::new();
 
+    let check_cancel = || {
+        let cancel = parse_cancel_flag();
+        if cancel.load(Ordering::SeqCst) {
+            pb_insert.map(|pb| {
+                term_progress.abandon(pb, "Insertion interrupted by user (Ctrl-C)".to_string())
+            });
+            return Err(eyre!("Insertion interrupted by user (Ctrl-C)"));
+        }
+        Ok(())
+    };
     let get_dir = |tup_desc: &TupPathDescriptor, crossref: &CrossRefMaps| -> Result<i64> {
         crossref
             .get_tup_db_id(tup_desc)
@@ -1848,6 +1868,7 @@ fn insert_nodes(
             for env in rl.get_env_list().iter() {
                 collector.add_env(&env);
             }
+            check_cancel()?;
         }
         collector.nodes()
     };
@@ -1876,16 +1897,23 @@ fn insert_nodes(
     //check_cancel()?;
 
     for (parent_desc, rowtype) in parent_descriptors {
-        if !parent_desc.is_root() && crossref.get_path_db_id(&parent_desc).is_none() {
-            let (parid, parparid) =
-                ensure_parent_inserted(tx, read_write_buf.get(), crossref, &rowtype, &parent_desc)?;
-            if !parid.is_negative() {
-                crossref.add_path_xref(parent_desc, parid, parparid);
-            }
+        if parent_desc.is_root() || crossref.get_path_db_id(&parent_desc).is_some() {
+            // already inserted
+            continue;
+        }
+        let (parid, parparid) =
+            ensure_parent_inserted(tx, read_write_buf.get(), crossref, &rowtype, &parent_desc)?;
+        if !parid.is_negative() {
+            crossref.add_path_xref(parent_desc, parid, parparid);
         }
     }
-    for node_to_insert in &nodes {
-        //check_cancel()?;
+    let node_cnt = nodes.len();
+    let sqrt_node_cnt = (node_cnt as f64).sqrt() as usize + 1;
+    for (i, node_to_insert) in nodes.iter().enumerate() {
+        if i % sqrt_node_cnt == 0 {
+            log::info!("Inserting node {}/{} ", i + 1, nodes.len());
+            check_cancel()?;
+        }
         debug!("inserting node: {:?}", node_to_insert);
         let node = node_to_insert.get_node(&read_write_buf, crossref)?;
         let compute_sha = || {
@@ -1932,7 +1960,7 @@ fn insert_nodes(
             term_progress.tick(pb);
         }
     }
-    //check_cancel()?;
+    check_cancel()?;
 
     if let Some(pb) = pb_insert {
         pb.set_message(format!("✔ Done {}", insert_label));
@@ -1963,7 +1991,11 @@ fn insert_nodes(
             .flat_map(|rl| rl.iter())
             .flat_map(|rl| rl.get_deps().iter().map(|s| (rl.get_task_loc(), s)))
     };
-    for (i, s) in srcs_from_links.chain(srcs_from_tasks) {
+    for (index, (i, s)) in srcs_from_links.chain(srcs_from_tasks).enumerate() {
+        if index % 10 == 0 {
+            log::info!("Validating input cross references: {}", index + 1);
+            check_cancel()?;
+        }
         if let Some(pd) = s.get_resolved_path_desc() {
             let (_, _) = crossref
                 .get_path_db_id(&pd.get_parent_descriptor())

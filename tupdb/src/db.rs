@@ -198,6 +198,26 @@ impl Node {
             srcid: -1,
         }
     }
+    pub fn new_withsrc(
+        id: i64,
+        dirid: i64,
+        mtime: i64,
+        name: String,
+        rtype: RowType,
+        srcid: i64,
+    ) -> Node {
+        Node {
+            id,
+            dirid,
+            mtime,
+            name,
+            rtype,
+            display_str: "".to_string(),
+            flags: "".to_string(),
+            srcid,
+        }
+    }
+
     pub fn unknown() -> Node {
         Node {
             id: -1,
@@ -440,23 +460,44 @@ impl<'a> MiscStatements for TupConnectionRef<'a> {
 }
 
 pub fn delete_db() -> DbResult<()> {
-    std::fs::remove_dir_all(".tup").map_err(|e| AnyError::from(e.to_string()))?;
+    std::fs::remove_dir_all(".tup").map_err(|e| {
+        AnyError::from(format!(
+            "Failed to remove existing .tup directory during reinit: {e}"
+        ))
+    })?;
     Ok(())
 }
 // Handle the tup init subcommand. This creates the file .tup\db and adds the tables
 pub fn init_db() -> DbResult<()> {
     println!("Creating a new db.");
     //use std::fs;
-    std::fs::create_dir_all(".tup").expect("Unable to access .tup dir");
-    let conn = Connection::open(".tup/db").expect("Failed to connect to .tup\\db");
+    std::fs::create_dir_all(".tup").map_err(|e| {
+        AnyError::from(format!(
+            "Unable to access or create .tup directory before initializing DB: {e}"
+        ))
+    })?;
+    let conn = Connection::open(".tup/db").map_err(|e| {
+        AnyError::from(format!(
+            "Failed to open connection to .tup/db while initializing: {e}"
+        ))
+    })?;
     if is_initialized(&conn, "Node") {
         return Err(AnyError::from(String::from(
             "Node table already exists in .tup/db",
         )));
     }
-    conn.execute_batch(include_str!("sql/node_table.sql"))?;
+    conn.execute_batch(include_str!("sql/node_table.sql"))
+        .map_err(|e| {
+            AnyError::from(format!(
+                "Failed to execute schema creation statements for .tup/db: {e}"
+            ))
+        })?;
 
-    let _ = File::create("Tupfile.ini").map_err(|e| AnyError::from(e.to_string()))?;
+    File::create("Tupfile.ini").map_err(|e| {
+        AnyError::from(format!(
+            "Failed to create Tupfile.ini after initializing database: {e}"
+        ))
+    })?;
     println!("Database created successfully.");
     Ok(())
 }
@@ -523,7 +564,11 @@ impl TupConnection {
     }
 
     pub fn transaction(&mut self) -> DbResult<TupTransaction<'_>> {
-        Ok(TupTransaction::new(self.0.transaction()?))
+        let t = self.0.unchecked_transaction()?;
+        // Disable FK checks within scan/parse transactions for speed; callers should ensure consistency.
+        t.execute("PRAGMA foreign_keys=OFF", [])?;
+        t.execute("PRAGMA defer_foreign_keys=ON", [])?;
+        Ok(TupTransaction::new(t))
     }
     pub fn deferred_transaction(&mut self) -> DbResult<TupTransaction<'_>> {
         Ok(TupTransaction::new(
@@ -566,13 +611,21 @@ impl DerefMut for TupConnection {
 }
 pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
     let pool = TupConnectionPool::new(database_url);
-    let conn = pool.get().map_err(|e| AnyError::from(e))?;
+    let conn = pool.get().map_err(|e| {
+        AnyError::from(format!(
+            "Failed to obtain connection for {database_url}: {e}"
+        ))
+    })?;
     if !is_initialized(&conn, "Node") {
         return Err(AnyError::from(String::from(format!(
             "Node table not found in {database_url}"
         ))));
     }
-    conn.execute("PRAGMA optimize;", [])?;
+    conn.execute("PRAGMA optimize;", []).map_err(|e| {
+        AnyError::from(format!(
+            "Failed to run PRAGMA optimize on {database_url}: {e}"
+        ))
+    })?;
     #[cfg(debug_assertions)]
     {
         let mut stmt = conn.prepare("PRAGMA compile_options")?;
@@ -592,7 +645,7 @@ pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
 pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
     #[cfg(debug_assertions)]
     let start_time = std::time::Instant::now();
-    
+
     let dirpathbuf_create_sql = include_str!("sql/dirpathbuf_temptable.sql");
     let dirpathbuf_indices_sql = include_str!("sql/dirpathbuf_indices.sql");
 
@@ -741,7 +794,9 @@ impl MiscStatements for TupConnection {
             .query_row("SELECT COUNT(1) FROM PresentList", [], |row| row.get(0))
             .unwrap_or(0);
         if present_count == 0 {
-            log::warn!("PresentList is empty; skipping mark_missing_not_deleted to avoid mass deletes");
+            log::warn!(
+                "PresentList is empty; skipping mark_missing_not_deleted to avoid mass deletes"
+            );
             return Ok(());
         }
         // Mark FILE_SYS nodes that are absent from PresentList and not already marked delete.

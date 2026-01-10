@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-hashbrown = "0.15.2"
-parking_lot = "0.12.3"
+hashbrown = "0.16.1"
+parking_lot = "0.12.5"
 tinyset = "0.5.2"
-thiserror = "2.0.12"
+thiserror = "2.0.17"
 bstr = "1.11.3"
-regex = "1.11.1"
-log = "0.4.27"
+regex = "1.12.2"
+log = "0.4.29"
 tupcompat = {path = "../tupcompat"}
