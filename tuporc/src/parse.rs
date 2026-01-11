@@ -1184,6 +1184,21 @@ where
             return Err(eyre!("Parse interrupted by Ctrl-C"));
         }
 
+        // If a Tupfile produced no rules, mark it resolved (unmark modified) but warn.
+        if resolved_rules.is_empty() {
+            if let Some((dbid, _)) = crossref.get_tup_db_id(resolved_rules.get_tupid()) {
+                tx.unmark_modified(dbid)?;
+            }else {
+                log::error!("Tupfile {:?} not found in crossref maps", resolved_rules.get_tupid());
+            }
+            log::info!(
+                "Tupfile {} produced no rules; marking as resolved",
+                insert_label
+            );
+            tx.commit()?;
+            return Ok(());
+        }
+
         insert_nodes(
             &mut tx,
             &rwbufs,
@@ -1203,9 +1218,6 @@ where
         Ok(())
     };
     let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
-        if resolved_rules.is_empty() {
-            return Ok(());
-        }
         insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
     };
 
@@ -1286,8 +1298,6 @@ fn parse_subset(
             .map_err(|error| {
                 let rwbuf = parser_clone.read_write_buffers();
                 let display_str = rwbuf.display_str(&error);
-                term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-                poisoned.store(true, Ordering::SeqCst);
                 // drop(wg);
                 eyre!(
                     "Error while parsing tupfile: {}:\n {} due to \n{}",
@@ -1298,6 +1308,8 @@ fn parse_subset(
             });
         if let Err(e) = res {
             drop(wg);
+            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
+            poisoned.store(true, Ordering::SeqCst);
             log::error!("Error {e} \n found parsing tupfile :{}", tupfile_name);
             return Err(e);
         }
