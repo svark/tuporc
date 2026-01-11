@@ -458,4 +458,4 @@ SELECT EXISTS(SELECT 1 FROM TupfileEntities WHERE id = :id);
 SELECT 1
 FROM Node
 WHERE type IN (SELECT type_index FROM NodeType WHERE type IN ('Rule', 'Task', 'Glob'));
---- <eos>
+-- <eos>
