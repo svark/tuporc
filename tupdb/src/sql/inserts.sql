@@ -221,7 +221,12 @@ FROM Node
          LEFT JOIN PresentList ON Node.id = PresentList.id
          INNER JOIN NodeType ON Node.type = NodeType.type_index
 WHERE PresentList.id IS NULL
-  AND (NodeType.class = 'FILE_SYS');
+  AND (NodeType.class = 'FILE_SYS')
+  AND (
+        -- Only consider nodes produced by or belonging to currently parsed Tupfiles/entities
+        Node.id IN (SELECT id FROM TupfileEntities)
+        OR Node.srcid IN (SELECT id FROM TupfileEntities)
+      );
 -- <eos>
 -- name: create_tupfile_entities_table_inner!
 -- Create a temporary table to store tupfile entities which have id/type pairs of outputs and rules/tasks that generate them

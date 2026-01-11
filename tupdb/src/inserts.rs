@@ -411,6 +411,16 @@ impl LibSqlInserts for Connection {
     }
 
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()> {
+        // If PresentList is empty (e.g., skip-scan), skip to avoid mass-deleting everything.
+        let present_count: i64 = self
+            .query_row("SELECT COUNT(1) FROM PresentList", [], |row| row.get(0))
+            .unwrap_or(0);
+        if present_count == 0 {
+            log::warn!(
+                "PresentList is empty; skipping mark_absent_nodes_to_delete to avoid mass deletes"
+            );
+            return Ok(());
+        }
         self.add_not_present_to_delete_list_inner()?;
         Ok(())
     }
