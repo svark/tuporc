@@ -47,7 +47,7 @@ pub(crate) fn scan_root(
     // Detect a fresh database with no rules/tasks/globs so we can avoid marking every file modified.
     let is_fresh_db = {
         let c = conn.get().expect("unable to get connection from pool");
-        c.has_no_rules_task_or_globs().unwrap_or(false)
+        c.has_no_rules_task_or_globs()?
     };
     insert_direntries(root, conn, term_progress, is_fresh_db)
 }

@@ -1188,8 +1188,11 @@ where
         if resolved_rules.is_empty() {
             if let Some((dbid, _)) = crossref.get_tup_db_id(resolved_rules.get_tupid()) {
                 tx.unmark_modified(dbid)?;
-            }else {
-                log::error!("Tupfile {:?} not found in crossref maps", resolved_rules.get_tupid());
+            } else {
+                log::error!(
+                    "Tupfile {:?} not found in crossref maps",
+                    resolved_rules.get_tupid()
+                );
             }
             log::info!(
                 "Tupfile {} produced no rules; marking as resolved",
