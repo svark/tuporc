@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use crate::eyre::WrapErr;
 use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
@@ -154,11 +155,14 @@ pub(crate) fn execute_targets(
             node.get_dir(),
             rule_string,
         );
+        if matches!(new_name, Cow::Borrowed(_)) {
+            return Ok(node); // no replacements done
+        }
 
         Ok(Node::new_rule(
             node.get_id(),
             node.get_dir(),
-            new_name,
+            new_name.to_string(),
             node.get_display_str().to_string(),
             node.get_flags().to_string(),
             node.get_srcid() as _,
