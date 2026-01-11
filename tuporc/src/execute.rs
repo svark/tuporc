@@ -1,3 +1,4 @@
+use crate::eyre::WrapErr;
 use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,6 @@ use tupdb::db::RowType::Excluded;
 use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
-use tupparser::errors::Error;
 
 #[derive(Debug, Clone)]
 struct PoisonedState {
@@ -378,9 +378,9 @@ impl ProcReceivers {
 fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> Result<Vec<i64>> {
     let dir = std::env::current_dir()?;
     let bo = BufferObjects::new(root);
-    let dir_desc = bo.add_abs(&dir).map_err(|e| {
-        Error::with_context(e, "While adding current directory to path list".to_string())
-    })?;
+    let dir_desc = bo
+        .add_abs(&dir)
+        .wrap_err("While adding current directory to path list")?;
     let mut dir_ids = Vec::new();
     for t in targets {
         let path_desc = dir_desc.join(t.as_str())?;

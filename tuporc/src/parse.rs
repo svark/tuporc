@@ -1233,12 +1233,7 @@ where
     pb.set_message("Resolving statements..");
     parser
         .receive_resolved_statements(receiver, insert_to_db_wrap_err)
-        .map_err(|error| {
-            let read_write_buffers = parser.read_write_buffers();
-            let display_str = read_write_buffers.display_str(&error);
-            term_progress.abandon(&pb, "Error resolving statements".to_string());
-            eyre!("Unable to resolve statements in tupfiles:\n{}", display_str,)
-        })?;
+        .wrap_err("Unable to resolve statements in tupfiles")?;
     log::info!("Finished resolving statements from parsed tupfiles");
     pb.set_message("Finalizing database updates..");
     let psx = parser_c.get_searcher();
@@ -1915,26 +1910,8 @@ fn insert_nodes(
             check_cancel()?;
         }
         debug!("inserting node: {:?}", node_to_insert);
-        let node = node_to_insert.get_node(&read_write_buf, crossref)?;
-        let compute_sha = || {
-            let tup_connection_ref = tx.connection();
-            node_to_insert
-                .compute_node_sha(&tup_connection_ref, read_write_buf.get())
-                .unwrap_or_default()
-        };
-        let (db_id, db_par_id) = {
-            let upsnode = tx.fetch_upsert_node(&node, compute_sha)?;
-            (upsnode.get_id(), upsnode.get_dir())
-        };
-        if !db_id.is_negative() {
-            node_to_insert.update_crossref(crossref, db_id, db_par_id);
-            let sha = compute_sha();
-            if !sha.is_empty() {
-                tx.upsert_node_sha(db_id, &sha)?;
-            }
-        } else {
-            log::warn!("Failed to insert node: {:?}", node);
-        }
+        insert_node(tx, &read_write_buf, crossref, node_to_insert)
+            .wrap_err(format!("Inserting node :{:?}", node_to_insert))?;
         if let Some(pb) = pb_insert {
             term_progress.tick(pb);
         }
@@ -2010,6 +1987,39 @@ fn insert_nodes(
         }
     }
 
+    Ok(())
+}
+
+fn insert_node(
+    tx: &mut TupTransaction,
+    read_write_buf: &&ReadWriteBufferObjects,
+    crossref: &mut CrossRefMaps,
+    node_to_insert: &NodeToInsert,
+) -> Result<(), Report> {
+    let node = node_to_insert.get_node(&read_write_buf, crossref)?;
+    // Cache the sha so we don't recompute it on modified existing nodes.
+    let compute_sha = || {
+        let tup_connection_ref = tx.connection();
+        let sha = node_to_insert
+            .compute_node_sha(&tup_connection_ref, read_write_buf.get())
+            .unwrap_or_default();
+        sha
+    };
+    let sha = compute_sha(); // need to compute sha before upsert for new nodes and modified nodes
+    let (db_id, db_par_id) = {
+        let upsnode = tx.fetch_upsert_node(&node, || sha.clone())?;
+        (upsnode.get_id(), upsnode.get_dir())
+    };
+    if !db_id.is_negative() {
+        node_to_insert.update_crossref(crossref, db_id, db_par_id);
+        {
+            if !sha.is_empty() {
+                tx.upsert_node_sha(db_id, &sha)?;
+            }
+        }
+    } else {
+        log::warn!("Failed to insert node: {:?}", node);
+    }
     Ok(())
 }
 
