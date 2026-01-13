@@ -10,7 +10,8 @@ Format for sql statements:
 -- # Parameters:
 -- param: param_name1: type1
 -- param: param_name2: type2
-<sql statements>
+<sql statements> each ending with ;
+-- <eos>
 ...
 ! -> return type is () is used for insert/update/delete statements
 ? -> takes a closure as a parameter to process each row returned by the query
@@ -77,7 +78,6 @@ pub trait LibSqlInserts {
     ) -> DbResult<()>;
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
     fn mark_tupfile_outputs(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
-    fn create_tupfile_entries_table(&self) -> DbResult<()>;
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
     fn mark_rules_with_changed_io(&self) -> DbResult<()>;
     fn mark_group_deps(&self) -> DbResult<()>;
@@ -405,10 +405,6 @@ impl LibSqlInserts for Connection {
         Ok(())
     }
 
-    fn create_tupfile_entries_table(&self) -> DbResult<()> {
-        self.create_tupfile_entities_table_inner()?;
-        Ok(())
-    }
 
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()> {
         // If PresentList is empty (e.g., skip-scan), skip to avoid mass-deleting everything.

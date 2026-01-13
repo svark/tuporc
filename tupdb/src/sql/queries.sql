@@ -437,7 +437,7 @@ WITH RECURSIVE sub_tree AS (
     FROM DirPathBuf dt
              JOIN sub_tree st ON dt.dir = st.id
         AND (st.depth < :glob_depth))
-SELECT name
+SELECT id
 FROM sub_tree;
 
 -- <eos>

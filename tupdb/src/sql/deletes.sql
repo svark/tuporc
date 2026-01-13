@@ -78,17 +78,6 @@ where id = :id
   and is_delete = 1;
 -- <eos>
 
--- name: prune_modify_list_of_success_inner!
--- Prune the modify list
--- # Parameters
-DELETE
-from ChangeList
-where id not in (
-    SELECT id FROM ChangeList WHERE is_delete = 1
-    UNION
-    SELECT id FROM SuccessList
-);
--- <eos>
 
 -- name: prune_delete_list_of_present_inner!
 -- Prune the delete list of PresentList
@@ -97,6 +86,13 @@ DELETE
 from ChangeList
 where EXISTS (SELECT 1 from PresentList as P where P.id = ChangeList.id)
   and is_delete = 1;
+-- <eos>
+
+-- name: prune_delete_list_inner!
+-- Prune the delete list
+-- # Parameters
+DELETE
+from ChangeList where is_delete = 1;
 -- <eos>
 
 -- name: delete_tupfile_entries_not_in_present_list_inner!
@@ -134,7 +130,7 @@ FROM Node n
 -- <eos>
     
 -- name: delete_orphaned_tupentries_inner!
--- Delete all nodes that are defined by tupfiles in delete list
+-- Delete all nodes orphaned by deletion of their source tupfile or rule
 -- # Parameters
 insert or
 REPLACE

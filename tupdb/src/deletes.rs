@@ -16,6 +16,7 @@ pub trait LibSqlDeletes {
 
     fn mark_orphans_to_delete(&self) -> Result<()>;
 
+    fn prune_delete_of_present_list(&self) -> Result<usize>;
     fn prune_delete_list(&self) -> Result<usize>;
     fn prune_modify_list(&self) -> Result<usize>;
 
@@ -82,9 +83,14 @@ impl LibSqlDeletes for Connection {
         Ok(())
     }
 
-    fn prune_delete_list(&self) -> Result<usize> {
+    fn prune_delete_of_present_list(&self) -> Result<usize> {
         let sz = self.prune_delete_list_of_present_inner()?;
         log::debug!("Deleted {} rows from delete_list_of_present", sz);
+        Ok(sz)
+    }
+    fn prune_delete_list(&self) -> Result<usize> {
+        let sz = self.prune_delete_list_inner()?;
+        log::debug!("Deleted {} rows from delete_list", sz);
         Ok(sz)
     }
 

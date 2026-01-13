@@ -59,7 +59,7 @@ pub trait LibSqlQueries {
 
     fn for_each_glob_dir<F>(&self, dir_id: i64, depth: i32, f: F) -> DbResult<()>
     where
-        F: FnMut(String) -> DbResult<()>;
+        F: FnMut(i64) -> DbResult<()>;
     fn fetch_rules_to_run(&self) -> DbResult<Vec<Node>>;
     fn fetch_tasks_to_run(&self) -> DbResult<Vec<Node>>;
 
@@ -250,11 +250,11 @@ impl LibSqlQueries for rusqlite::Connection {
 
     fn for_each_glob_dir<F>(&self, dir_id: i64, depth: i32, mut f: F) -> DbResult<()>
     where
-        F: FnMut(String) -> DbResult<()>,
+        F: FnMut(i64) -> DbResult<()>,
     {
         self.for_each_glob_dir_inner(dir_id, depth, |row| {
-            let path: String = row.get(0)?;
-            f(path).map_err(internal_sqlite_error)
+            let child_dirid: i64 = row.get(0)?;
+            f(child_dirid).map_err(internal_sqlite_error)
         })?;
         Ok(())
     }
