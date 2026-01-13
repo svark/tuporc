@@ -728,7 +728,7 @@ fn add_modify_nodes(
     }
     drop(node_at_path_receiver);
     drop(dirid_sender);
-    tx.prune_delete_list().wrap_err("Building deleted list")?; // remove nodes marked as present from delete list (maybe from previous scans)
+    tx.prune_delete_of_present_list().wrap_err("Building deleted list")?; // remove nodes marked as present from delete list (maybe from previous scans)
     tx.mark_absent_nodes_to_delete()
         .wrap_err("Marking absent nodes as deleted")?;
     // Enrich deletions for nodes whose parent directory entries are missing (orphans)

@@ -40,6 +40,7 @@ use tupparser::{
 };
 use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 use RowType::Group;
+const BUFFER_SIZE: usize = 10;
 
 fn parse_cancel_flag() -> &'static Arc<AtomicBool> {
     static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -709,9 +710,6 @@ impl PathSearcher for DbPathSearcher {
         self.root.as_path()
     }
 
-    fn merge(&mut self, p: &impl PathBuffers, o: &impl OutputHandler) -> Result<(), Error> {
-        OutputHandler::merge(&mut self.psx, p, o)
-    }
     fn is_dir(&self, pd: &PathDescriptor) -> (bool, i64) {
         let conn = self.conn.get().expect("connection not found");
         conn.fetch_dirid_by_path(pd.get_path_ref())
@@ -772,7 +770,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             .as_secs() as i64;
         tx.set_run_status("parse", "in_progress", now)?;
         tx.commit()?;
-        conn.create_tupfile_entries_table()?;
+        tupdb::db::create_temptables(&conn)?; // for PresentList, TupfileEntries
     }
     //conn.prune_modified_list_basic()?;
     let db = DbPathSearcher::new(connection.clone(), root.as_ref());
@@ -785,21 +783,11 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         {
             let tp = term_progress.clone();
             tp.set_main_with_len("Enriching modify list", 7);
-            conn.mark_orphans_to_delete()?;
+            //conn.mark_orphans_to_delete()?;
             let pb_main = term_progress.pb_main.clone();
             pb_main.inc(1);
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
-            pb_main.inc(1);
-
-            // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
-            conn.mark_tupfile_deps()
-                .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
-            pb_main.inc(1);
-            for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
-                conn.update_node_sha(i, sha.as_str())?;
-                conn.mark_glob_deps(i).context("Mark glob dependencies")?; // modified glob -> Tupfile
-            }
             pb_main.inc(1);
 
             conn.mark_group_deps().context("Mark group dependencies")?;
@@ -902,10 +890,14 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
             tx.insert_link(tupfile_id.0, rule_id.0, false.into(), Rule)?;
         }
-        Link::DirToGlob(dir, glob) => {
+        Link::DirToGlob(dir, glob, depth) => {
             let dir_id = crossref.get_path_db_id_ok(&dir)?;
             let glob_id = crossref.get_glob_db_id_ok(&glob)?;
+            let more_dirs = fetch_deeper_dirs(&tx.connection(), glob_id.0, *depth)?;
             tx.insert_link(dir_id.0, glob_id.0, true.into(), Glob)?;
+            for d in more_dirs {
+                tx.insert_link(d, glob_id.0, true.into(), Glob)?;
+            }
         }
     }
     Ok(())
@@ -913,36 +905,15 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
 
 fn insert_links(
     tx: &mut TupTransaction,
-    resolved_rules: &ResolvedRules,
+    //resolved_rules: &ResolvedRules,
+    tup_id: &TupPathDescriptor,
     crossref: &mut CrossRefMaps,
+    link_collector: &LinkCollector,
 ) -> Result<()> {
     // collect all un-added groups and add them in a single transaction.
-    let mut link_collector = LinkCollector::new();
-    let links = {
-        for tupfile_read in resolved_rules.get_tupfiles_read() {
-            link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
-        }
-        add_links_from_to_globs(
-            &tx.connection(),
-            resolved_rules,
-            crossref,
-            &mut link_collector,
-        )
-        .context("Inserting links from/to globs")?;
-        add_links_from_to_rules_and_groups(resolved_rules, &mut link_collector);
-        link_collector.links()
-    };
-    {
-        for l in links {
-            insert_link(&tx, l, crossref).map_err(|e| {
-                eyre!(
-                    "error while inserting link {:?} in tupfile {:?} due to :{}",
-                    l,
-                    resolved_rules.get_tupid(),
-                    e
-                )
-            })?;
-        }
+    for l in link_collector.links() {
+        insert_link(&tx, l, crossref)
+            .context(format!("Inserting link {:?} in tupfile {:?}", l, tup_id,))?;
     }
     Ok(())
 }
@@ -972,46 +943,38 @@ fn add_links_from_to_rules_and_groups(
     }
 }
 
-fn add_links_from_to_globs(
-    conn: &TupConnectionRef,
+fn collect_links_from_to_globs(
     resolved_rules: &ResolvedRules,
-    crossref: &mut CrossRefMaps,
     link_collector: &mut LinkCollector,
 ) -> Result<(), Report> {
     for glob_desc in resolved_rules.get_globs_read() {
-        let (_, glob_dir) = crossref.get_glob_db_id_ok(glob_desc).wrap_err_with(|| {
-            eyre!(
-                "Error adding links from/to glob mentioned in tupfile {:?}",
-                resolved_rules.get_tupid()
-            )
-        })?;
-        link_collector.add_globs_read_to_tupfile_link(glob_desc, resolved_rules.get_tupid());
+        let tup_desc = resolved_rules.get_tupid();
+        link_collector.add_glob_to_tupfile_link(glob_desc, tup_desc);
         let glob_path = GlobPath::build_from(&PathDescriptor::default(), glob_desc)?;
         let non_pattern_path = glob_path.get_non_pattern_prefix_desc();
         let depth = glob_desc.components().count() - non_pattern_path.components().count();
-        let tup_desc = resolved_rules.get_tupid();
         if depth > 1 {
-            conn.for_each_glob_dir(glob_dir, depth as i32, |dir| -> DbResult<()> {
-                let tup_cwd = PathDescriptor::default();
-                let dir_path = tup_cwd
-                    .join(dir)
-                    .map_err(Error::from)
-                    .map_err(into_any_error)?;
-                link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
-                Ok(())
-            })
-            .wrap_err_with(|| {
-                eyre!(
-                    "Adding glob paths at {} from {}",
-                    glob_dir,
-                    tup_desc.get_path_ref()
-                )
-            })?;
+            link_collector.add_dir_to_glob_link_deep(non_pattern_path, glob_desc, depth);
         } else {
-            link_collector.add_dir_to_glob_link(glob_desc, resolved_rules.get_tupid());
+            link_collector.add_dir_to_glob_link(non_pattern_path, glob_desc);
         }
     }
     Ok(())
+}
+
+fn fetch_deeper_dirs(
+    conn: &TupConnectionRef,
+    glob_dir: i64,
+    depth: usize,
+) -> Result<Vec<i64>, Report> {
+    let mut links = Vec::new();
+    conn.for_each_glob_dir(glob_dir, depth as i32, |id: i64| -> DbResult<()> {
+        links.push(id);
+        //link_collector.add_dir_to_glob_link(&dir_path, resolved_rules.get_tupid());
+        Ok(())
+    })
+    .wrap_err_with(|| eyre!("Adding glob paths at {}", glob_dir,))?;
+    Ok(links)
 }
 
 // Gather all the modified tupfiles within directories specified
@@ -1035,6 +998,15 @@ pub fn gather_modified_tupfiles(
     term_progress.tick(&term_progress.pb_main);
 
     create_presentlist_temptable(conn)?;
+
+    term_progress.tick(&term_progress.pb_main);
+    // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
+    conn.mark_tupfile_deps()
+        .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
+    for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
+        conn.update_node_sha(i, sha.as_str())?;
+        conn.mark_glob_deps(i).context("Mark glob dependencies")?; // modified glob -> Tupfile
+    }
     term_progress.tick(&term_progress.pb_main);
 
     let mut target_dirs_and_names = Vec::new();
@@ -1116,23 +1088,94 @@ fn parse_and_add_rules_to_db(
     .expect("Thread error while fetching resolved rules from tupfiles")?;
     Ok(parser)
 }
+fn check_cancel() -> Result<()> {
+    let cancel = parse_cancel_flag();
+    if cancel.load(Ordering::SeqCst) {
+        return Err(eyre!("Insertion interrupted by user (Ctrl-C)"));
+    }
+    Ok(())
+}
+/// A snapshot of the nodes and links to insert for a single tupfile
+#[derive(Debug, Clone)]
+struct TupBuildGraphSnapshot {
+    tup_id: TupPathDescriptor,
+    envs_to_insert: HashSet<EnvDescriptor>,
+    nodes_to_insert: Vec<NodeToInsert>,
+    link_collector: LinkCollector,
+}
+impl TupBuildGraphSnapshot {
+    fn new(
+        tup_id: TupPathDescriptor,
+        envs_to_insert: HashSet<EnvDescriptor>,
+        nodes_to_insert: Vec<NodeToInsert>,
+        link_collector: LinkCollector,
+    ) -> Self {
+        TupBuildGraphSnapshot {
+            tup_id,
+            envs_to_insert,
+            nodes_to_insert,
+            link_collector,
+        }
+    }
+    fn get_tup_id(&self) -> &TupPathDescriptor {
+        &self.tup_id
+    }
+    fn get_envs_to_insert(&self) -> &HashSet<EnvDescriptor> {
+        &self.envs_to_insert
+    }
+    fn get_nodes_to_insert(&self) -> &Vec<NodeToInsert> {
+        &self.nodes_to_insert
+    }
+    fn get_links(&self) -> &LinkCollector {
+        &self.link_collector
+    }
+}
+// subroutine to build graph snapshot to insert for a given set of resolved rules
+fn collect_db_insertions(
+    resolved_rules: ResolvedRules,
+    rwbufs: ReadWriteBufferObjects,
+    nodes_to_insert: &mut Vec<TupBuildGraphSnapshot>,
+    insert_sender: Sender<Vec<TupBuildGraphSnapshot>>,
+) -> Result<()> {
+    let (envs_to_insert, nodes) = collect_nodes_to_insert(&rwbufs, &resolved_rules, check_cancel)?;
+
+    let mut link_collector = LinkCollector::new();
+    for tupfile_read in resolved_rules.get_tupfiles_read() {
+        link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
+    }
+    collect_links_from_to_globs(&resolved_rules, &mut link_collector)
+        .context("Collecting links from/to globs")?;
+    add_links_from_to_rules_and_groups(&resolved_rules, &mut link_collector);
+
+    nodes_to_insert.push(TupBuildGraphSnapshot::new(
+        resolved_rules.get_tupid().clone(),
+        envs_to_insert,
+        nodes,
+        link_collector,
+    ));
+
+    if nodes_to_insert.len() >= BUFFER_SIZE {
+        insert_sender.send(nodes_to_insert.drain(..).collect())?;
+    }
+    Ok(())
+}
 
 // Spawn multiple threads to parse tupfiles in parallel within a scope
 fn parse_in_scope<'a, 'b>(
     s: &Scope<'a>,
-    parser: &mut TupParser<DbPathSearcher>,
+    parser: &'a mut TupParser<DbPathSearcher>,
     tupfiles: &'b [Node],
     term_progress: &'b TermProgress,
     sender: Sender<StatementsToResolve>,
     receiver: Receiver<StatementsToResolve>,
-    mut crossref: &mut CrossRefMaps,
+    mut crossref: &'a mut CrossRefMaps,
 ) -> Result<(), Report>
 where
     'b: 'a,
 {
     let wg = WaitGroup::new();
     let poisoned = Arc::new(AtomicBool::new(false));
-    let num_threads = std::cmp::min(MAX_THRS_DIRS, tupfiles.len());
+    let num_threads = std::cmp::min(MAX_THRS_DIRS / 2, tupfiles.len());
     let mut handles = Vec::new();
     for thread_index in 0..num_threads {
         let parser_clone = parser.clone();
@@ -1156,117 +1199,187 @@ where
         handles.push(join_handle);
     }
     drop(sender);
+    // create a thread to receive resolved statements and batch insert them to db
 
-    let pb = term_progress.get_main();
     let rwbufs = parser.read_write_buffers().clone();
     //let mut crossref = CrossRefMaps::default();
     let outs = parser.get_outs();
-    let parser_c = parser.clone();
-    let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
-    pb_insert.set_length(1);
-    pb_insert.set_position(0);
-    let mut insert_to_db = |resolved_rules: ResolvedRules| -> Result<()> {
-        //let conn = &mut binding.conn.get()?;
+    let (insert_sender, insert_receiver) = crossbeam::channel::unbounded::<Vec<TupBuildGraphSnapshot>>();
+    {
+        let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
+        let mut parser_c = parser.clone();
+        let wg = wg.clone();
+        let pb = term_progress.make_progress_bar("Processing parsed tupfiles");
+        let poisoned = poisoned.clone();
+        let h = s.spawn(move |_| -> Result<()> {
+            let pb_ref = pb.clone();
+            let fnc = move || {
+                let collect_db_insertions_wrap_err =
+                    |resolved_rules: ResolvedRules| -> Result<(), Error> {
+                        pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
+                        term_progress.tick(&pb_ref);
+                        let res = collect_db_insertions(
+                            resolved_rules,
+                            rwbufs.clone(),
+                            &mut nodes_to_insert,
+                            insert_sender.clone(),
+                        )
+                        .map_err(|e| Error::CallBackError(e.to_string()));
+                        res
+                    };
+                parser_c
+                    .receive_resolved_statements(receiver, collect_db_insertions_wrap_err)
+                    .context("Resolving statements in tupfiles")?;
+
+                for tupfile_lua in tupfiles
+                    .iter()
+                    .filter(|x| x.get_name().ends_with(".lua"))
+                    .cloned()
+                {
+                    check_cancel()?;
+                    let path = tupfile_lua.get_name();
+                    pb_ref.set_message(format!("Parsing :{}", path));
+                    let resolved_rules = parser_c.parse(path).map_err(|e| {
+                        eyre!("Error: {}", parser_c.read_write_buffers().display_str(&e))
+                    })?;
+                    collect_db_insertions(
+                        resolved_rules,
+                        rwbufs.clone(),
+                        &mut nodes_to_insert,
+                        insert_sender.clone(),
+                    )?;
+                    term_progress.tick(&pb_ref);
+                    pb_ref.set_message(format!("Done parsing {}", path));
+                }
+                drop(insert_sender);
+                Ok(())
+            };
+            let res = fnc();
+            if res.is_err() {
+                poisoned.store(true, Ordering::SeqCst);
+                term_progress.abandon(&pb, "Aborted processing parsed tupfiles due to error");
+            } else {
+                term_progress.finish(&pb, "Done processing parsed tupfiles");
+            }
+            drop(wg);
+            res
+        });
+        handles.push(h);
+    }
+    {
+        let parser_c = parser.clone();
+        let rwbufs = parser.read_write_buffers().clone();
+        let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
+        pb_insert.set_length(1);
+        pb_insert.set_position(0);
+
         let psx = parser_c.get_searcher();
         let mut c = psx.conn.get()?;
         let mut tx = c.transaction()?;
-        let insert_label = format!(
-            "Inserting nodes for {}",
-            rwbufs
-                .get_tup_path(resolved_rules.get_tupid())
-                .as_path()
-                .display()
-        );
-        log::info!("{}", insert_label);
-        let cancel = parse_cancel_flag();
-        if cancel.load(Ordering::SeqCst) {
-            term_progress.abandon(&pb_insert, "Interrupted");
-            return Err(eyre!("Parse interrupted by Ctrl-C"));
-        }
+        let ticker = crossbeam::channel::tick(std::time::Duration::from_millis(500));
+        loop {
+            crossbeam::select! {
+                recv(ticker) -> _ => {
+                    if poisoned.load(Ordering::SeqCst) {
+                        log::debug!("recvd user interrupt");
+                        break;
+                    }
+                    if check_cancel().is_err() {
+                        log::debug!("insertion cancelled");
+                        break;
+                    }
+                    continue;
+                },
 
-        // If a Tupfile produced no rules, mark it resolved (unmark modified) but warn.
-        if resolved_rules.is_empty() {
-            if let Some((dbid, _)) = crossref.get_tup_db_id(resolved_rules.get_tupid()) {
-                tx.unmark_modified(dbid)?;
-            } else {
-                log::error!(
-                    "Tupfile {:?} not found in crossref maps",
-                    resolved_rules.get_tupid()
-                );
-            }
-            log::info!(
-                "Tupfile {} produced no rules; marking as resolved",
-                insert_label
-            );
-            tx.commit()?;
-            return Ok(());
+                recv(insert_receiver) -> nodes_batch_res => {
+                    let nodes_batch = match nodes_batch_res {
+                        Ok(nb) => nb,
+                        Err(_) => {
+                            log::info!("No more nodes to insert, finishing up");
+                            break;
+                        }
+                    };
+                    for tup_link_info in nodes_batch {
+                        check_cancel()?;
+                        let tup_id = tup_link_info.get_tup_id().clone();
+                        insert_nodes_wrapper(
+                            &mut tx,
+                            term_progress,
+                            &mut crossref,
+                            &rwbufs,
+                            &pb_insert,
+                            &tup_id,
+                            tup_link_info.get_envs_to_insert(),
+                            &tup_link_info.get_nodes_to_insert(),
+                        )?;
+                        let (dbid, _) = crossref
+                            .get_tup_db_id(&tup_id)
+                            .ok_or_else(|| eyre!("Could not fetch db id for tupfile {}", &tup_id))?;
+                        tx.unmark_modified(dbid)?;
+                        check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, crossref)?;
+                        let _ = insert_links(&mut tx, &tup_id, crossref, tup_link_info.get_links())
+                            .context(format!("Inserting links for {}", tup_id))?;
+                        term_progress.tick(&pb_insert);
+                    } // end for tup_link_info in nodes_batch
+                } // end recv of insert_receiver
+            } // end select
         }
-
-        insert_nodes(
-            &mut tx,
-            &rwbufs,
-            &resolved_rules,
-            &mut crossref,
-            term_progress,
-            Some(&pb_insert),
-            insert_label.as_str(),
-        )?;
-        check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, &mut crossref)?;
-        let _ = insert_links(&mut tx, &resolved_rules, &mut crossref)?;
-        let (dbid, _) = crossref
-            .get_tup_db_id(resolved_rules.get_tupid())
-            .expect("tupfile dbid fetch failed");
-        tx.unmark_modified(dbid)?;
+        tx.mark_absent_tupfile_entries_to_delete()?;
+        tx.mark_orphans_to_delete()?; // cascade deletion of orphaned nodes
+        log::info!("Marked orphaned entries to delete");
+        tx.delete_nodes()?; // delete all marked nodes
+        tx.prune_delete_list()?; // clean up delete list after deletions
+        log::info!("Deleted marked nodes");
         tx.commit()?;
-        Ok(())
-    };
-    let mut insert_to_db_wrap_err = move |resolved_rules: ResolvedRules| -> Result<(), Error> {
-        insert_to_db(resolved_rules).map_err(|e| Error::CallBackError(e.to_string()))
-    };
-
-    log::info!("Starting to resolve statements from parsed tupfiles");
-    pb.set_message("Resolving statements..");
-    {
-        for tupfile_lua in tupfiles
-            .iter()
-            .filter(|x| x.get_name().ends_with(".lua"))
-            .cloned()
-        {
-            let path = tupfile_lua.get_name();
-            pb.set_message(format!("Parsing :{}", path));
-            let resolved_rules = parser.parse(path).map_err(|e| {
-                term_progress.abandon(&pb, format!("Error parsing {path}"));
-                eyre!("Error: {}", parser.read_write_buffers().display_str(&e))
-            })?;
-            //new_resolved_rules.push(resolved_rules);
-            insert_to_db_wrap_err(resolved_rules)?;
-            term_progress.tick(&pb);
-            pb.set_message(format!("Done parsing {}", path));
-        }
+        pb_insert.finish_and_clear();
     }
 
-    pb.set_message("Resolving statements..");
-    parser
-        .receive_resolved_statements(receiver, insert_to_db_wrap_err)
-        .wrap_err("Unable to resolve statements in tupfiles")?;
-    log::info!("Finished resolving statements from parsed tupfiles");
-    pb.set_message("Finalizing database updates..");
-    let psx = parser_c.get_searcher();
-    let mut c = psx.conn.get()?;
-    let tx = c.transaction()?;
-    tx.mark_orphans_to_delete()?;
-    log::info!("Marked orphaned entries to delete");
-    tx.delete_nodes()?;
-    log::info!("Deleted marked nodes");
-    tx.commit()?;
-    pb_insert.finish_and_clear();
+    let pb = term_progress.get_main();
     term_progress.finish(&pb, "Done parsing tupfiles");
     term_progress.clear();
     log::info!("Finished parse phase");
+    log::info!("Finished resolving statements from parsed tupfiles");
     wg.wait();
     for join_handle in handles {
         join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
     }
+    Ok(())
+}
+
+fn insert_nodes_wrapper(
+    tx: &mut TupTransaction,
+    term_progress: &TermProgress,
+    mut crossref: &mut CrossRefMaps,
+    rwbufs: &ReadWriteBufferObjects,
+    pb_insert: &ProgressBar,
+    tup_id: &TupPathDescriptor,
+    envs_to_insert: &HashSet<EnvDescriptor>,
+    nodes: &Vec<NodeToInsert>,
+) -> Result<(), Report> {
+    //let mut tx = c.transaction()?;
+    let insert_label = format!(
+        "Inserting nodes for {}",
+        rwbufs.get_tup_path(tup_id).as_path().display()
+    );
+    log::info!("{}", insert_label);
+    // If a Tupfile produced no rules, mark it resolved (unmark modified) but warn.
+    if nodes.is_empty() {
+        log::info!(
+            "Tupfile {} produced no rules; marking as resolved",
+            insert_label
+        );
+        return Ok(());
+    }
+    insert_nodes(
+        tx,
+        &rwbufs,
+        &mut crossref,
+        term_progress,
+        &pb_insert,
+        insert_label.as_str(),
+        &nodes,
+        &envs_to_insert,
+    )?;
     Ok(())
 }
 
@@ -1321,8 +1434,9 @@ fn parse_subset(
         term_progress.tick(&pb);
     }
     drop(wg);
-    pb.set_message("Done parsing all tupfiles");
-    log::info!("Finished parsing all tupfiles");
+    pb.set_message("Done parsing subset");
+    log::info!("Finished parsing subet tupfiles");
+    term_progress.finish(&pb, format!("Done parsing subset {}", thread_index));
     Ok(())
 }
 
@@ -1547,7 +1661,7 @@ struct Collector {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 enum Link {
-    DirToGlob(PathDescriptor, GlobPathDescriptor),
+    DirToGlob(PathDescriptor, GlobPathDescriptor, usize),
     InputToRule(PathDescriptor, RuleDescriptor),
     RuleToOutput(RuleDescriptor, PathDescriptor),
     OutputToGroup(PathDescriptor, GroupPathDescriptor),
@@ -1573,7 +1687,16 @@ impl LinkCollector {
     }
 
     pub(crate) fn add_dir_to_glob_link(&mut self, d: &PathDescriptor, g: &GlobPathDescriptor) {
-        self.links.insert(Link::DirToGlob(d.clone(), g.clone()));
+        self.links.insert(Link::DirToGlob(d.clone(), g.clone(), 1));
+    }
+    pub(crate) fn add_dir_to_glob_link_deep(
+        &mut self,
+        d: &PathDescriptor,
+        g: &GlobPathDescriptor,
+        depth: usize,
+    ) {
+        self.links
+            .insert(Link::DirToGlob(d.clone(), g.clone(), depth));
     }
 
     pub(crate) fn add_input_to_rule_link(&mut self, inp: &InputResolvedType, rd: &RuleDescriptor) {
@@ -1600,7 +1723,7 @@ impl LinkCollector {
         self.links
             .insert(Link::TupfileToTupfile(t.clone(), tup.clone()));
     }
-    pub(crate) fn add_globs_read_to_tupfile_link(
+    pub(crate) fn add_glob_to_tupfile_link(
         &mut self,
         g: &GlobPathDescriptor,
         tup: &TupPathDescriptor,
@@ -1750,7 +1873,7 @@ impl Collector {
         }
         Ok(())
     }
-    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor, dir: i64) -> Result<()> {
+    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor) -> Result<()> {
         let rule_formula = self.read_write_buffer_objects.get_rule(rule_desc);
         let name = rule_formula.get_rule_str();
         let ref ph = self.read_write_buffer_objects;
@@ -1768,21 +1891,7 @@ impl Collector {
                     rule_ref
                 );
             }
-            let prevline = self
-                .unique_rule_check
-                .insert(dir.to_string() + "/" + name.as_str(), rule_ref.clone());
-            if prevline.is_none() {
-                self.collect_rule(rule_desc);
-            } else {
-                bail!(
-                    "Rule {} at  {}:{} was previously defined at {}. \
-                                        Ensure that rule definitions take the inputs as arguments.",
-                    name.as_str(),
-                    tuppath.to_string().as_str(),
-                    rule_ref,
-                    prevline.unwrap()
-                );
-            }
+            self.collect_rule(rule_desc);
         }
         Ok(())
     }
@@ -1799,102 +1908,17 @@ impl Collector {
 fn insert_nodes(
     tx: &mut TupTransaction,
     read_write_buf: &ReadWriteBufferObjects,
-    resolved_rules: &ResolvedRules,
     crossref: &mut CrossRefMaps,
     term_progress: &TermProgress,
-    pb_insert: Option<&ProgressBar>,
+    pb: &ProgressBar,
     insert_label: &str,
+    nodes: &[NodeToInsert],
+    envs_to_insert: &HashSet<EnvDescriptor>,
+    //check_cancel: F,
 ) -> Result<()> {
-    //let rules_in_tup_file = resolved_rules.rules_by_tup();
-
-    //let mut nodeids = BTreeSet::new();
-    //let mut paths_to_update: HashMap<i64, i64> = HashMap::new();  we dont update nodes until rules are executed.
-    let mut envs_to_insert = HashSet::new();
-
-    let check_cancel = || {
-        let cancel = parse_cancel_flag();
-        if cancel.load(Ordering::SeqCst) {
-            pb_insert.map(|pb| {
-                term_progress.abandon(pb, "Insertion interrupted by user (Ctrl-C)".to_string())
-            });
-            return Err(eyre!("Insertion interrupted by user (Ctrl-C)"));
-        }
-        Ok(())
-    };
-    let get_dir = |tup_desc: &TupPathDescriptor, crossref: &CrossRefMaps| -> Result<i64> {
-        crossref
-            .get_tup_db_id(tup_desc)
-            .map(|(_, dir)| dir)
-            .or_else(|| {
-                crossref
-                    .get_path_db_id(&tup_desc.get_parent_descriptor())
-                    .map(|(dir, _)| dir)
-            })
-            .ok_or_else(|| {
-                eyre!(
-                    "No tup directory found in db for tup descriptor:{:?}",
-                    tup_desc
-                )
-            })
-    };
-    // collect all un-added groups and add them in a single transaction.
-    let mut nodes: Vec<_> = {
-        let mut collector = Collector::new(read_write_buf.clone())?;
-        for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
-            let tuploc = resolvedtasks.first().map(|x| x.get_task_loc());
-            for resolvedtask in resolvedtasks.iter() {
-                let tupid = tuploc.unwrap().get_tupfile_desc();
-                let rd = resolvedtask.get_task_descriptor();
-                for s in resolvedtask.get_deps() {
-                    collector.add_input_for_insert(s, tupid.clone())?;
-                }
-                collector.add_task_node(rd)?;
-                let env_desc = resolvedtask.get_env_list();
-                envs_to_insert.extend(env_desc.iter());
-            }
-        }
-
-        for tupfile in resolved_rules.get_tupfiles_read() {
-            collector.add_tupfile(tupfile)?;
-        }
-        for rl in resolved_rules.get_resolved_links().iter() {
-            let rd = rl.get_rule_desc();
-            let rule_ref = rl.get_rule_ref();
-            let tup_desc = rule_ref.get_tupfile_desc();
-            let dir = get_dir(&tup_desc, &crossref)?;
-            collector.add_rule_node(rd, dir)?;
-            for p in rl.get_targets() {
-                collector.add_output(p, SrcId::RuleId(rl.get_rule_desc().clone()))?
-            }
-            let group = rl.get_group_desc();
-            collector.add_group(group.cloned());
-
-            for s in rl.get_sources() {
-                collector.add_input_for_insert(s, tup_desc.clone())?;
-            }
-            for p in rl.get_excluded_targets() {
-                collector.add_excluded(p.clone())?
-            }
-            for env in rl.get_env_list().iter() {
-                collector.add_env(&env);
-            }
-            check_cancel()?;
-        }
-        collector.nodes()
-    };
-    // sort nodes by type and then by path for better performance (as parent directories are inserted first)
-    nodes.sort_by(|a, b| {
-        if a.get_type().eq(&b.get_type()) {
-            a.get_path(&read_write_buf)
-                .cmp(&b.get_path(&read_write_buf))
-        } else {
-            a.get_type().cmp(&b.get_type())
-        }
-    });
-
     let total_steps = nodes.len() + envs_to_insert.len();
     let il = insert_label.to_string();
-    if let Some(pb) = pb_insert {
+    {
         let len = std::cmp::max(1, total_steps as u64);
         pb.set_length(len);
         pb.set_position(0);
@@ -1927,7 +1951,7 @@ fn insert_nodes(
         debug!("inserting node: {:?}", node_to_insert);
         insert_node(tx, &read_write_buf, crossref, node_to_insert)
             .wrap_err(format!("Inserting node :{:?}", node_to_insert))?;
-        if let Some(pb) = pb_insert {
+        {
             term_progress.tick(pb);
         }
     }
@@ -1948,61 +1972,84 @@ fn insert_nodes(
                 log::warn!("Error while inserting env var: {:?}", e);
             }
         }
-        if let Some(pb) = pb_insert {
-            term_progress.tick(pb);
-        }
+        term_progress.tick(pb);
     }
     check_cancel()?;
 
-    if let Some(pb) = pb_insert {
-        pb.set_message(format!("✔ Done {}", insert_label));
+    pb.set_message(format!("✔ Done {}", insert_label));
 
-        if total_steps > 0 {
-            pb.set_position(total_steps as u64);
-        }
-    }
-
-    // some validity checks after inserting nodes to see if the db is consistent
-    let rules = resolved_rules.rules_by_tup();
-    let tasks = resolved_rules.tasks_by_tup();
-    let srcs_from_links = {
-        log::info!(
-            "Cross referencing rule inputs to insert with the db ids with same name and directory"
-        );
-        rules
-            .iter()
-            .flat_map(|rl| rl.iter())
-            .flat_map(|rl| rl.get_sources().map(|s| (rl.get_rule_ref(), s)))
-    };
-    let srcs_from_tasks = {
-        log::info!(
-            "Cross referencing task inputs to insert with the db ids with same name and directory"
-        );
-        tasks
-            .iter()
-            .flat_map(|rl| rl.iter())
-            .flat_map(|rl| rl.get_deps().iter().map(|s| (rl.get_task_loc(), s)))
-    };
-    for (index, (i, s)) in srcs_from_links.chain(srcs_from_tasks).enumerate() {
-        if index % 10 == 0 {
-            log::info!("Validating input cross references: {}", index + 1);
-            check_cancel()?;
-        }
-        if let Some(pd) = s.get_resolved_path_desc() {
-            let (_, _) = crossref
-                .get_path_db_id(&pd.get_parent_descriptor())
-                .ok_or(eyre!(
-                    "parent path not found:{:?} mentioned in rule {:?}",
-                    pd.get_parent_descriptor(),
-                    i
-                ))?;
-            let (_, _) = crossref
-                .get_path_db_id(pd)
-                .ok_or_else(|| eyre!("path not found:{:?} mentioned in rule {:?}", s, i))?;
-        }
+    if total_steps > 0 {
+        pb.set_position(total_steps as u64);
     }
 
     Ok(())
+}
+
+fn collect_nodes_to_insert<F>(
+    read_write_buf: &ReadWriteBufferObjects,
+    resolved_rules: &ResolvedRules,
+    check_cancel: F,
+) -> Result<(HashSet<EnvDescriptor>, Vec<NodeToInsert>), Report>
+where
+    F: Fn() -> Result<(), Report>,
+{
+    let mut envs_to_insert = HashSet::new();
+
+    // collect all un-added groups and add them in a single transaction.
+    let mut nodes: Vec<_> = {
+        let mut collector = Collector::new(read_write_buf.clone())?;
+        for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
+            let tuploc = resolvedtasks.first().map(|x| x.get_task_loc());
+            for resolvedtask in resolvedtasks.iter() {
+                let tupid = tuploc.unwrap().get_tupfile_desc();
+                let rd = resolvedtask.get_task_descriptor();
+                for s in resolvedtask.get_deps() {
+                    collector.add_input_for_insert(s, tupid.clone())?;
+                }
+                collector.add_task_node(rd)?;
+                let env_desc = resolvedtask.get_env_list();
+                envs_to_insert.extend(env_desc.iter());
+            }
+        }
+
+        for tupfile in resolved_rules.get_tupfiles_read() {
+            collector.add_tupfile(tupfile)?;
+        }
+        for rl in resolved_rules.get_resolved_links().iter() {
+            let rd = rl.get_rule_desc();
+            let rule_ref = rl.get_rule_ref();
+            let tup_desc = rule_ref.get_tupfile_desc();
+            //let dir = get_dir(&tup_desc, &crossref)?;
+            collector.add_rule_node(rd)?;
+            for p in rl.get_targets() {
+                collector.add_output(p, SrcId::RuleId(rl.get_rule_desc().clone()))?
+            }
+            let group = rl.get_group_desc();
+            collector.add_group(group.cloned());
+
+            for s in rl.get_sources() {
+                collector.add_input_for_insert(s, tup_desc.clone())?;
+            }
+            for p in rl.get_excluded_targets() {
+                collector.add_excluded(p.clone())?
+            }
+            for env in rl.get_env_list().iter() {
+                collector.add_env(&env);
+            }
+            check_cancel()?;
+        }
+        collector.nodes()
+    };
+    // sort nodes by type and then by path for better performance (as parent directories are inserted first)
+    nodes.sort_by(|a, b| {
+        if a.get_type().eq(&b.get_type()) {
+            a.get_path(&read_write_buf)
+                .cmp(&b.get_path(&read_write_buf))
+        } else {
+            a.get_type().cmp(&b.get_type())
+        }
+    });
+    Ok((envs_to_insert, nodes))
 }
 
 fn insert_node(
