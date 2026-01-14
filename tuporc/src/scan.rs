@@ -16,7 +16,7 @@ use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
 use crate::eyre::WrapErr;
-use crate::parse::{compute_path_hash, cancel_flag};
+use crate::parse::{cancel_flag, compute_path_hash};
 use crate::{is_tupfile, TermProgress};
 use crossbeam::channel::{never, tick, Receiver, Sender};
 use crossbeam::select;
@@ -399,13 +399,13 @@ fn insert_direntries(
             let root_hp = HashedPath::from(root.to_path_buf());
 
             let root_hash_path = root_hp.clone();
-            let running = cancel_flag();
+            let cancelled = cancel_flag();
             dir_id_by_path.insert(root_hp, 1);
             let ign = build_ignore(root)?;
 
             //println!("root:{:?}", root.to_path_buf());
             {
-                let running = running.clone();
+                let cancelled = cancelled.clone();
                 let ign = ign.clone();
                 s.spawn(move |_| {
                     let ticker = tick(Duration::from_millis(500));
@@ -425,7 +425,7 @@ fn insert_direntries(
                     while receiver_cnt != 0 {
                         select! {
                             recv(ticker) -> _ =>  {
-                                if !running.load(Ordering::SeqCst) {
+                                if cancelled.load(Ordering::SeqCst) {
                                     log::debug!("recvd user interrupt");
                                     break;
                                 }
@@ -514,7 +514,7 @@ fn insert_direntries(
                 let pool = pool.clone();
                 let dirid_sender = dirid_sender.clone();
                 let term_progress = term_progress.clone();
-                let running = running.clone();
+                let cancelled = cancelled.clone();
                 let err = error.clone();
                 s.spawn(move |_| {
                     let mut conn = pool.get().expect("unable to get connection from pool");
@@ -530,7 +530,7 @@ fn insert_direntries(
                     if res.is_err() {
                         log::error!("Error:{:?}", res);
                         term_progress.abandon(&pb, " Errors encountered during scanning inserting nodes.");
-                        running.store(false, Ordering::SeqCst);
+                        cancelled.store(true, Ordering::SeqCst);
                     } else {
                         term_progress.finish(&pb, "✔ Finished scanning");
                     }
@@ -552,7 +552,7 @@ fn insert_direntries(
                 let dir_child_sender = dir_child_sender.clone();
                 let wg = wg.clone();
                 let ign = ign.clone();
-                //let running = running.clone();
+                //let cancelled = cancelled.clone();
                 s.spawn(move |_| {
                     // walkdir over the children and send the children for insertion into db using the sender for DirChildren.
                     // This is a sort of recursive, but instead of calling itself, it creates and sends a new DirSender for subdirectories within it.
@@ -700,7 +700,9 @@ fn add_modify_nodes(
                 existing_node.get_id()
             };
             if is_dir {
-                dirid_sender.send((pbuf.clone(), id))?;
+                if let Err(e) = dirid_sender.send((pbuf.clone(), id)) {
+                    log::debug!("dirid_sender disconnected: {}", e);
+                }
             }
 
             cnt += 1;
@@ -714,7 +716,8 @@ fn add_modify_nodes(
     }
     drop(node_at_path_receiver);
     drop(dirid_sender);
-    tx.prune_delete_of_present_list().wrap_err("Building deleted list")?; // remove nodes marked as present from delete list (maybe from previous scans)
+    tx.prune_delete_of_present_list()
+        .wrap_err("Building deleted list")?; // remove nodes marked as present from delete list (maybe from previous scans)
     tx.mark_absent_nodes_to_delete()
         .wrap_err("Marking absent nodes as deleted")?;
     // Enrich deletions for nodes whose parent directory entries are missing (orphans)

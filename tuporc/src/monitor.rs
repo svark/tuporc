@@ -155,14 +155,14 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
             log::warn!("error in event: {:?}", e.err().unwrap());
         }
     };
-    let running = cancel_flag().clone();
+    let cancelled = cancel_flag().clone();
     let (stop_sender, stop_receiver) = crossbeam::channel::bounded(0);
     let stop_sender_clone = stop_sender.clone();
     {
-        let running = running.clone();
+        let cancelled = cancelled.clone();
         let stop_sender_clone = stop_sender_clone.clone();
         std::thread::spawn(move || {
-            while !running.load(std::sync::atomic::Ordering::Relaxed) {
+            while !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 sleep(Duration::from_millis(100));
             }
             let _ = stop_sender_clone.send(());
