@@ -295,7 +295,8 @@ impl LibSqlInserts for Connection {
                     existing_node.get_name().to_string()
                         + " (previously created by rule: '"
                         + name.as_str()
-                        + "' now by rule: '" + cur_name.as_str()
+                        + "' now by rule: '"
+                        + cur_name.as_str()
                         + "')",
                 ));
             }
@@ -424,7 +425,6 @@ impl LibSqlInserts for Connection {
         }
         Ok(())
     }
-
 
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()> {
         // If PresentList is empty (e.g., skip-scan), skip to avoid mass-deleting everything.
