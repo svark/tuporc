@@ -2127,9 +2127,6 @@ impl<'a, 'b> ConnWrapper<'a, 'b> {
     pub fn new(conn: &'b TupConnectionRef<'a>) -> Self {
         Self { conn }
     }
-    pub fn get_conn(&self) -> &TupConnectionRef<'a> {
-        self.conn
-    }
 }
 
 impl<'a, 'b> tupparser::decode::GroupInputs for ConnWrapper<'a, 'b> {
