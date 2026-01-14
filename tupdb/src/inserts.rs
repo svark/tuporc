@@ -280,6 +280,26 @@ impl LibSqlInserts for Connection {
         let existing_node = self
             .fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
             .unwrap_or(Node::unknown());
+
+        if existing_node.get_srcid() != -1 && node.get_srcid() == -1 {
+            if existing_node.get_srcid() != node.get_srcid() {
+                // fetch previously stored rule name for better error message
+                let name = self
+                    .fetch_node_name(existing_node.get_srcid())
+                    .unwrap_or("unknown".to_string());
+                let cur_name = self
+                    .fetch_node_name(node.get_srcid())
+                    .unwrap_or("unknown".to_string());
+                return Err(AnyError::ConflictingParents(
+                    existing_node.get_srcid(),
+                    existing_node.get_name().to_string()
+                        + " (previously created by rule: '"
+                        + name.as_str()
+                        + "' now by rule: '" + cur_name.as_str()
+                        + "')",
+                ));
+            }
+        }
         self.upsert_node(node, &existing_node, compute_sha)
     }
     fn fetch_upsert_node_raw(
@@ -349,7 +369,7 @@ impl LibSqlInserts for Connection {
         // Enforce uniqueness: at most one producer per output.
         // Check for an existing producer edge to this output.
         let mut stmt = self.prepare(
-            "SELECT from_id FROM NormalLink WHERE to_id = ?1 AND to_type IN (4, 7) LIMIT 1",
+            "SELECT from_id FROM NormalLink WHERE to_id =?1 AND to_type IN(4, 7) LIMIT 1",
         )?;
         let mut rows = stmt.query([output_id])?;
         if let Some(row) = rows.next()? {
@@ -367,7 +387,7 @@ impl LibSqlInserts for Connection {
                     .fetch_node_name(output_id)
                     .unwrap_or_else(|_| output_id.to_string());
                 return Err(AnyError::from(format!(
-                    "Output {} already has producer {} (id={}), cannot also be produced by {} (id={})",
+                    "Output {} already has producer {}(id = {}), cannot also be produced by {}(id = {})",
                     output_name, existing_name, existing_from_id, candidate_name, producer_id
                 )));
             }

@@ -20,6 +20,7 @@ impl CallBackError {
 pub enum AnyError {
     Db(Arc<rusqlite::Error>),
     CbErr(CallBackError),
+    ConflictingParents(i64, String)
 }
 
 impl AnyError {
@@ -38,6 +39,8 @@ impl Display for AnyError {
         match self {
             AnyError::Db(e) => e.fmt(f),
             AnyError::CbErr(e) => e.inner.fmt(f),
+            AnyError::ConflictingParents(i1, s) =>
+                write!(f, "Conflicting parents for {} {}", i1, s),
         }
     }
 }
