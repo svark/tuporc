@@ -26,7 +26,7 @@ use tupparser::decode::decode_group_captures;
 use tupparser::statements::{Loc, TupLoc};
 use tupparser::TupPathDescriptor;
 
-use crate::parse::ConnWrapper;
+use crate::parse::{cancel_flag, ConnWrapper};
 use crate::{start_tup_connection, TermProgress, IO_DB};
 use tupdb::db::RowType;
 use tupdb::db::RowType::Excluded;
@@ -48,7 +48,7 @@ impl PoisonedState {
         }
     }
     fn is_poisoned(&self) -> bool {
-        *self.poisoned.read() != 0
+        *self.poisoned.read() != 0 || cancel_flag().load(std::sync::atomic::Ordering::Relaxed)
     }
     fn update_poisoned(&self, poisoned: u8) -> bool {
         if !self.is_poisoned() {
@@ -62,6 +62,9 @@ impl PoisonedState {
         *self.poisoned.write() = 1;
     }
     fn should_stop(&self) -> bool {
+        if cancel_flag().load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         let p = self.poisoned.read();
         *p == 1 && (!self.keep_going || *p > 1)
     }
@@ -501,10 +504,7 @@ fn exec_nodes_to_run(
     let poisoned = PoisonedState::new(keep_going);
     let num_threads = std::cmp::min(num_threads, valid_rules.len());
     let mut pbars: Vec<ProgressBar> = Vec::new();
-    {
-        let poisoned = poisoned.clone();
-        let _ = ctrlc::try_set_handler(move || poisoned.force_poisoned());
-    }
+    let _ = cancel_flag();
     valid_rules.sort_by(|x, y| {
         let xid = x.get_id() as i32;
         let yid = y.get_id() as i32;

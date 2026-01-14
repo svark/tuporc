@@ -27,12 +27,12 @@ use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 
-use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::buffers::PathBuffers;
+use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::transform::{
-    compute_dir_sha256, compute_glob_sha256, compute_sha256, StatementsToResolve,
+    compute_dir_hash, compute_glob_hash, compute_hash, StatementsToResolve,
 };
 use tupparser::{
     EnvDescriptor, GlobPathDescriptor, GroupPathDescriptor, PathDescriptor, RuleDescriptor,
@@ -42,7 +42,7 @@ use tupparser::{ReadWriteBufferObjects, ResolvedRules, TupParser};
 use RowType::Group;
 const BUFFER_SIZE: usize = 10;
 
-fn parse_cancel_flag() -> &'static Arc<AtomicBool> {
+pub fn cancel_flag() -> &'static Arc<AtomicBool> {
     static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     CANCEL_FLAG.get_or_init(|| {
         let flag = Arc::new(AtomicBool::new(false));
@@ -84,15 +84,16 @@ pub(crate) enum NodeToInsert {
     #[allow(dead_code)]
     Tup(TupPathDescriptor),
     Group(GroupPathDescriptor),
-    GeneratedFile(PathDescriptor, SrcId),
+    GeneratedFile(PathDescriptor, SrcId, Option<String>),
     Env(EnvDescriptor),
     Task(TaskDescriptor),
-    #[allow(dead_code)]
-    InputFile(PathDescriptor),
-    Glob(GlobPathDescriptor, TupPathDescriptor),
+    InputFile(PathDescriptor, Option<String>),
+    Glob(GlobPathDescriptor, TupPathDescriptor, Option<String>),
     ExcludedFile(PathDescriptor),
-    Dir(PathDescriptor),
-    DirGen(PathDescriptor),
+    #[allow(dead_code)]
+    Dir(PathDescriptor, Option<String>),
+    #[allow(dead_code)]
+    DirGen(PathDescriptor, Option<String>),
 }
 
 impl PathDiscovery for ConnWrapper<'_, '_> {
@@ -110,24 +111,6 @@ impl PathDiscovery for ConnWrapper<'_, '_> {
 }
 
 impl NodeToInsert {
-    #[allow(dead_code)]
-    pub(crate) fn new(bo: &impl PathBuffers, p0: &Node, full_path: &Path) -> Option<Self> {
-        let p = bo.add_abs(full_path).unwrap();
-
-        match p0.get_type() {
-            File => Some(NodeToInsert::InputFile(p)),
-            Dir => Some(NodeToInsert::Dir(p)),
-            GenF => Some(NodeToInsert::GeneratedFile(
-                p,
-                SrcId::RuleId(Default::default()),
-            )),
-            TupF => Some(NodeToInsert::Tup(p)),
-            DirGen => Some(NodeToInsert::DirGen(p)),
-            Glob => Some(NodeToInsert::Glob(p, Default::default())),
-            _ => None,
-        }
-    }
-
     /// get the name of the node to insert in the database
     pub fn get_name(&self, read_write_buffer_objects: &ReadWriteBufferObjects) -> String {
         match self {
@@ -137,27 +120,27 @@ impl NodeToInsert {
                 .file_name()
                 .to_string(),
             NodeToInsert::Group(g) => read_write_buffer_objects.get_group_name(g),
-            NodeToInsert::GeneratedFile(p, _) => read_write_buffer_objects
+            NodeToInsert::GeneratedFile(p, _, _) => read_write_buffer_objects
                 .get_path(p)
                 .file_name()
                 .to_string(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_name(e),
             NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).to_string(),
-            NodeToInsert::InputFile(p) => read_write_buffer_objects
+            NodeToInsert::InputFile(p, _) => read_write_buffer_objects
                 .get_path(p)
                 .file_name()
                 .to_string(),
-            NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_name(g),
+            NodeToInsert::Glob(g, _, _) => read_write_buffer_objects.get_name(g),
             NodeToInsert::ExcludedFile(e) => read_write_buffer_objects.get_name(e),
-            NodeToInsert::Dir(p) => read_write_buffer_objects.get_name(p),
-            NodeToInsert::DirGen(p) => read_write_buffer_objects.get_name(p),
+            NodeToInsert::Dir(p, _) => read_write_buffer_objects.get_name(p),
+            NodeToInsert::DirGen(p, _) => read_write_buffer_objects.get_name(p),
         }
     }
 
     #[allow(dead_code)]
     fn get_input_file(&self) -> Option<PathDescriptor> {
         match self {
-            NodeToInsert::InputFile(p) => Some(p.clone()),
+            NodeToInsert::InputFile(p, _) => Some(p.clone()),
             _ => None,
         }
     }
@@ -167,14 +150,14 @@ impl NodeToInsert {
             NodeToInsert::Rule(r) => r.to_u64() as i64,
             NodeToInsert::Tup(t) => t.to_u64() as i64,
             NodeToInsert::Group(g) => g.to_u64() as i64,
-            NodeToInsert::GeneratedFile(p, _) => p.to_u64() as i64,
+            NodeToInsert::GeneratedFile(p, _, _) => p.to_u64() as i64,
             NodeToInsert::Env(e) => e.to_u64() as i64,
             NodeToInsert::Task(t) => t.to_u64() as i64,
-            NodeToInsert::InputFile(p) => p.to_u64() as i64,
-            NodeToInsert::Glob(g, _) => g.to_u64() as i64,
+            NodeToInsert::InputFile(p, _) => p.to_u64() as i64,
+            NodeToInsert::Glob(g, _, _) => g.to_u64() as i64,
             NodeToInsert::ExcludedFile(p) => p.to_u64() as i64,
-            NodeToInsert::Dir(p) => p.to_u64() as i64,
-            NodeToInsert::DirGen(p) => p.to_u64() as i64,
+            NodeToInsert::Dir(p, _) => p.to_u64() as i64,
+            NodeToInsert::DirGen(p, _) => p.to_u64() as i64,
         }
     }
 
@@ -183,14 +166,14 @@ impl NodeToInsert {
             NodeToInsert::Rule(_) => Rule,
             NodeToInsert::Tup(_) => TupF,
             NodeToInsert::Group(_) => Group,
-            NodeToInsert::GeneratedFile(_, _) => GenF,
+            NodeToInsert::GeneratedFile(_, _, _) => GenF,
             NodeToInsert::Env(_) => Env,
             NodeToInsert::Task(_) => Task,
-            NodeToInsert::InputFile(_) => File,
-            NodeToInsert::Glob(_, _) => Glob,
+            NodeToInsert::InputFile(_, _) => File,
+            NodeToInsert::Glob(_, _, _) => Glob,
             NodeToInsert::ExcludedFile(_) => Excluded,
-            NodeToInsert::Dir(_) => Dir,
-            NodeToInsert::DirGen(_) => DirGen,
+            NodeToInsert::Dir(_, _) => Dir,
+            NodeToInsert::DirGen(_, _) => DirGen,
         }
     }
 
@@ -218,7 +201,7 @@ impl NodeToInsert {
                         tupid
                     ))
             }
-            NodeToInsert::GeneratedFile(gen, SrcId::RuleId(id)) => cross_ref_maps
+            NodeToInsert::GeneratedFile(gen, SrcId::RuleId(id), _) => cross_ref_maps
                 .get_rule_db_id(id)
                 .map(|x| x.0)
                 .ok_or_eyre(eyre!(
@@ -227,7 +210,7 @@ impl NodeToInsert {
                     id
                 )),
 
-            NodeToInsert::Glob(g, tupid) => cross_ref_maps
+            NodeToInsert::Glob(g, tupid, _) => cross_ref_maps
                 .get_tup_db_id(tupid)
                 .map(|x| x.0)
                 .ok_or_eyre(eyre!(
@@ -243,7 +226,7 @@ impl NodeToInsert {
         match self {
             NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_display_str(),
             NodeToInsert::Env(e) => read_write_buffer_objects.get_env_value(e),
-            NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_recursive_glob_str(g),
+            NodeToInsert::Glob(g, _, _) => read_write_buffer_objects.get_recursive_glob_str(g),
             _ => "".to_string(),
         }
     }
@@ -264,14 +247,14 @@ impl NodeToInsert {
             NodeToInsert::Rule(r) => read_write_buffer_objects.get_rule(r).get_parent_id(),
             NodeToInsert::Tup(t) => read_write_buffer_objects.get_tup_parent_id(t),
             NodeToInsert::Group(g) => read_write_buffer_objects.get_group_parent_id(g),
-            NodeToInsert::GeneratedFile(p, _) => read_write_buffer_objects.get_parent_id(p),
+            NodeToInsert::GeneratedFile(p, _, _) => read_write_buffer_objects.get_parent_id(p),
             NodeToInsert::Env(_) => PathDescriptor::default(),
             NodeToInsert::Task(t) => read_write_buffer_objects.get_task(t).get_parent_id(),
-            NodeToInsert::InputFile(p) => read_write_buffer_objects.get_parent_id(p),
-            NodeToInsert::Glob(g, _) => read_write_buffer_objects.get_glob_prefix(g),
+            NodeToInsert::InputFile(p, _) => read_write_buffer_objects.get_parent_id(p),
+            NodeToInsert::Glob(g, _, _) => read_write_buffer_objects.get_glob_prefix(g),
             NodeToInsert::ExcludedFile(e) => read_write_buffer_objects.get_parent_id(e),
-            NodeToInsert::Dir(p) => read_write_buffer_objects.get_parent_id(p),
-            NodeToInsert::DirGen(p) => read_write_buffer_objects.get_parent_id(p),
+            NodeToInsert::Dir(p, _) => read_write_buffer_objects.get_parent_id(p),
+            NodeToInsert::DirGen(p, _) => read_write_buffer_objects.get_parent_id(p),
         }
     }
 
@@ -280,34 +263,64 @@ impl NodeToInsert {
         conn: &TupConnectionRef,
         path_buffers: &impl PathBuffers,
     ) -> Option<String> {
+        if let Some(value) = self.get_saved_hash() {
+            return Some(value);
+        }
         let compute_sha_for = |p: &PathDescriptor| {
             let p = PathBuffers::get_abs_path(path_buffers, p);
-            let sha = compute_sha256(p.as_path()).ok();
+            let sha = compute_hash(p.as_path()).ok();
             debug!("sha for {:?} is {:?}", p, sha);
             sha
         };
         let compute_sha_for_glob = |p: &PathDescriptor| {
-            let sha = compute_glob_sha256(&ConnWrapper::new(conn), path_buffers, p).ok();
+            let sha = compute_glob_hash(&ConnWrapper::new(conn), path_buffers, p).ok();
             debug!("sha for {:?} is {:?}", p, sha);
             sha
         };
 
         let compute_sha_for_dir = |p: &GlobPathDescriptor| {
             let p = path_buffers.get_abs_path(p);
-            let sha = compute_dir_sha256(p.as_path()).ok();
+            let sha = compute_dir_hash(p.as_path()).ok();
             debug!("sha for {:?} is {:?}", p, sha);
             sha
         };
         match self {
-            NodeToInsert::GeneratedFile(p, _) => compute_sha_for(p),
+            NodeToInsert::GeneratedFile(p, _, _) => compute_sha_for(p),
             NodeToInsert::Tup(p) => compute_sha_for(p),
-            NodeToInsert::InputFile(p) => compute_sha_for(p),
-            NodeToInsert::Glob(g, _) => compute_sha_for_glob(g),
-            NodeToInsert::DirGen(p) => compute_sha_for_dir(p),
-            NodeToInsert::Dir(p) => compute_sha_for_dir(p),
+            NodeToInsert::InputFile(p, _) => compute_sha_for(p),
+            NodeToInsert::Glob(g, _, _) => compute_sha_for_glob(g),
+            NodeToInsert::DirGen(p, _) => compute_sha_for_dir(p),
+            NodeToInsert::Dir(p, _) => compute_sha_for_dir(p),
             _ => None,
         }
     }
+
+    fn force_save_hash(&mut self, conn: &TupConnectionRef, path_buffers: &impl PathBuffers) {
+        if self.get_saved_hash().is_none() {
+            let mut sha = self.compute_node_sha(conn, path_buffers);
+            match self {
+                NodeToInsert::InputFile(_, h) => *h = sha.take(),
+                NodeToInsert::Glob(_, _, h) => *h = sha.take(),
+                NodeToInsert::Dir(_, h) => *h = sha.take(),
+                NodeToInsert::DirGen(_, h) => *h = sha.take(),
+                NodeToInsert::GeneratedFile(_, _, h) => *h = sha.take(),
+                _ => {}
+            }
+        }
+    }
+
+    fn get_saved_hash(&self) -> Option<String> {
+        match self {
+            NodeToInsert::InputFile(_, Some(hash)) => return Some(hash.clone()),
+            NodeToInsert::Glob(_, _, Some(hash)) => return Some(hash.clone()),
+            NodeToInsert::Dir(_, Some(hash)) => return Some(hash.clone()),
+            NodeToInsert::DirGen(_, Some(hash)) => return Some(hash.clone()),
+            NodeToInsert::GeneratedFile(_, _, Some(has)) => return Some(has.clone()),
+            _ => {}
+        }
+        None
+    }
+
     // use this only in the order of nodes returned by the parser
     // for example when inserting nodes in the database, rules should be inserted first before outputs.
     // that way the srcid of outputs can be resolved via crossref
@@ -381,7 +394,7 @@ impl NodeToInsert {
             NodeToInsert::Group(g) => {
                 crossref.add_group_xref(g.clone(), id, parid);
             }
-            NodeToInsert::GeneratedFile(p, _) => {
+            NodeToInsert::GeneratedFile(p, _, _) => {
                 crossref.add_path_xref(p.clone(), id, parid);
             }
             NodeToInsert::Env(e) => {
@@ -390,19 +403,19 @@ impl NodeToInsert {
             NodeToInsert::Task(t) => {
                 crossref.add_task_xref(t.clone(), id, parid);
             }
-            NodeToInsert::InputFile(p) => {
+            NodeToInsert::InputFile(p, _) => {
                 crossref.add_path_xref(p.clone(), id, parid);
             }
-            NodeToInsert::Glob(g, _) => {
+            NodeToInsert::Glob(g, _, _) => {
                 crossref.add_path_xref(g.clone(), id, parid);
             }
             NodeToInsert::ExcludedFile(p) => {
                 crossref.add_path_xref(p.clone(), id, parid);
             }
-            NodeToInsert::Dir(d) => {
+            NodeToInsert::Dir(d, _) => {
                 crossref.add_path_xref(d.clone(), id, parid);
             }
-            NodeToInsert::DirGen(d) => {
+            NodeToInsert::DirGen(d, _) => {
                 crossref.add_path_xref(d.clone(), id, parid);
             }
         }
@@ -598,8 +611,8 @@ impl DbPathSearcher {
 impl Drop for DbPathSearcher {
     fn drop(&mut self) {
         debug!("dropping DbPathSearcher");
-        if let Ok(mutconn) = self.conn.get() {
-            let _ = mutconn.deref().drop_tupfile_entries_table();
+        if let Ok(conn) = self.conn.get() {
+            let _ = conn.deref().drop_tupfile_entries_table();
         }
     }
 }
@@ -645,8 +658,8 @@ impl PathDiscovery for DbPathSearcher {
             let y = y.path_descriptor();
             x.cmp(&y)
         };
-        if mps.is_empty()   {
-            if sel.allows_file(){
+        if mps.is_empty() {
+            if sel.allows_file() {
                 mps = output_handler.discover_paths(path_buffers, glob_path)?;
             }
         }
@@ -656,7 +669,7 @@ impl PathDiscovery for DbPathSearcher {
     }
 }
 impl PathSearcher for DbPathSearcher {
-    fn locate_tuprules(
+    fn locate_tup_rules(
         &self,
         tup_cwd: &PathDescriptor,
         path_buffers: &impl PathBuffers,
@@ -664,7 +677,7 @@ impl PathSearcher for DbPathSearcher {
         let conn = self.conn.get().expect("connection not found");
         let tup_path = tup_cwd.get_path_ref();
         debug!(
-            "tup path is : {} in which (or its parents) we look for TupRules.tup or Tuprules.lua",
+            "tup path is : {} in which (or its parents) we look for TupRules.tup or TupRules.lua",
             tup_path.as_path().display()
         );
         let dirid = conn
@@ -673,17 +686,17 @@ impl PathSearcher for DbPathSearcher {
             .unwrap_or(1i64);
         debug!("dirid: {}", dirid);
         let mut tup_rules = Vec::new();
-        let tuprs = ["TupRules.tup", "tuprules.lua"];
+        let tuprs = ["TupRules.tup", "TupRules.lua"];
         let mut add_rules = |dirid| {
             for tupr in tuprs {
                 if let Ok((dirid_, name)) = conn
                     .fetch_closest_parent(tupr, dirid)
-                    .inspect_err(|e| eprintln!("Error while looking for tuprules: {}", e))
+                    .inspect_err(|e| eprintln!("Error while looking for TupRules: {}", e))
                 {
                     debug!("tup rules node  : {} dir:{}", name, dirid_);
                     let node_dir = conn.fetch_dirpath(dirid_)
                         .unwrap_or_else(|e|
-                            panic!("Directory {dirid_} not found while trying to locate tuprules. Error {e}")
+                            panic!("Directory {dirid_} not found while trying to locate TupRules. Error {e}")
                         );
                     let node_path = node_dir.join(name.as_str());
                     let _ = path_buffers
@@ -696,7 +709,6 @@ impl PathSearcher for DbPathSearcher {
         add_rules(dirid);
         tup_rules
     }
-
 
     fn get_root(&self) -> &Path {
         self.root.as_path()
@@ -867,18 +879,18 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
             tx.insert_link(env_id, rule_id.0, true.into(), Rule)?;
         }
-        Link::TupfileToTupfile(pd, tupd) => {
-            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+        Link::TupfileToTupfile(pd, tup_desc) => {
+            let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
             let tupfile_read_id = crossref.get_path_db_id_ok(&pd)?;
             tx.insert_link(tupfile_read_id.0, tupfile_id.0, true.into(), TupF)?;
         }
-        Link::GlobToTupfile(g, tupd) => {
+        Link::GlobToTupfile(g, tup_desc) => {
             let glob_id = crossref.get_glob_db_id_ok(&g)?;
-            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+            let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
             tx.insert_link(glob_id.0, tupfile_id.0, true.into(), TupF)?;
         }
-        Link::TupfileToRule(tupd, rd) => {
-            let tupfile_id = crossref.get_tup_db_id_ok(&tupd)?;
+        Link::TupfileToRule(tup_desc, rd) => {
+            let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
             tx.insert_link(tupfile_id.0, rule_id.0, false.into(), Rule)?;
         }
@@ -1054,7 +1066,7 @@ fn parse_and_add_rules_to_db(
     tupfiles: &[Node],
     term_progress: &TermProgress,
 ) -> Result<TupParser<DbPathSearcher>> {
-    let cancel_flag = parse_cancel_flag();
+    let cancel_flag = cancel_flag();
     cancel_flag.store(false, Ordering::SeqCst);
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let (sender, receiver) = crossbeam::channel::unbounded();
@@ -1081,7 +1093,7 @@ fn parse_and_add_rules_to_db(
     Ok(parser)
 }
 fn check_cancel() -> Result<()> {
-    let cancel = parse_cancel_flag();
+    let cancel = cancel_flag();
     if cancel.load(Ordering::SeqCst) {
         return Err(eyre!("Insertion interrupted by user (Ctrl-C)"));
     }
@@ -1124,13 +1136,18 @@ impl TupBuildGraphSnapshot {
 }
 // subroutine to build graph snapshot to insert for a given set of resolved rules
 fn collect_db_insertions(
+    psx: &TupConnectionRef,
     resolved_rules: ResolvedRules,
-    rwbufs: ReadWriteBufferObjects,
+    rwbufs: &ReadWriteBufferObjects,
     nodes_to_insert: &mut Vec<TupBuildGraphSnapshot>,
-    insert_sender: Sender<Vec<TupBuildGraphSnapshot>>,
+    insert_sender: &Sender<Vec<TupBuildGraphSnapshot>>,
 ) -> Result<()> {
-    let (envs_to_insert, nodes) = collect_nodes_to_insert(&rwbufs, &resolved_rules, check_cancel)?;
+    let (envs_to_insert, mut nodes) =
+        collect_nodes_to_insert(&rwbufs, &resolved_rules, check_cancel)?;
 
+    for node in nodes.iter_mut() {
+        node.force_save_hash(psx, rwbufs.get());
+    }
     let mut link_collector = LinkCollector::new();
     for tupfile_read in resolved_rules.get_tupfiles_read() {
         link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
@@ -1193,70 +1210,100 @@ where
     drop(sender);
     // create a thread to receive resolved statements and batch insert them to db
 
-    let rwbufs = parser.read_write_buffers().clone();
     //let mut crossref = CrossRefMaps::default();
-    let (insert_sender, insert_receiver) = crossbeam::channel::unbounded::<Vec<TupBuildGraphSnapshot>>();
+    let (insert_sender, insert_receiver) =
+        crossbeam::channel::unbounded::<Vec<TupBuildGraphSnapshot>>();
     {
-        let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
-        let mut parser_c = parser.clone();
-        let wg = wg.clone();
-        let pb = term_progress.make_progress_bar("Processing parsed tupfiles");
         let poisoned = poisoned.clone();
-        let receiver = receiver.clone();
-        let h = s.spawn(move |_| -> Result<()> {
-            let pb_ref = pb.clone();
-            let fnc = move || {
+        let pbar_string: [&str; _] = [
+            "Processing parsed tupfiles - part 1",
+            "Processing parsed tupfiles - part 2",
+            "Processing parsed tupfiles - part 3",
+            "Processing parsed tupfiles - part 4",
+        ];
+        for pstr in pbar_string.into_iter() {
+            let parser_c = parser.clone();
+            let pb_ref = term_progress.make_progress_bar(pstr);
+            let wg = wg.clone();
+            let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
+            let insert_sender = insert_sender.clone();
+            let rwbufs = parser_c.read_write_buffers().clone();
+            let receiver = receiver.clone();
+            let poisoned = poisoned.clone();
+            let h = s.spawn(move |_| -> Result<()> {
+                let conn = parser_c.get_searcher().conn.get()?;
                 let collect_db_insertions_wrap_err =
                     |resolved_rules: ResolvedRules| -> Result<(), Error> {
                         pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
+                        let conn_ref = conn.as_ref(); // need for hash computation
                         term_progress.tick(&pb_ref);
                         let res = collect_db_insertions(
+                            &conn_ref,
                             resolved_rules,
-                            rwbufs.clone(),
+                            &rwbufs,
                             &mut nodes_to_insert,
-                            insert_sender.clone(),
+                            &insert_sender,
                         )
                         .map_err(|e| Error::CallBackError(e.to_string()));
                         res
                     };
-                parser_c
+                let status = parser_c
                     .receive_resolved_statements(receiver, collect_db_insertions_wrap_err)
-                    .context("Resolving statements in tupfiles")?;
-
-                for tupfile_lua in tupfiles
-                    .iter()
-                    .filter(|x| x.get_name().ends_with(".lua"))
-                    .cloned()
-                {
-                    check_cancel()?;
-                    let path = tupfile_lua.get_name();
-                    pb_ref.set_message(format!("Parsing :{}", path));
-                    let resolved_rules = parser_c.parse(path).map_err(|e| {
-                        eyre!("Error: {}", parser_c.read_write_buffers().display_str(&e))
-                    })?;
-                    collect_db_insertions(
-                        resolved_rules,
-                        rwbufs.clone(),
-                        &mut nodes_to_insert,
-                        insert_sender.clone(),
-                    )?;
-                    term_progress.tick(&pb_ref);
-                    pb_ref.set_message(format!("Done parsing {}", path));
-                }
+                    .context("Resolving statements in tupfiles");
                 drop(insert_sender);
-                Ok(())
-            };
-            let res = fnc();
-            if res.is_err() {
-                poisoned.store(true, Ordering::SeqCst);
-                term_progress.abandon(&pb, "Aborted processing parsed tupfiles due to error");
-            } else {
-                term_progress.finish(&pb, "Done processing parsed tupfiles");
-            }
-            drop(wg);
-            res
-        });
-        handles.push(h);
+                drop(wg);
+                handle_result(term_progress, &poisoned, &pb_ref, status)
+            });
+            handles.push(h);
+        }
+        let num_lua = tupfiles
+            .iter()
+            .filter(|x| x.get_name().ends_with(".lua"))
+            .count();
+        if num_lua != 0 {
+            let wg = wg.clone();
+            let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
+            let mut parser_c = parser.clone();
+            let insert_sender = insert_sender.clone();
+            let rwbufs = parser_c.read_write_buffers().clone();
+            let pb = term_progress.make_progress_bar("Processing lua build files");
+            let poisoned = poisoned.clone();
+            let h = s.spawn(move |_| -> Result<()> {
+                let pb_ref = pb.clone();
+                let conn = parser_c.get_searcher().conn.get()?;
+                let fnc = move || {
+                    for tupfile_lua in tupfiles
+                        .iter()
+                        .filter(|x| x.get_name().ends_with(".lua"))
+                        .cloned()
+                    {
+                        check_cancel()?;
+                        let path = tupfile_lua.get_name();
+                        pb_ref.set_message(format!("Parsing :{}", path));
+                        let (resolved_rules, _) = parser_c.parse(path).map_err(|e| {
+                            eyre!("Error: {}", parser_c.read_write_buffers().display_str(&e))
+                        })?;
+                        let conn_ref = conn.as_ref();
+                        collect_db_insertions(
+                            &conn_ref,
+                            resolved_rules,
+                            &rwbufs,
+                            &mut nodes_to_insert,
+                            &insert_sender,
+                        )?;
+                        term_progress.tick(&pb_ref);
+                        pb_ref.set_message(format!("Done parsing {}", path));
+                    }
+                    drop(insert_sender);
+                    Ok(())
+                };
+                let res = fnc();
+                drop(wg);
+                handle_result(term_progress, &poisoned, &pb, res)
+            });
+            handles.push(h);
+        }
+        drop(insert_sender);
     }
     {
         let parser_c = parser.clone();
@@ -1345,6 +1392,22 @@ where
     Ok(())
 }
 
+fn handle_result(
+    term_progress: &TermProgress,
+    poisoned: &Arc<AtomicBool>,
+    pb_ref: &ProgressBar,
+    status: Result<()>,
+) -> Result<()> {
+    if status.is_err() {
+        poisoned.store(true, Ordering::SeqCst);
+        term_progress.abandon(&pb_ref, "Aborted processing parsed tupfiles due to error");
+    } else {
+        term_progress.finish(&pb_ref, "Done processing parsed tupfiles");
+    }
+    status?;
+    Ok(())
+}
+
 fn insert_nodes_wrapper(
     tx: &mut TupTransaction,
     term_progress: &TermProgress,
@@ -1401,11 +1464,13 @@ fn parse_subset(
         .skip(thread_index)
         .step_by(num_threads)
     {
+        let tupfile_name = tupfile.get_name();
         if poisoned.load(Ordering::SeqCst) {
+            drop(sender);
             drop(wg);
+            term_progress.abandon(&pb, format!("Aborted parsing {tupfile_name}"));
             bail!("Parsing aborted due to error or cancellation");
         }
-        let tupfile_name = tupfile.get_name();
         log::info!("Parsing :{}", tupfile_name);
         pb.set_message(format!("Parsing :{tupfile_name}"));
         let res = parser_clone
@@ -1422,6 +1487,7 @@ fn parse_subset(
                 )
             });
         if let Err(e) = res {
+            drop(sender);
             drop(wg);
             term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
             poisoned.store(true, Ordering::SeqCst);
@@ -1432,8 +1498,8 @@ fn parse_subset(
         log::info!("Finished parsing :{}", tupfile_name);
         term_progress.tick(&pb);
     }
+    drop(sender);
     drop(wg);
-    pb.set_message("Done parsing subset");
     log::info!("Finished parsing subet tupfiles");
     term_progress.finish(&pb, format!("Done parsing subset {}", thread_index));
     Ok(())
@@ -1570,9 +1636,9 @@ fn insert_node_in_dir(
 
 pub(crate) fn compute_path_hash(is_dir: bool, pbuf: HashedPath) -> String {
     if is_dir {
-        compute_dir_sha256(pbuf.as_ref()).unwrap_or_default()
+        compute_dir_hash(pbuf.as_ref()).unwrap_or_default()
     } else {
-        compute_sha256(pbuf.as_ref()).unwrap_or_default()
+        compute_hash(pbuf.as_ref()).unwrap_or_default()
     }
 }
 
@@ -1729,8 +1795,10 @@ impl Collector {
         self.nodes_to_insert
     }
     fn collect_output(&mut self, p: &PathDescriptor, srcid: SrcId) -> Result<()> {
+        let root = self.read_write_buffer_objects.get_root();
+        let hash = compute_hash::<&Path>(root.join(p.get_path_ref()).as_ref()).ok();
         self.nodes_to_insert
-            .push(NodeToInsert::GeneratedFile(p.clone(), srcid));
+            .push(NodeToInsert::GeneratedFile(p.clone(), srcid, hash));
         Ok(())
     }
 
@@ -1747,7 +1815,7 @@ impl Collector {
 
     fn collect_glob(&mut self, p: &GlobPathDescriptor, tupid: TupPathDescriptor) -> Result<()> {
         self.nodes_to_insert
-            .push(NodeToInsert::Glob(p.clone(), tupid));
+            .push(NodeToInsert::Glob(p.clone(), tupid, None));
         Ok(())
     }
 
@@ -1760,7 +1828,7 @@ impl Collector {
     fn collect_input(&mut self, p: &PathDescriptor) -> Result<()> {
         debug!("collecting input: {:?}", p.get_file_name().to_string());
         self.nodes_to_insert
-            .push(NodeToInsert::InputFile(p.clone()));
+            .push(NodeToInsert::InputFile(p.clone(), None));
         Ok(())
     }
 
@@ -1771,10 +1839,10 @@ impl Collector {
         Ok(())
     }
 
-    fn collect_rule(&mut self, p: &RuleDescriptor) {
+    fn collect_rule(&mut self, p: &RuleDescriptor, _hash: Option<String>) {
         self.nodes_to_insert.push(NodeToInsert::Rule(p.clone()));
     }
-    fn collect_task(&mut self, p: &TaskDescriptor) {
+    fn collect_task(&mut self, p: &TaskDescriptor, _hash: Option<String>) {
         self.nodes_to_insert.push(NodeToInsert::Task(p.clone()));
     }
     fn add_env(&mut self, p: &EnvDescriptor) {
@@ -1808,7 +1876,7 @@ impl Collector {
         }
         Ok(())
     }
-    fn add_task_node(&mut self, task_desc: &TaskDescriptor) -> Result<()> {
+    fn add_task_node(&mut self, task_desc: &TaskDescriptor, hash: Option<String>) -> Result<()> {
         let task_instance = self.read_write_buffer_objects.get_task(task_desc);
         let name = task_instance.get_target();
         let tuppath = task_instance.get_parent();
@@ -1825,7 +1893,7 @@ impl Collector {
             .unique_rule_check
             .insert(task_instance.get_path().to_string(), line.clone());
         if prevline.is_none() {
-            self.collect_task(task_desc);
+            self.collect_task(task_desc, hash);
         } else {
             bail!(
                 "Task at  {}:{} was previously defined at line {}. \
@@ -1837,7 +1905,7 @@ impl Collector {
         }
         Ok(())
     }
-    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor) -> Result<()> {
+    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor, hash: Option<String>) -> Result<()> {
         let rule_formula = self.read_write_buffer_objects.get_rule(rule_desc);
         let name = rule_formula.get_rule_str();
         let ref ph = self.read_write_buffer_objects;
@@ -1855,7 +1923,7 @@ impl Collector {
                     rule_ref
                 );
             }
-            self.collect_rule(rule_desc);
+            self.collect_rule(rule_desc, hash);
         }
         Ok(())
     }
@@ -1971,7 +2039,7 @@ where
                 for s in resolvedtask.get_deps() {
                     collector.add_input_for_insert(s, tupid.clone())?;
                 }
-                collector.add_task_node(rd)?;
+                collector.add_task_node(rd, None)?;
                 let env_desc = resolvedtask.get_env_list();
                 envs_to_insert.extend(env_desc.iter());
             }
@@ -1985,7 +2053,7 @@ where
             let rule_ref = rl.get_rule_ref();
             let tup_desc = rule_ref.get_tupfile_desc();
             //let dir = get_dir(&tup_desc, &crossref)?;
-            collector.add_rule_node(rd)?;
+            collector.add_rule_node(rd, None)?;
             for p in rl.get_targets() {
                 collector.add_output(p, SrcId::RuleId(rl.get_rule_desc().clone()))?
             }
@@ -2026,10 +2094,11 @@ fn insert_node(
     let node = node_to_insert.get_node(&read_write_buf, crossref)?;
     // Cache the sha so we don't recompute it on modified existing nodes.
     let compute_sha = || {
-        let tup_connection_ref = tx.connection();
-        let sha = node_to_insert
-            .compute_node_sha(&tup_connection_ref, read_write_buf.get())
-            .unwrap_or_default();
+        let sha = if matches!(node_to_insert.get_row_type(), Rule | Task) {
+            String::new()
+        } else {
+            node_to_insert.get_saved_hash().unwrap_or_default()
+        };
         sha
     };
     let sha = compute_sha(); // need to compute sha before upsert for new nodes and modified nodes
@@ -2040,7 +2109,7 @@ fn insert_node(
     if !db_id.is_negative() {
         node_to_insert.update_crossref(crossref, db_id, db_par_id);
         {
-            if !sha.is_empty() {
+            if !sha.is_empty() && !matches!(node_to_insert.get_row_type(), Rule | Task) {
                 tx.upsert_node_sha(db_id, &sha)?;
             }
         }
@@ -2057,6 +2126,9 @@ pub(crate) struct ConnWrapper<'a, 'b> {
 impl<'a, 'b> ConnWrapper<'a, 'b> {
     pub fn new(conn: &'b TupConnectionRef<'a>) -> Self {
         Self { conn }
+    }
+    pub fn get_conn(&self) -> &TupConnectionRef<'a> {
+        self.conn
     }
 }
 

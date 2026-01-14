@@ -10,13 +10,13 @@ use std::ops::Deref;
 //use std::io::Error as IOError;
 use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::yield_now;
 use std::time::{Duration, SystemTime};
 
 use crate::eyre::WrapErr;
-use crate::parse::compute_path_hash;
+use crate::parse::{compute_path_hash, cancel_flag};
 use crate::{is_tupfile, TermProgress};
 use crossbeam::channel::{never, tick, Receiver, Sender};
 use crossbeam::select;
@@ -31,7 +31,7 @@ use tupdb::db::{
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
-use tupparser::transform::{compute_dir_sha256, compute_sha256};
+use tupparser::transform::{compute_dir_hash, compute_hash};
 use walkdir::{DirEntry, WalkDir};
 
 const MAX_THRS_NODES: u8 = 4;
@@ -337,7 +337,6 @@ fn insert_direntries(
     term_progress: &TermProgress,
     is_fresh_db: bool,
 ) -> eyre::Result<()> {
-    let running = Arc::new(AtomicBool::new(true));
     log::debug!("Inserting/updating directory entries to db");
     {
         let conn = pool.get().expect("unable to get connection from pool");
@@ -353,7 +352,7 @@ fn insert_direntries(
         )
         .expect("Unable to prepare root node for insertion");
 
-        let compute_root_sha = || compute_dir_sha256(root).ok();
+        let compute_root_sha = || compute_dir_hash(root).ok();
 
         let inserted = conn.fetch_upsert_node_raw(&root_node.get_prepared_node(), || {
             compute_root_sha().unwrap_or_default()
@@ -371,7 +370,7 @@ fn insert_direntries(
             )
             .expect("Unable to prepare tup.config node for insertion");
             let pathbuf = root.join(TUP_CONFIG);
-            let tup_config_sha = || compute_sha256(pathbuf.clone()).unwrap_or_default();
+            let tup_config_sha = || compute_hash(pathbuf.clone()).unwrap_or_default();
             let _ =
                 conn.fetch_upsert_node_raw(&tup_config_node.get_prepared_node(), tup_config_sha)?;
         }
@@ -400,20 +399,7 @@ fn insert_direntries(
             let root_hp = HashedPath::from(root.to_path_buf());
 
             let root_hash_path = root_hp.clone();
-            let (stop_sender, _) = crossbeam::channel::bounded::<()>(1);
-            // Set up the ctrlc handler
-            {
-                let stop_sender = stop_sender.clone();
-                let running = running.clone();
-                ctrlc::try_set_handler(move || {
-                    let _ = stop_sender.send(());
-                    running.store(false, Ordering::SeqCst);
-                })
-                    .unwrap_or_else(
-                        |e| log::warn!("unable to set ctrlc handler:{}", e)
-                    );
-            }
-
+            let running = cancel_flag();
             dir_id_by_path.insert(root_hp, 1);
             let ign = build_ignore(root)?;
 

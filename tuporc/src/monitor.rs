@@ -2,12 +2,10 @@ use std::env::{current_dir, current_exe};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::parse::CrossRefMaps;
+use crate::parse::{cancel_flag, CrossRefMaps};
 use crate::scan::scan_root;
 use crate::{start_tup_connection, TermProgress, IO_DB};
 use crossbeam::channel::Receiver;
@@ -157,17 +155,17 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
             log::warn!("error in event: {:?}", e.err().unwrap());
         }
     };
-    let running = Arc::new(AtomicBool::new(true));
+    let running = cancel_flag().clone();
     let (stop_sender, stop_receiver) = crossbeam::channel::bounded(0);
     let stop_sender_clone = stop_sender.clone();
     {
         let running = running.clone();
-        let _ = ctrlc::try_set_handler(move || {
+        let stop_sender_clone = stop_sender_clone.clone();
+        std::thread::spawn(move || {
+            while !running.load(std::sync::atomic::Ordering::Relaxed) {
+                sleep(Duration::from_millis(100));
+            }
             let _ = stop_sender_clone.send(());
-            running.store(false, std::sync::atomic::Ordering::Relaxed);
-        })
-        .map_err(|e| {
-            log::error!("Failed to set handler: {}", e);
         });
     }
     let connection_pool = start_tup_connection()?;
