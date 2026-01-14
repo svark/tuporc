@@ -28,7 +28,7 @@ use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 
 use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
-use tupparser::buffers::{OutputHolder, PathBuffers};
+use tupparser::buffers::PathBuffers;
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
 use tupparser::errors::Error;
 use tupparser::transform::{
@@ -100,9 +100,9 @@ impl PathDiscovery for ConnWrapper<'_, '_> {
         &self,
         path_buffers: &impl PathBuffers,
         glob_path: &[GlobPath],
-        cb: impl FnMut(MatchingPath),
+        cb: impl FnMut(MatchingPath) -> Result<(), Error> + Send + Sync,
         sel: SelOptions,
-    ) -> std::result::Result<usize, Error> {
+    ) -> Result<usize, Error> {
         let sz = DbPathSearcher::fetch_glob_globs_cb(&self.conn, path_buffers, glob_path, cb, sel)
             .map_err(|e| Error::new_callback_error(e.to_string()))?;
         Ok(sz)
@@ -504,7 +504,6 @@ fn into_any_error(e: Error) -> AnyError {
 #[derive(Clone)]
 struct DbPathSearcher {
     conn: TupConnectionPool,
-    psx: OutputHolder,
     root: PathBuf,
 }
 
@@ -512,7 +511,6 @@ impl DbPathSearcher {
     pub fn new<P: AsRef<Path>>(conn: TupConnectionPool, root: P) -> DbPathSearcher {
         DbPathSearcher {
             conn,
-            psx: OutputHolder::new(),
             root: root.as_ref().to_path_buf(),
         }
     }
@@ -525,7 +523,7 @@ impl DbPathSearcher {
         sel: SelOptions,
     ) -> Result<usize, AnyError>
     where
-        F: FnMut(MatchingPath),
+        F: FnMut(MatchingPath) -> Result<(), Error> + Send + Sync,
     {
         let mut num_matches = 0;
         for glob_path in glob_paths {
@@ -578,7 +576,7 @@ impl DbPathSearcher {
                 };
                 if let Some(mp) = matching_path {
                     num_matches = num_matches + 1;
-                    f(mp);
+                    f(mp).map_err(|e| AnyError::from(e.to_string()))?;
                 }
                 Ok(())
             };
@@ -609,8 +607,8 @@ impl PathDiscovery for DbPathSearcher {
     fn discover_paths_with_cb(
         &self,
         path_buffers: &impl PathBuffers,
-        glob_paths: &[GlobPath],
-        mut cb: impl FnMut(MatchingPath),
+        glob_path: &[GlobPath],
+        cb: impl FnMut(MatchingPath) -> Result<(), Error> + Send + Sync,
         sel: SelOptions,
     ) -> Result<usize, Error> {
         let conn = self
@@ -618,25 +616,16 @@ impl PathDiscovery for DbPathSearcher {
             .get()
             .map_err(|e| Error::new_callback_error(e.to_string()))?;
         let tup_connection_ref = conn.as_ref();
-        let mut match_count =
-            Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_paths, &mut cb, sel)
+        let match_count =
+            Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_path, cb, sel)
                 .map_err(|e| Error::new_callback_error(e.to_string()))?;
-        if match_count == 0 {
-            let mps = self
-                .get_outs()
-                .discover_paths(path_buffers, glob_paths)
-                .map_err(|e| Error::new_path_search_error(e.to_string()))?;
-            for mp in mps {
-                cb(mp);
-                match_count += 1;
-            }
-        }
         Ok(match_count)
     }
 
     fn discover_paths(
         &self,
         path_buffers: &impl PathBuffers,
+        output_handler: &impl OutputHandler,
         glob_path: &[GlobPath],
         sel: SelOptions,
     ) -> Result<Vec<MatchingPath>, Error> {
@@ -647,14 +636,20 @@ impl PathDiscovery for DbPathSearcher {
             glob_path,
             |mp| {
                 mps.push(mp);
+                Ok(())
             },
-            sel,
+            sel.clone(),
         )?;
         let c = |x: &MatchingPath, y: &MatchingPath| {
             let x = x.path_descriptor();
             let y = y.path_descriptor();
             x.cmp(&y)
         };
+        if mps.is_empty()   {
+            if sel.allows_file(){
+                mps = output_handler.discover_paths(path_buffers, glob_path)?;
+            }
+        }
         mps.sort_by(c);
         mps.dedup();
         Ok(mps)
@@ -702,9 +697,6 @@ impl PathSearcher for DbPathSearcher {
         tup_rules
     }
 
-    fn get_outs(&self) -> &OutputHolder {
-        &self.psx
-    }
 
     fn get_root(&self) -> &Path {
         self.root.as_path()
@@ -1203,7 +1195,6 @@ where
 
     let rwbufs = parser.read_write_buffers().clone();
     //let mut crossref = CrossRefMaps::default();
-    let outs = parser.get_outs();
     let (insert_sender, insert_receiver) = crossbeam::channel::unbounded::<Vec<TupBuildGraphSnapshot>>();
     {
         let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
@@ -1211,6 +1202,7 @@ where
         let wg = wg.clone();
         let pb = term_progress.make_progress_bar("Processing parsed tupfiles");
         let poisoned = poisoned.clone();
+        let receiver = receiver.clone();
         let h = s.spawn(move |_| -> Result<()> {
             let pb_ref = pb.clone();
             let fnc = move || {
@@ -1277,15 +1269,18 @@ where
         let mut c = psx.conn.get()?;
         let mut tx = c.transaction()?;
         let ticker = crossbeam::channel::tick(std::time::Duration::from_millis(500));
+        let mut loop_aborted = false;
         loop {
             crossbeam::select! {
                 recv(ticker) -> _ => {
                     if poisoned.load(Ordering::SeqCst) {
                         log::debug!("recvd user interrupt");
+                        loop_aborted = true;
                         break;
                     }
                     if check_cancel().is_err() {
                         log::debug!("insertion cancelled");
+                        loop_aborted = true;
                         break;
                     }
                     continue;
@@ -1300,7 +1295,6 @@ where
                         }
                     };
                     for tup_link_info in nodes_batch {
-                        check_cancel()?;
                         let tup_id = tup_link_info.get_tup_id().clone();
                         insert_nodes_wrapper(
                             &mut tx,
@@ -1316,13 +1310,18 @@ where
                             .get_tup_db_id(&tup_id)
                             .ok_or_else(|| eyre!("Could not fetch db id for tupfile {}", &tup_id))?;
                         tx.unmark_modified(dbid)?;
-                        check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, crossref)?;
+                        //check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, crossref)?;
                         let _ = insert_links(&mut tx, &tup_id, crossref, tup_link_info.get_links())
                             .context(format!("Inserting links for {}", tup_id))?;
                         term_progress.tick(&pb_insert);
                     } // end for tup_link_info in nodes_batch
                 } // end recv of insert_receiver
             } // end select
+        }
+        if loop_aborted {
+            let _ = tx.rollback();
+            term_progress.abandon(&pb_insert, "Insertion aborted");
+            return Err(eyre!("Insertion aborted"));
         }
         tx.mark_absent_tupfile_entries_to_delete()?;
         tx.mark_orphans_to_delete()?; // cascade deletion of orphaned nodes
@@ -1437,41 +1436,6 @@ fn parse_subset(
     pb.set_message("Done parsing subset");
     log::info!("Finished parsing subet tupfiles");
     term_progress.finish(&pb, format!("Done parsing subset {}", thread_index));
-    Ok(())
-}
-
-/// checks tno two rules/tasks produce the same output
-fn check_uniqueness_of_parent_rule(
-    conn: &TupConnectionRef,
-    read_buf: &ReadWriteBufferObjects,
-    outs: &impl OutputHandler,
-    crossref: &mut CrossRefMaps,
-) -> Result<()> {
-    for o in outs.get_output_files().iter() {
-        let np = read_buf.get_path(o);
-        if let Ok(node) = find_by_path(np.as_path(), conn) {
-            // Identify the current rule (producer) from parser context
-            let current_parent_rule_ref = outs
-                .get_parent_rule(o)
-                .unwrap_or_else(|| panic!("Parent rule not found for {}", o));
-            let (current_rule_db_id, _) = crossref.get_rule_db_id_ok(&current_parent_rule_ref)?;
-
-            // Fallback using srcid as generic producer: if a previous producer exists via srcid,
-            // handle both Rule and Task cases. For Rule, preserve the update-universe diagnostic.
-            let prev_producer_id = node.get_srcid();
-            if prev_producer_id > 0 && prev_producer_id != current_rule_db_id {
-                if !conn.check_is_in_update_universe(prev_producer_id)? {
-                    let old_rule_name = conn.fetch_node_name(prev_producer_id)?;
-                    return Err(eyre!(format!(
-                        "File was previously marked as generated from a producer:{} \
-                                    but is now being generated in {}",
-                        old_rule_name,
-                        current_parent_rule_ref.to_string()
-                    )));
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1949,6 +1913,7 @@ fn insert_nodes(
             check_cancel()?;
         }
         debug!("inserting node: {:?}", node_to_insert);
+        // for an output node ensure that srcid is unique and does not conflict with existing rules
         insert_node(tx, &read_write_buf, crossref, node_to_insert)
             .wrap_err(format!("Inserting node :{:?}", node_to_insert))?;
         {
@@ -2054,7 +2019,7 @@ where
 
 fn insert_node(
     tx: &mut TupTransaction,
-    read_write_buf: &&ReadWriteBufferObjects,
+    read_write_buf: &ReadWriteBufferObjects,
     crossref: &mut CrossRefMaps,
     node_to_insert: &NodeToInsert,
 ) -> Result<(), Report> {
