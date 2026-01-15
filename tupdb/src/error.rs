@@ -32,6 +32,12 @@ impl AnyError {
             _ => false,
         }
     }
+    pub fn is_query_returned_no_rows(&self) -> bool {
+        match self {
+            AnyError::Db(e) => e.deref().eq(&rusqlite::Error::QueryReturnedNoRows),
+            _ => false,
+        }
+    }
 }
 
 impl Display for AnyError {
