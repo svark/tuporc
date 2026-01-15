@@ -94,7 +94,7 @@ fn prepare_for_execution(
                 term_progress.abandon(&pbar, "Cyclic dependency detected!");
                 AnyError::from(e.to_string())
             })?;
-            term_progress.tick(&pbar);
+            term_progress.progress(&pbar);
             Ok(())
         };
 
@@ -671,7 +671,7 @@ fn wait_for_children(
                     debug!("finished executing rule: \n{:?}", ch.1);
                     finished.push(id);
                 }
-                term_progress.tick(pbar);
+                term_progress.progress(pbar);
             } else {
                 tryagain.push(child.clone());
             }

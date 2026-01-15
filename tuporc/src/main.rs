@@ -73,9 +73,10 @@ impl TermProgress {
 
     pub fn make_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
         let pb_main = ProgressBar::new(len);
-        let sty_main =
-            ProgressStyle::with_template("{bar:40.green/yellow} [{elapsed}] {pos:>4}/{len:4}")
-                .unwrap();
+        let sty_main = ProgressStyle::with_template(
+            "{bar:40.green/yellow} [{elapsed}<{eta}] {pos:>4}/{len:4} {msg}",
+        )
+        .unwrap();
         pb_main.set_style(sty_main);
         pb_main.set_message(msg);
         let _ = self.mb.clear();
@@ -99,7 +100,9 @@ impl TermProgress {
     pub fn make_child_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
         let pb = ProgressBar::new(len);
         pb.set_style(
-            ProgressStyle::with_template("{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}")
+            ProgressStyle::with_template(
+                "{bar:40.cyan/blue} [{elapsed}<{eta}] {pos:>4}/{len:4} {msg}",
+            )
                 .unwrap(),
         );
         pb.set_message(msg);
@@ -129,7 +132,7 @@ impl TermProgress {
         self
     }
 
-    pub fn tick(&self, pb: &ProgressBar) {
+    pub fn progress(&self, pb: &ProgressBar) {
         if let Some(l) = pb.length() {
             if l < pb.position() {
                 pb.inc(1);
@@ -307,7 +310,7 @@ fn main() -> Result<()> {
             }
             Action::Parse {
                 mut target,
-                keep_going: _keep_going,
+                keep_going,
                 skip_scan,
             } => {
                 let root = change_root_update_targets(&mut target)?;
@@ -330,7 +333,7 @@ fn main() -> Result<()> {
 
                 let term_progress =
                     term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress).inspect_err(
+                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress, keep_going).inspect_err(
                     |e| {
                         term_progress.abandon_main(format!("Parsing failed with error: {}", e));
                     },
@@ -425,6 +428,7 @@ fn main() -> Result<()> {
                         tupfiles,
                         root.as_path(),
                         &term_progress,
+                        keep_going,
                     )?;
                     term_progress.clear();
                     let exec_options = execute::ExecOptions {

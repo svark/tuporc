@@ -508,6 +508,44 @@ impl CrossRefMaps {
         self.task_id.insert(t.into(), (db_id, par_db_id));
     }
 }
+/// wait for the next [StatementsToResolve] and process them
+fn receive_resolved_statements(
+    parser: &TupParser<DbPathSearcher>,
+    receiver: Receiver<StatementsToResolve>,
+    pb_ref: &ProgressBar,
+    term_progress: &TermProgress,
+    conn_ref: &TupConnectionRef,
+    rwbufs: &ReadWriteBufferObjects,
+    poisoned: &Arc<AtomicBool>,
+    insert_sender: &Sender<Vec<TupBuildGraphSnapshot>>,
+    nodes_to_insert: &mut Vec<TupBuildGraphSnapshot>,
+) -> Result<()> {
+    while let Ok(to_resolve) = receiver.recv() {
+        let tup_desc = to_resolve.get_cur_file_desc().clone();
+        log::info!("resolving statements for tupfile {:?}", tup_desc);
+        let (resolved_rules, _) = parser
+            .process_raw_statements(to_resolve)
+            .wrap_err(format!(
+                "While processing statements for tupfile {}",
+                tup_desc
+            ))
+            .inspect_err(|e| log::error!("error found resolving stmts\n {e}"))?;
+        pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
+        let _cancelled = check_cancel()?;
+        if poisoned.load(Ordering::SeqCst) {
+            break;
+        }
+        term_progress.progress(&pb_ref);
+        collect_db_insertions(
+            &conn_ref,
+            resolved_rules,
+            &rwbufs,
+            nodes_to_insert,
+            insert_sender,
+        )?;
+    }
+    Ok(())
+}
 
 fn into_any_error(e: Error) -> AnyError {
     AnyError::from(e.to_string())
@@ -732,7 +770,11 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
     {
         let db = DbPathSearcher::new(connection, root.as_ref());
         let mut parser = TupParser::try_new_from(root.as_ref(), db)?;
-        let pb = term_progress.make_progress_bar("_");
+        let cnt = tupfiles
+            .iter()
+            .filter(|x| !x.get_name().ends_with(".lua"))
+            .count();
+        let pb = term_progress.make_child_len_progress_bar("_", cnt as u64);
         let mut states_after_parse = Vec::new();
         {
             for tupfile in tupfiles
@@ -741,13 +783,27 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
                 .cloned()
             {
                 pb.set_message(format!("Parsing :{}", tupfile.get_name()));
-                let statements_to_resolve = parser.parse_tupfile_immediate(tupfile.get_name())?;
+                let res = parser.parse_tupfile_immediate(tupfile.get_name());
+                let statements_to_resolve = match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!(
+                            "Error parsing tupfile {}: {}",
+                            tupfile.get_name(),
+                            e.to_string()
+                        );
+
+                        term_progress
+                            .abandon(&pb, format!("Error parsing tupfile {}", tupfile.get_name()));
+                        return Err(Report::from(e));
+                    }
+                };
                 if let Some(val) = statements_to_resolve.fetch_var(var) {
                     states_after_parse
                         .push((statements_to_resolve.get_cur_file_desc().clone(), val));
                 }
                 pb.set_message(format!("Done parsing {}", tupfile.get_name()));
-                term_progress.tick(&pb);
+                term_progress.progress(&pb);
             }
         }
         Ok(states_after_parse)
@@ -760,6 +816,7 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     tupfiles: Vec<Node>,
     root: P,
     term_progress: &TermProgress,
+    keep_going: bool,
 ) -> Result<()> {
     if tupfiles.is_empty() {
         log::warn!("No Tupfiles to parse");
@@ -785,25 +842,21 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         //conn.enrich_modify_list()?;
         {
-            let tp = term_progress.clone();
-            tp.set_main_with_len("Enriching modify list", 7);
-            //conn.mark_orphans_to_delete()?;
-            let pb_main = term_progress.pb_main.clone();
-            pb_main.inc(1);
+            let pb_enrich = term_progress.make_child_len_progress_bar("Enriching modify list", 3);
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
-            pb_main.inc(1);
+            pb_enrich.inc(1);
 
             conn.mark_group_deps().context("Mark group dependencies")?;
-            pb_main.inc(1);
+            pb_enrich.inc(1);
             conn.prune_modify_list().context("Prune modify list")?;
-            pb_main.inc(1);
-            pb_main.finish_with_message("Done enriching modify list");
+            pb_enrich.inc(1);
+            pb_enrich.finish_with_message("Done enriching modify list");
         }
         conn.mark_tupfile_outputs(&tupfile_ids)
             .context("Mark tupfile outputs")?;
     }
-    let _ = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress)?;
+    let _ = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress, keep_going)?;
     {
         let conn = connection.get()?;
         let now = SystemTime::now()
@@ -993,17 +1046,17 @@ pub fn gather_modified_tupfiles(
 
     let term_progress = term_progress.set_main_with_ticker("Gathering modified Tupfiles");
     term_progress.pb_main.set_message("Creating temp tables");
-    term_progress.tick(&term_progress.pb_main);
+    term_progress.progress(&term_progress.pb_main);
     create_dirpathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill dirpathbuf table")?;
 
     create_tuppathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill tuppathbuf table")?;
-    term_progress.tick(&term_progress.pb_main);
+    term_progress.progress(&term_progress.pb_main);
 
     create_presentlist_temptable(conn)?;
 
-    term_progress.tick(&term_progress.pb_main);
+    term_progress.progress(&term_progress.pb_main);
     // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
     conn.mark_tupfile_deps()
         .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
@@ -1011,7 +1064,7 @@ pub fn gather_modified_tupfiles(
         conn.update_node_sha(i, sha.as_str())?;
         conn.mark_glob_deps(i).context("Mark glob dependencies")?; // modified glob -> Tupfile
     }
-    term_progress.tick(&term_progress.pb_main);
+    term_progress.progress(&term_progress.pb_main);
 
     let mut target_dirs_and_names = Vec::new();
     if !targets.is_empty() {
@@ -1043,7 +1096,7 @@ pub fn gather_modified_tupfiles(
         {
             tupfiles.push(n);
         }
-        term_progress.tick(&term_progress.pb_main);
+        term_progress.progress(&term_progress.pb_main);
         Ok(())
     })?;
     Ok(tupfiles)
@@ -1065,6 +1118,7 @@ fn parse_and_add_rules_to_db(
     mut parser: TupParser<DbPathSearcher>,
     tupfiles: &[Node],
     term_progress: &TermProgress,
+    keep_going: bool,
 ) -> Result<TupParser<DbPathSearcher>> {
     let cancel_flag = cancel_flag();
     cancel_flag.store(false, Ordering::SeqCst);
@@ -1087,6 +1141,7 @@ fn parse_and_add_rules_to_db(
             sender,
             receiver,
             &mut crossref,
+            keep_going,
         )
     })
     .expect("Thread error while fetching resolved rules from tupfiles")?;
@@ -1136,7 +1191,7 @@ impl TupBuildGraphSnapshot {
 }
 // subroutine to build graph snapshot to insert for a given set of resolved rules
 fn collect_db_insertions(
-    psx: &TupConnectionRef,
+    conn_ref: &TupConnectionRef,
     resolved_rules: ResolvedRules,
     rwbufs: &ReadWriteBufferObjects,
     nodes_to_insert: &mut Vec<TupBuildGraphSnapshot>,
@@ -1146,7 +1201,7 @@ fn collect_db_insertions(
         collect_nodes_to_insert(&rwbufs, &resolved_rules, check_cancel)?;
 
     for node in nodes.iter_mut() {
-        node.force_save_hash(psx, rwbufs.get());
+        node.force_save_hash(conn_ref, rwbufs.get());
     }
     let mut link_collector = LinkCollector::new();
     for tupfile_read in resolved_rules.get_tupfiles_read() {
@@ -1178,6 +1233,7 @@ fn parse_in_scope<'a, 'b>(
     sender: Sender<StatementsToResolve>,
     receiver: Receiver<StatementsToResolve>,
     mut crossref: &'a mut CrossRefMaps,
+    keep_going: bool,
 ) -> Result<(), Report>
 where
     'b: 'a,
@@ -1203,6 +1259,7 @@ where
                 wg,
                 &pb,
                 poisoned,
+                keep_going,
             )
         });
         handles.push(join_handle);
@@ -1220,6 +1277,12 @@ where
             "Processing parsed tupfiles - part 2",
             "Processing parsed tupfiles - part 3",
             "Processing parsed tupfiles - part 4",
+            "Processing parsed tupfiles - part 5",
+            "Processing parsed tupfiles - part 6",
+            "Processing parsed tupfiles - part 7",
+            "Processing parsed tupfiles - part 8",
+            "Processing parsed tupfiles - part 9",
+            "Processing parsed tupfiles - part 10",
         ];
         for pstr in pbar_string.into_iter() {
             let parser_c = parser.clone();
@@ -1232,24 +1295,19 @@ where
             let poisoned = poisoned.clone();
             let h = s.spawn(move |_| -> Result<()> {
                 let conn = parser_c.get_searcher().conn.get()?;
-                let collect_db_insertions_wrap_err =
-                    |resolved_rules: ResolvedRules| -> Result<(), Error> {
-                        pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
-                        let conn_ref = conn.as_ref(); // need for hash computation
-                        term_progress.tick(&pb_ref);
-                        let res = collect_db_insertions(
-                            &conn_ref,
-                            resolved_rules,
-                            &rwbufs,
-                            &mut nodes_to_insert,
-                            &insert_sender,
-                        )
-                        .map_err(|e| Error::CallBackError(e.to_string()));
-                        res
-                    };
-                let status = parser_c
-                    .receive_resolved_statements(receiver, collect_db_insertions_wrap_err)
-                    .context("Resolving statements in tupfiles");
+                let conn_ref = conn.as_ref();
+                let status = receive_resolved_statements(
+                    &parser_c,
+                    receiver,
+                    &pb_ref,
+                    term_progress,
+                    &conn_ref,
+                    &rwbufs,
+                    &poisoned,
+                    &insert_sender,
+                    &mut nodes_to_insert,
+                )
+                .context("Resolving statements in tupfiles");
                 drop(insert_sender);
                 drop(wg);
                 handle_result(term_progress, &poisoned, &pb_ref, status)
@@ -1291,7 +1349,7 @@ where
                             &mut nodes_to_insert,
                             &insert_sender,
                         )?;
-                        term_progress.tick(&pb_ref);
+                        term_progress.progress(&pb_ref);
                         pb_ref.set_message(format!("Done parsing {}", path));
                     }
                     drop(insert_sender);
@@ -1360,7 +1418,7 @@ where
                         //check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, crossref)?;
                         let _ = insert_links(&mut tx, &tup_id, crossref, tup_link_info.get_links())
                             .context(format!("Inserting links for {}", tup_id))?;
-                        term_progress.tick(&pb_insert);
+                        term_progress.progress(&pb_insert);
                     } // end for tup_link_info in nodes_batch
                 } // end recv of insert_receiver
             } // end select
@@ -1398,14 +1456,18 @@ fn handle_result(
     pb_ref: &ProgressBar,
     status: Result<()>,
 ) -> Result<()> {
-    if status.is_err() {
-        poisoned.store(true, Ordering::SeqCst);
-        term_progress.abandon(&pb_ref, "Aborted processing parsed tupfiles due to error");
-    } else {
-        term_progress.finish(&pb_ref, "Done processing parsed tupfiles");
+    match status {
+        Err(e) => {
+            log::error!("Error: {}", e);
+            term_progress.abandon(&pb_ref, "Aborted processing parsed tupfiles");
+            poisoned.store(true, Ordering::SeqCst);
+            Err(e)
+        }
+        _ => {
+            term_progress.finish(&pb_ref, "Done processing parsed tupfiles");
+            Ok(())
+        }
     }
-    status?;
-    Ok(())
 }
 
 fn insert_nodes_wrapper(
@@ -1456,6 +1518,7 @@ fn parse_subset(
     wg: WaitGroup,
     pb: &ProgressBar,
     poisoned: Arc<AtomicBool>,
+    keep_going: bool, // keep going on error
 ) -> Result<()> {
     for tupfile in tupfiles
         .iter()
@@ -1473,34 +1536,41 @@ fn parse_subset(
         }
         log::info!("Parsing :{}", tupfile_name);
         pb.set_message(format!("Parsing :{tupfile_name}"));
-        let res = parser_clone
+        match parser_clone
             .parse_tupfile(tupfile.get_name(), sender.clone())
             .map_err(|error| {
                 let rwbuf = parser_clone.read_write_buffers();
                 let display_str = rwbuf.display_str(&error);
-                // drop(wg);
                 eyre!(
-                    "Error while parsing tupfile: {}:\n {} due to \n{}",
+                    "Failed to parse tupfile {}: {}\nCaused by: {}",
                     tupfile.get_name(),
                     display_str,
                     error
                 )
-            });
-        if let Err(e) = res {
-            drop(sender);
-            drop(wg);
-            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-            poisoned.store(true, Ordering::SeqCst);
-            log::error!("Error {e} \n found parsing tupfile :{}", tupfile_name);
-            return Err(e);
+            }) {
+            Ok(_) => {
+                pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+                log::info!("Finished parsing :{}", tupfile_name);
+                term_progress.progress(&pb);
+            }
+            Err(e) if keep_going => {
+                log::error!("{}", e);
+                pb.set_message(format!("Error parsing {}", tupfile.get_name()));
+                term_progress.progress(&pb);
+            }
+            Err(e) => {
+                log::error!("{}", e);
+                drop(sender);
+                drop(wg);
+                term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
+                poisoned.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
         }
-        pb.set_message(format!("Done parsing {}", tupfile.get_name()));
-        log::info!("Finished parsing :{}", tupfile_name);
-        term_progress.tick(&pb);
     }
     drop(sender);
     drop(wg);
-    log::info!("Finished parsing subet tupfiles");
+    log::info!("Finished parsing subset tupfiles");
     term_progress.finish(&pb, format!("Done parsing subset {}", thread_index));
     Ok(())
 }
@@ -1558,7 +1628,7 @@ pub(crate) fn insert_path(
     };
 
     // Walk the parent components, inserting any missing directory with the correct parent id/path.
-    let (mut cur_parent_id, mut cur_path) = (0i64, path_buffers.get_root_dir().to_path_buf());
+    let (mut cur_parent_id, mut cur_path) = (1i64, path_buffers.get_root_dir().to_path_buf());
     for comp in parent_pd.components() {
         let name = comp.get_file_name_os_str();
         if comp.is_root() || name == "." {
@@ -1985,7 +2055,7 @@ fn insert_nodes(
         insert_node(tx, &read_write_buf, crossref, node_to_insert)
             .wrap_err(format!("Inserting node :{:?}", node_to_insert))?;
         {
-            term_progress.tick(pb);
+            term_progress.progress(pb);
         }
     }
 
@@ -2005,7 +2075,7 @@ fn insert_nodes(
                 log::warn!("Error while inserting env var: {:?}", e);
             }
         }
-        term_progress.tick(pb);
+        term_progress.progress(pb);
     }
     check_cancel()?;
 
