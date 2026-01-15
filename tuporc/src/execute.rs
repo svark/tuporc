@@ -27,7 +27,7 @@ use tupparser::statements::{Loc, TupLoc};
 use tupparser::TupPathDescriptor;
 
 use crate::parse::{cancel_flag, ConnWrapper};
-use crate::{start_tup_connection, TermProgress, IO_DB};
+use crate::{TermProgress, IO_DB};
 use tupdb::db::RowType;
 use tupdb::db::RowType::Excluded;
 use tupdb::error::{AnyError, DbResult};
@@ -130,12 +130,12 @@ impl Default for ExecOptions {
 }
 
 pub(crate) fn execute_targets(
+    connection_pool: &TupConnectionPool,
     target: &Vec<String>,
     root: PathBuf,
     exec_options: &ExecOptions,
 ) -> Result<()> {
-    let connection_pool = start_tup_connection()
-        .expect("Connection to tup database in .tup/db could not be established");
+
     let (dag, node_bimap) =
         prepare_for_execution(connection_pool.clone(), &exec_options.term_progress)?;
 
@@ -502,7 +502,8 @@ fn exec_nodes_to_run(
         topo_orders_set.insert(topo_order.get(&(v.get_id() as i32)).unwrap());
     }
     let poisoned = PoisonedState::new(keep_going);
-    let num_threads = std::cmp::min(num_threads, valid_rules.len());
+    let num_threads = std::cmp::min(connection_pool.max_size() as usize,
+                                    std::cmp::min(num_threads, valid_rules.len()));
     let mut pbars: Vec<ProgressBar> = Vec::new();
     let _ = cancel_flag();
     valid_rules.sort_by(|x, y| {
@@ -855,7 +856,7 @@ fn listen_to_processes(
     poisoned: PoisonedState,
     mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
-    let io_conn_pool = start_connection(IO_DB).expect("Failed to open in memory db");
+    let io_conn_pool = start_connection(IO_DB, 2).expect("Failed to open in memory db");
     let mut io_conn = io_conn_pool.get()?;
     tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;

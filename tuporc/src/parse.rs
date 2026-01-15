@@ -3,8 +3,6 @@ use crate::scan::{HashedPath, MAX_THRS_DIRS};
 use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::channel::{Receiver, Sender};
-use crossbeam::sync::WaitGroup;
-use crossbeam::thread::Scope;
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
 use indicatif::ProgressBar;
 use log::debug;
@@ -14,7 +12,7 @@ use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tupdb::db::RowType::{Dir, DirGen, Env, Excluded, File, GenF, Glob, Rule, Task, TupF};
 use tupdb::db::{
@@ -27,6 +25,7 @@ use tupdb::error::{AnyError, DbResult};
 use tupdb::inserts::LibSqlInserts;
 use tupdb::queries::LibSqlQueries;
 
+use rayon::ThreadPoolBuilder;
 use tupparser::buffers::PathBuffers;
 use tupparser::buffers::{GlobPath, InputResolvedType, MatchingPath, NormalPath, SelOptions};
 use tupparser::decode::{OutputHandler, PathDiscovery, PathSearcher};
@@ -1132,9 +1131,19 @@ fn parse_and_add_rules_to_db(
             .add_tup_file(Path::new(tup_node.get_name()));
         crossref.add_tup_xref(tupid, tup_node.get_id(), tup_node.get_dir());
     }
-    crossbeam::thread::scope(|s| -> Result<()> {
-        parse_in_scope(
-            s,
+    let pool_threads = {
+        let pool_size = parser.get_searcher().conn.max_size() as usize;
+        // leave a couple of connections for insert/other work, and cap to MAX_THRS_DIRS
+        std::cmp::max(1, std::cmp::min(MAX_THRS_DIRS, pool_size.saturating_sub(2)))
+    };
+    let thread_pool = ThreadPoolBuilder::new()
+        .thread_name(|i| format!("tup-parse-thread-{i}"))
+        .num_threads(pool_threads)
+        .build()?;
+    let parse_result = Arc::new(Mutex::new(None));
+    thread_pool.scope(|scope| {
+        if let Err(e) = parse_in_scope(
+            scope,
             &mut parser,
             tupfiles,
             term_progress,
@@ -1142,9 +1151,17 @@ fn parse_and_add_rules_to_db(
             receiver,
             &mut crossref,
             keep_going,
-        )
-    })
-    .expect("Thread error while fetching resolved rules from tupfiles")?;
+        ) {
+            *parse_result.lock().expect("poisoned parse result mutex") = Some(e);
+        }
+    });
+    if let Some(err) = parse_result
+        .lock()
+        .expect("poisoned parse result mutex")
+        .take()
+    {
+        return Err(err);
+    }
     Ok(parser)
 }
 fn check_cancel() -> Result<()> {
@@ -1225,111 +1242,115 @@ fn collect_db_insertions(
 }
 
 // Spawn multiple threads to parse tupfiles in parallel within a scope
-fn parse_in_scope<'a, 'b>(
-    s: &Scope<'a>,
-    parser: &'a mut TupParser<DbPathSearcher>,
+fn record_error(store: &Arc<Mutex<Option<Report>>>, err: Report) {
+    let mut guard = store.lock().expect("poisoned error store");
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
+fn parse_in_scope<'scope, 'b>(
+    s: &rayon::Scope<'scope>,
+    parser: &'scope mut TupParser<DbPathSearcher>,
     tupfiles: &'b [Node],
     term_progress: &'b TermProgress,
     sender: Sender<StatementsToResolve>,
     receiver: Receiver<StatementsToResolve>,
-    mut crossref: &'a mut CrossRefMaps,
+    mut crossref: &'scope mut CrossRefMaps,
     keep_going: bool,
 ) -> Result<(), Report>
 where
-    'b: 'a,
+    'b: 'scope,
 {
-    let wg = WaitGroup::new();
     let poisoned = Arc::new(AtomicBool::new(false));
-    let num_threads = std::cmp::min(MAX_THRS_DIRS / 2, tupfiles.len());
-    let mut handles = Vec::new();
-    for thread_index in 0..num_threads {
-        let parser_clone = parser.clone();
-        let sender = sender.clone();
-        let wg = wg.clone();
-        let pb = term_progress.make_progress_bar("_");
-        let poisoned = poisoned.clone();
-        let join_handle = s.spawn(move |_| -> Result<()> {
-            parse_subset(
-                tupfiles,
-                term_progress,
-                num_threads,
-                thread_index,
-                parser_clone,
-                sender,
-                wg,
-                &pb,
-                poisoned,
-                keep_going,
-            )
+    let first_err = Arc::new(Mutex::new(None));
+    tupfiles
+        .iter()
+        .filter(|x| !x.get_name().ends_with(".lua"))
+        .cloned()
+        .for_each(|tupfile| {
+            let parser_clone = parser.clone();
+            let sender = sender.clone();
+            let pb = term_progress.make_progress_bar("_");
+            let poisoned = poisoned.clone();
+            let first_err = first_err.clone();
+            s.spawn(move |_| {
+                if let Err(e) = parse_one_tupfile(
+                    tupfile,
+                    term_progress,
+                    parser_clone,
+                    sender,
+                    &pb,
+                    poisoned,
+                    keep_going,
+                ) {
+                    record_error(&first_err, e);
+                }
+            });
         });
-        handles.push(join_handle);
-    }
     drop(sender);
-    // create a thread to receive resolved statements and batch insert them to db
-
-    //let mut crossref = CrossRefMaps::default();
+    // create threads to receive resolved statements and batch insert them to db
     let (insert_sender, insert_receiver) =
         crossbeam::channel::unbounded::<Vec<TupBuildGraphSnapshot>>();
     {
         let poisoned = poisoned.clone();
-        let pbar_string: [&str; _] = [
-            "Processing parsed tupfiles - part 1",
-            "Processing parsed tupfiles - part 2",
-            "Processing parsed tupfiles - part 3",
-            "Processing parsed tupfiles - part 4",
-            "Processing parsed tupfiles - part 5",
-            "Processing parsed tupfiles - part 6",
-            "Processing parsed tupfiles - part 7",
-            "Processing parsed tupfiles - part 8",
-            "Processing parsed tupfiles - part 9",
-            "Processing parsed tupfiles - part 10",
-        ];
-        for pstr in pbar_string.into_iter() {
+        let first_err = first_err.clone();
+        let non_lua_count = tupfiles
+            .iter()
+            .filter(|x| !x.get_name().ends_with(".lua"))
+            .count();
+        let num_receivers =
+            std::cmp::min(rayon::current_num_threads(), std::cmp::max(1, non_lua_count));
+        for worker_idx in 0..num_receivers {
             let parser_c = parser.clone();
-            let pb_ref = term_progress.make_progress_bar(pstr);
-            let wg = wg.clone();
+            let pb_ref = term_progress.make_progress_bar("Resolving statements");
+            pb_ref.set_message(format!("Resolving statements worker {}", worker_idx + 1));
             let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
             let insert_sender = insert_sender.clone();
             let rwbufs = parser_c.read_write_buffers().clone();
             let receiver = receiver.clone();
             let poisoned = poisoned.clone();
-            let h = s.spawn(move |_| -> Result<()> {
-                let conn = parser_c.get_searcher().conn.get()?;
-                let conn_ref = conn.as_ref();
-                let status = receive_resolved_statements(
-                    &parser_c,
-                    receiver,
-                    &pb_ref,
-                    term_progress,
-                    &conn_ref,
-                    &rwbufs,
-                    &poisoned,
-                    &insert_sender,
-                    &mut nodes_to_insert,
-                )
-                .context("Resolving statements in tupfiles");
-                drop(insert_sender);
-                drop(wg);
-                handle_result(term_progress, &poisoned, &pb_ref, status)
+            let first_err = first_err.clone();
+            s.spawn(move |_| {
+                let result = (|| -> Result<()> {
+                    let conn = parser_c.get_searcher().conn.get()?;
+                    let conn_ref = conn.as_ref();
+                    let status = receive_resolved_statements(
+                        &parser_c,
+                        receiver,
+                        &pb_ref,
+                        term_progress,
+                        &conn_ref,
+                        &rwbufs,
+                        &poisoned,
+                        &insert_sender,
+                        &mut nodes_to_insert,
+                    )
+                    .context("Resolving statements in tupfiles");
+                    drop(insert_sender);
+                    handle_result(term_progress, &poisoned, &pb_ref, status)
+                })();
+                if let Err(e) = result {
+                    record_error(&first_err, e);
+                }
             });
-            handles.push(h);
         }
         let num_lua = tupfiles
             .iter()
             .filter(|x| x.get_name().ends_with(".lua"))
             .count();
         if num_lua != 0 {
-            let wg = wg.clone();
             let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
             let mut parser_c = parser.clone();
             let insert_sender = insert_sender.clone();
             let rwbufs = parser_c.read_write_buffers().clone();
             let pb = term_progress.make_progress_bar("Processing lua build files");
             let poisoned = poisoned.clone();
-            let h = s.spawn(move |_| -> Result<()> {
-                let pb_ref = pb.clone();
-                let conn = parser_c.get_searcher().conn.get()?;
-                let fnc = move || {
+            let first_err = first_err.clone();
+            s.spawn(move |_| {
+                let res = (|| -> Result<()> {
+                    let pb_ref = pb.clone();
+                    let conn = parser_c.get_searcher().conn.get()?;
                     for tupfile_lua in tupfiles
                         .iter()
                         .filter(|x| x.get_name().ends_with(".lua"))
@@ -1354,12 +1375,11 @@ where
                     }
                     drop(insert_sender);
                     Ok(())
-                };
-                let res = fnc();
-                drop(wg);
-                handle_result(term_progress, &poisoned, &pb, res)
+                })();
+                if let Err(e) = handle_result(term_progress, &poisoned, &pb, res) {
+                    record_error(&first_err, e);
+                }
             });
-            handles.push(h);
         }
         drop(insert_sender);
     }
@@ -1443,9 +1463,12 @@ where
     term_progress.clear();
     log::info!("Finished parse phase");
     log::info!("Finished resolving statements from parsed tupfiles");
-    wg.wait();
-    for join_handle in handles {
-        join_handle.join().unwrap()?; // fail if any of the spawned threads returned an error
+    if let Some(err) = first_err
+        .lock()
+        .expect("poisoned error store")
+        .take()
+    {
+        return Err(err);
     }
     Ok(())
 }
@@ -1507,71 +1530,57 @@ fn insert_nodes_wrapper(
     Ok(())
 }
 
-// parse a subset of tupfiles assigned to this thread
-fn parse_subset(
-    tupfiles: &[Node],
+// parse a single tupfile
+fn parse_one_tupfile(
+    tupfile: Node,
     term_progress: &TermProgress,
-    num_threads: usize,
-    thread_index: usize,
     mut parser_clone: TupParser<DbPathSearcher>,
     sender: Sender<StatementsToResolve>,
-    wg: WaitGroup,
     pb: &ProgressBar,
     poisoned: Arc<AtomicBool>,
     keep_going: bool, // keep going on error
 ) -> Result<()> {
-    for tupfile in tupfiles
-        .iter()
-        .filter(|x| !x.get_name().ends_with(".lua"))
-        .cloned()
-        .skip(thread_index)
-        .step_by(num_threads)
-    {
-        let tupfile_name = tupfile.get_name();
-        if poisoned.load(Ordering::SeqCst) {
-            drop(sender);
-            drop(wg);
-            term_progress.abandon(&pb, format!("Aborted parsing {tupfile_name}"));
-            bail!("Parsing aborted due to error or cancellation");
+    let tupfile_name = tupfile.get_name();
+    if poisoned.load(Ordering::SeqCst) {
+        drop(sender);
+        term_progress.abandon(&pb, format!("Aborted parsing {tupfile_name}"));
+        bail!("Parsing aborted due to error or cancellation");
+    }
+    log::info!("Parsing :{}", tupfile_name);
+    pb.set_message(format!("Parsing :{tupfile_name}"));
+    match parser_clone
+        .parse_tupfile(tupfile.get_name(), sender.clone())
+        .map_err(|error| {
+            let rwbuf = parser_clone.read_write_buffers();
+            let display_str = rwbuf.display_str(&error);
+            eyre!(
+                "Failed to parse tupfile {}: {}\nCaused by: {}",
+                tupfile.get_name(),
+                display_str,
+                error
+            )
+        }) {
+        Ok(_) => {
+            pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+            log::info!("Finished parsing :{}", tupfile_name);
+            term_progress.progress(&pb);
         }
-        log::info!("Parsing :{}", tupfile_name);
-        pb.set_message(format!("Parsing :{tupfile_name}"));
-        match parser_clone
-            .parse_tupfile(tupfile.get_name(), sender.clone())
-            .map_err(|error| {
-                let rwbuf = parser_clone.read_write_buffers();
-                let display_str = rwbuf.display_str(&error);
-                eyre!(
-                    "Failed to parse tupfile {}: {}\nCaused by: {}",
-                    tupfile.get_name(),
-                    display_str,
-                    error
-                )
-            }) {
-            Ok(_) => {
-                pb.set_message(format!("Done parsing {}", tupfile.get_name()));
-                log::info!("Finished parsing :{}", tupfile_name);
-                term_progress.progress(&pb);
-            }
-            Err(e) if keep_going => {
-                log::error!("{}", e);
-                pb.set_message(format!("Error parsing {}", tupfile.get_name()));
-                term_progress.progress(&pb);
-            }
-            Err(e) => {
-                log::error!("{}", e);
-                drop(sender);
-                drop(wg);
-                term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
-                poisoned.store(true, Ordering::SeqCst);
-                return Err(e);
-            }
+        Err(e) if keep_going => {
+            log::error!("{}", e);
+            pb.set_message(format!("Error parsing {}", tupfile.get_name()));
+            term_progress.progress(&pb);
+        }
+        Err(e) => {
+            log::error!("{}", e);
+            drop(sender);
+            term_progress.abandon(&pb, format!("Error parsing {tupfile_name}"));
+            poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
         }
     }
     drop(sender);
-    drop(wg);
-    log::info!("Finished parsing subset tupfiles");
-    term_progress.finish(&pb, format!("Done parsing subset {}", thread_index));
+    log::info!("Finished parsing tupfile {}", tupfile_name);
+    term_progress.finish(&pb, format!("Done parsing {}", tupfile_name));
     Ok(())
 }
 

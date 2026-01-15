@@ -19,6 +19,7 @@ extern crate tupdb;
 use std::borrow::Cow;
 use std::env::{current_dir, set_current_dir};
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,8 +53,8 @@ pub(crate) struct TermProgress {
     pb_main: ProgressBar,
 }
 
-fn start_tup_connection() -> Result<TupConnectionPool> {
-    let pool = start_connection(TUP_DB)
+fn start_tup_connection(pool_size: u32) -> Result<TupConnectionPool> {
+    let pool = start_connection(TUP_DB, pool_size)
         .wrap_err_with(|| format!("Failed to open tup database at '{}'", TUP_DB))?;
     Ok(pool)
 }
@@ -188,6 +189,11 @@ struct Args {
     /// Verbose output of the build steps
     #[clap(long)]
     verbose: bool,
+
+    #[clap(long, default_value_t = num_cpus::get() as u32)]
+    /// Number of database connections in the pool
+    db_pool_size: u32,
+
     /// Internal flag used when relaunching elevated on Windows
     #[clap(long, hide = true, action)]
     elevated: bool,
@@ -199,10 +205,17 @@ enum Action {
     Init,
 
     #[clap(about = "Clean and initialize database again")]
-    ReInit,
+    ReInit {
+        #[clap(short = 'g', default_value = "false")]
+        keep_gen_files : bool,
+    },
 
     #[clap(about = "Scans the file system for changes since the last scan")]
-    Scan,
+    Scan {
+        /// Number of jobs to run in parallel
+        #[arg(short = 'j', long = "num-jobs", default_value_t = num_cpus::get() as usize)]
+        num_jobs: usize,
+    },
 
     #[clap(about = "Parses the tup files in a tup database")]
     Parse {
@@ -214,6 +227,9 @@ enum Action {
         /// skip scanning the filesystem before parse
         #[arg(short = 's', long = "skip-scan", default_value = "false")]
         skip_scan: bool,
+        /// Number of jobs to run in parallel
+        #[arg(short = 'j', long = "num-jobs", default_value_t = num_cpus::get() as usize)]
+        num_jobs: usize,
     },
 
     #[clap(about = "Build specified targets")]
@@ -223,7 +239,7 @@ enum Action {
         /// keep_going when set, allows builds to continue on error
         #[arg(short = 'k', default_value = "false")]
         keep_going: bool,
-        #[arg(short = 'j', long = "num-jobs", default_value = "0")]
+        #[arg(short = 'j', long = "num-jobs", default_value_t = num_cpus::get() as usize)]
         num_jobs: usize,
         /// Skip scanning the filesystem before build
         #[clap(short = 's', long = "skip-scan", default_value = "false")]
@@ -251,6 +267,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     env_logger::init();
     log_sqlite_version();
+    let db_pool_size = args.db_pool_size;
     if let Some(act) = args.command.or_else(|| {
         Some(Action::Upd {
             target: Vec::new(),
@@ -263,19 +280,23 @@ fn main() -> Result<()> {
             Action::Init => {
                 init_db().wrap_err("Failed to initialize .tup/db")?;
             }
-            Action::ReInit => {
+            Action::ReInit { keep_gen_files}  => {
                 {
                     change_root()?;
-                    let pool = start_tup_connection()
+                    let pool = start_tup_connection(db_pool_size)
                         .wrap_err("Failed to connect to tup database during reinit")?;
                     let conn = pool
                         .get()
                         .wrap_err("Failed to get database connection from pool")?;
                     // check if there is DirPathBuf table in the database
-                    if is_initialized(&conn, "DirPathBuf") {
+                    if is_initialized(&conn, "DirPathBuf") && !keep_gen_files {
                         conn.for_each_gen_file(|node| {
                             if node.get_type().eq(&RowType::GenF) {
-                                std::fs::remove_file(node.get_name()).unwrap();
+                                let _ = std::fs::remove_file(node.get_name()).or_else(  |_| {
+                                    log::warn!("No such file {}", node.get_name());
+                                    Ok::<(), io::Error>(())
+                                }
+                                );
                             }
                             Ok(())
                         })?;
@@ -296,9 +317,9 @@ fn main() -> Result<()> {
                 delete_db().wrap_err("Reinit: failed to delete existing .tup directory")?;
                 init_db().wrap_err("Reinit: failed to initialize .tup/db")?;
             }
-            Action::Scan => {
+            Action::Scan  { num_jobs: _num_jobs }=> {
                 change_root()?;
-                let pool = start_tup_connection()
+                let pool = start_tup_connection(args.db_pool_size)
                     .wrap_err("Scan action: could not establish connection to .tup/db")?;
                 let root = current_dir()?;
 
@@ -312,6 +333,7 @@ fn main() -> Result<()> {
                 mut target,
                 keep_going,
                 skip_scan,
+                num_jobs: _,
             } => {
                 let root = change_root_update_targets(&mut target)?;
                 if !target.is_empty() {
@@ -321,7 +343,7 @@ fn main() -> Result<()> {
                     );
                 }
 
-                let pool = start_tup_connection()
+                let pool = start_tup_connection(args.db_pool_size)
                     .wrap_err("Parse action: could not establish connection to .tup/db")?;
                 let term_progress = TermProgress::new("Scanning ");
                 let skip_scan = skip_scan || monitor::is_monitor_running();
@@ -400,7 +422,7 @@ fn main() -> Result<()> {
                 println!("Updating db {}", target.join(" "));
                 let term_progress = TermProgress::new("Building ");
                 {
-                    let connection_pool = start_tup_connection()
+                    let connection_pool = start_tup_connection(args.db_pool_size)
                         .wrap_err("Update action: could not establish connection to .tup/db")?;
                     // Track run status and handle interrupted runs.
                     {
@@ -437,12 +459,11 @@ fn main() -> Result<()> {
                         num_jobs,
                         term_progress: term_progress.clone(),
                     };
-                    execute::execute_targets(&target, root, &exec_options)?;
+                    let connection_pool = start_tup_connection(db_pool_size)?;
+                    execute::execute_targets(&connection_pool, &target, root, &exec_options)?;
                     // Mark run success
                     {
-                        let mut conn = start_tup_connection()
-                            .wrap_err("Update action: could not establish connection to .tup/db")?
-                            .get()?;
+                        let mut conn = connection_pool.get()?;
                         let tx = conn.transaction()?;
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -473,7 +494,7 @@ fn main() -> Result<()> {
             Action::DumpVars { var, skip_scan, .. } => {
                 change_root()?;
                 let root = current_dir()?;
-                let pool = start_tup_connection()
+                let pool = start_tup_connection(args.db_pool_size)
                     .wrap_err("DumpVars action: could not establish connection to .tup/db")?;
                 let term_progress = TermProgress::new("Scanning ");
                 let tupfiles =

@@ -23,6 +23,7 @@ use tupparser::buffers::{BufferObjects, PathBuffers};
 pub(crate) struct WatchObject {
     root: PathBuf,
     ign: Gitignore,
+    db_pool_size: u32
 }
 
 impl WatchObject {
@@ -30,10 +31,11 @@ impl WatchObject {
         WatchObject {
             root: root.clone(),
             ign,
+            db_pool_size: tupdb::db::MAX_CONNECTIONS as u32,
         }
     }
     pub fn start(&mut self) -> Result<()> {
-        monitor(&self.root, self.ign.clone())?;
+        monitor(&self.root, self.ign.clone(), self.db_pool_size)?;
         Ok(())
     }
     pub fn stop(&mut self) -> Result<()> {
@@ -83,7 +85,7 @@ fn is_file_locked_for_write<P: AsRef<Path>>(path: P) -> Result<bool> {
     Ok(file.try_lock_exclusive().is_err())
 }
 
-fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
+fn monitor(root: &Path, ign: Gitignore, db_pool_size: u32) -> Result<()> {
     let config = Config::default().with_poll_interval(Duration::from_millis(1000));
     let lock_file_path = root.join(".tup/mon_lock");
     let mut file = OpenOptions::new()
@@ -168,7 +170,7 @@ fn monitor(root: &Path, ign: Gitignore) -> Result<()> {
             let _ = stop_sender_clone.send(());
         });
     }
-    let connection_pool = start_tup_connection()?;
+    let connection_pool = start_tup_connection(db_pool_size)?;
     let term_progress = TermProgress::new("Full scan underway..");
     scan_root(root.as_path(), connection_pool.clone(), &term_progress)?;
     crossbeam::scope(|s| -> Result<()> {
@@ -348,7 +350,7 @@ fn is_ignorable<P: AsRef<Path>>(path: P, ign: &Gitignore, is_dir: bool) -> bool 
 }
 
 fn stop_monitor() -> Result<()> {
-    let conn = start_connection(IO_DB)?;
+    let conn = start_connection(IO_DB,1)?;
     conn.get()?
         .execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())
