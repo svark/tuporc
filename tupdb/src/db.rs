@@ -13,7 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, MAIN_SEPARATOR};
 use std::sync::Arc;
 use std::time::Duration;
-
+pub const MAX_CONNECTIONS : u32 = 20;
 //returns change status of a db command
 pub enum UpsertStatus {
     Inserted(i64),
@@ -512,10 +512,10 @@ pub struct TupConnectionPool {
 pub struct TupConnection(r2d2::PooledConnection<SqliteConnectionManager>);
 
 impl TupConnectionPool {
-    pub fn new(database_url: &str) -> Self {
+    pub fn new(database_url: &str, pool_size: u32) -> Self {
         let manager = SqliteConnectionManager::file(database_url);
         let pool = r2d2::Builder::new()
-            .max_size(18)
+            .max_size(std::cmp::min(MAX_CONNECTIONS, pool_size))
             .connection_timeout(Duration::from_secs(10)) // Extend the timeout
             .build(manager)
             .expect("Failed to create connection pool");
@@ -527,6 +527,10 @@ impl TupConnectionPool {
 
     pub fn get(&self) -> Result<TupConnection, r2d2::Error> {
         Ok(TupConnection::new(self.pool.get()?))
+    }
+
+    pub fn max_size(&self) -> u32 {
+        self.pool.max_size()
     }
 }
 pub struct TupConnectionRef<'a>(&'a Connection);
@@ -609,8 +613,8 @@ impl DerefMut for TupConnection {
         &mut self.0
     }
 }
-pub fn start_connection(database_url: &str) -> DbResult<TupConnectionPool> {
-    let pool = TupConnectionPool::new(database_url);
+pub fn start_connection(database_url: &str, max_pool_size: u32) -> DbResult<TupConnectionPool> {
+    let pool = TupConnectionPool::new(database_url, max_pool_size);
     let conn = pool.get().map_err(|e| {
         AnyError::from(format!(
             "Failed to obtain connection for {database_url}: {e}"
