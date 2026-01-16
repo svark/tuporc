@@ -103,9 +103,7 @@ impl PathDiscovery for ConnWrapper<'_, '_> {
         cb: impl FnMut(MatchingPath) -> Result<(), Error> + Send + Sync,
         sel: SelOptions,
     ) -> Result<usize, Error> {
-        let sz = DbPathSearcher::fetch_glob_globs_cb(&self.conn, path_buffers, glob_path, cb, sel)
-            .map_err(|e| Error::new_callback_error(e.to_string()))?;
-        Ok(sz)
+        DbPathSearcher::get_glob_matches(self.conn, path_buffers, glob_path, cb, sel)
     }
 }
 
@@ -528,7 +526,7 @@ fn receive_resolved_statements(
                 "While processing statements for tupfile {}",
                 tup_desc
             ))
-            .inspect_err(|e| log::error!("error found resolving stmts\n {e}"))?;
+            .inspect_err(|e| log::error!("error found resolving stmts in {tup_desc} -- {e}"))?;
         pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
         let _cancelled = check_cancel()?;
         if poisoned.load(Ordering::SeqCst) {
@@ -644,13 +642,27 @@ impl DbPathSearcher {
         log::warn!("no rows found for any glob pattern: {:?}", glob_paths);
         Err(AnyError::query_returned_no_rows())
     }
-}
-impl Drop for DbPathSearcher {
-    fn drop(&mut self) {
-        debug!("dropping DbPathSearcher");
-        if let Ok(conn) = self.conn.get() {
-            let _ = conn.deref().drop_tupfile_entries_table();
+
+    fn get_glob_matches(
+        tup_connection_ref: &TupConnectionRef,
+        path_buffers: &impl PathBuffers,
+        glob_path: &[GlobPath],
+        cb: impl FnMut(MatchingPath) -> Result<(), Error> + Send + Sync,
+        sel: SelOptions,
+    ) -> Result<usize, Error> {
+        if glob_path.is_empty() {
+            return Ok(0);
         }
+        let first_glob = &glob_path[0];
+        let match_count =
+            Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_path, cb, sel)
+                .map_err(|e| match e {
+                    _ if e.is_query_returned_no_rows() => {
+                        Error::NoGlobMatches(first_glob.get_glob_desc().get_path_ref().to_string())
+                    }
+                    _ => Error::new_callback_error(e.to_string()),
+                })?;
+        Ok(match_count)
     }
 }
 impl PathDiscovery for DbPathSearcher {
@@ -666,10 +678,7 @@ impl PathDiscovery for DbPathSearcher {
             .get()
             .map_err(|e| Error::new_callback_error(e.to_string()))?;
         let tup_connection_ref = conn.as_ref();
-        let match_count =
-            Self::fetch_glob_globs_cb(&tup_connection_ref, path_buffers, glob_path, cb, sel)
-                .map_err(|e| Error::new_callback_error(e.to_string()))?;
-        Ok(match_count)
+        Self::get_glob_matches(&tup_connection_ref, path_buffers, &glob_path, cb, sel)
     }
 
     fn discover_paths(
@@ -689,7 +698,13 @@ impl PathDiscovery for DbPathSearcher {
                 Ok(())
             },
             sel.clone(),
-        )?;
+        ).or_else(|e| {
+            if e.is_no_glob_matches() {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        })?;
         let c = |x: &MatchingPath, y: &MatchingPath| {
             let x = x.path_descriptor();
             let y = y.path_descriptor();
@@ -838,7 +853,6 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     {
         let dbref = parser.get_searcher();
         let conn = dbref.conn.get()?;
-        let tupfile_ids = tupfiles.iter().map(|t| t.get_id()).collect::<Vec<_>>();
         //conn.enrich_modify_list()?;
         {
             let pb_enrich = term_progress.make_child_len_progress_bar("Enriching modify list", 3);
@@ -852,7 +866,8 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             pb_enrich.inc(1);
             pb_enrich.finish_with_message("Done enriching modify list");
         }
-        conn.mark_tupfile_outputs(&tupfile_ids)
+        let tupfile_ids = tupfiles.iter().map(|t| t.get_id());
+        conn.mark_tupfile_outputs(tupfile_ids)
             .context("Mark tupfile outputs")?;
     }
     let _ = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), &term_progress, keep_going)?;
@@ -1264,6 +1279,13 @@ where
 {
     let poisoned = Arc::new(AtomicBool::new(false));
     let first_err = Arc::new(Mutex::new(None));
+    let total_tupfiles = tupfiles
+        .iter()
+        .filter(|x| !x.get_name().ends_with(".lua"))
+        .count();
+    let parse_pb =
+        term_progress.make_child_len_progress_bar("Parsing tupfiles", total_tupfiles as u64);
+
     tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
@@ -1271,7 +1293,7 @@ where
         .for_each(|tupfile| {
             let parser_clone = parser.clone();
             let sender = sender.clone();
-            let pb = term_progress.make_progress_bar("_");
+            let pb = parse_pb.clone();
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             s.spawn(move |_| {
@@ -1299,11 +1321,15 @@ where
             .iter()
             .filter(|x| !x.get_name().ends_with(".lua"))
             .count();
-        let num_receivers =
-            std::cmp::min(rayon::current_num_threads(), std::cmp::max(1, non_lua_count));
+        let num_receivers = std::cmp::min(
+            rayon::current_num_threads(),
+            std::cmp::max(1, non_lua_count),
+        );
+        let resolve_pb =
+            term_progress.make_child_len_progress_bar("Resolving statements", num_receivers as u64);
         for worker_idx in 0..num_receivers {
             let parser_c = parser.clone();
-            let pb_ref = term_progress.make_progress_bar("Resolving statements");
+            let pb_ref = resolve_pb.clone();
             pb_ref.set_message(format!("Resolving statements worker {}", worker_idx + 1));
             let mut nodes_to_insert = Vec::with_capacity(BUFFER_SIZE);
             let insert_sender = insert_sender.clone();
@@ -1333,6 +1359,7 @@ where
                 if let Err(e) = result {
                     record_error(&first_err, e);
                 }
+                pb_ref.inc(1);
             });
         }
         let num_lua = tupfiles
@@ -1344,7 +1371,8 @@ where
             let mut parser_c = parser.clone();
             let insert_sender = insert_sender.clone();
             let rwbufs = parser_c.read_write_buffers().clone();
-            let pb = term_progress.make_progress_bar("Processing lua build files");
+            let pb = term_progress
+                .make_child_len_progress_bar("Parsing lua build files", num_lua as u64);
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             s.spawn(move |_| {
@@ -1357,6 +1385,10 @@ where
                         .cloned()
                     {
                         check_cancel()?;
+                        if poisoned.load(Ordering::SeqCst) {
+                            log::debug!("parsing lua build files cancelled");
+                            break;
+                        }
                         let path = tupfile_lua.get_name();
                         pb_ref.set_message(format!("Parsing :{}", path));
                         let (resolved_rules, _) = parser_c.parse(path).map_err(|e| {
@@ -1370,7 +1402,7 @@ where
                             &mut nodes_to_insert,
                             &insert_sender,
                         )?;
-                        term_progress.progress(&pb_ref);
+                        pb_ref.inc(1);
                         pb_ref.set_message(format!("Done parsing {}", path));
                     }
                     drop(insert_sender);
@@ -1446,7 +1478,10 @@ where
         if loop_aborted {
             let _ = tx.rollback();
             term_progress.abandon(&pb_insert, "Insertion aborted");
-            return Err(eyre!("Insertion aborted"));
+            if let Some(err) = first_err.lock().expect("poisoned error store").take() {
+                return Err(err);
+            }
+            return Ok(());
         }
         tx.mark_absent_tupfile_entries_to_delete()?;
         tx.mark_orphans_to_delete()?; // cascade deletion of orphaned nodes
@@ -1463,11 +1498,7 @@ where
     term_progress.clear();
     log::info!("Finished parse phase");
     log::info!("Finished resolving statements from parsed tupfiles");
-    if let Some(err) = first_err
-        .lock()
-        .expect("poisoned error store")
-        .take()
-    {
+    if let Some(err) = first_err.lock().expect("poisoned error store").take() {
         return Err(err);
     }
     Ok(())
@@ -1482,7 +1513,7 @@ fn handle_result(
     match status {
         Err(e) => {
             log::error!("Error: {}", e);
-            term_progress.abandon(&pb_ref, "Aborted processing parsed tupfiles");
+            term_progress.abandon(&pb_ref, format!("Aborted processing parsed tupfiles : {e}"));
             poisoned.store(true, Ordering::SeqCst);
             Err(e)
         }
