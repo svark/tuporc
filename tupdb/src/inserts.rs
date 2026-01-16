@@ -77,7 +77,7 @@ pub trait LibSqlInserts {
         producer_type: RowType,
     ) -> DbResult<()>;
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
-    fn mark_tupfile_outputs(&self, tupfile_ids: &Vec<i64>) -> DbResult<()>;
+    fn mark_tupfile_outputs(&self, tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()>;
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
     fn mark_rules_with_changed_io(&self) -> DbResult<()>;
     fn mark_group_deps(&self) -> DbResult<()>;
@@ -419,10 +419,11 @@ impl LibSqlInserts for Connection {
         self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
         Ok(())
     }
-    fn mark_tupfile_outputs(&self, tupfile_ids: &Vec<i64>) -> DbResult<()> {
-        for tupfile_id in tupfile_ids {
-            self.add_rules_and_outputs_of_tupfile_entities(*tupfile_id)?;
-        }
+    fn mark_tupfile_outputs(&self, mut tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()> {
+        tupfile_ids.try_for_each(|tupfile_id| -> DbResult<()> {
+            self.add_rules_and_outputs_of_tupfile_entities(tupfile_id)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
