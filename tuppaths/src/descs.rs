@@ -242,10 +242,42 @@ impl PathDescriptor {
             }
         })
     }
-    /// build a new path descriptor by adding single path component to the current path
+    /// Total ordering helper: shallower paths first; tie-break by osstr values up the parent chain.
+    pub fn dict_less(&self, other: &Self) -> std::cmp::Ordering {
+        // Consistent ordering without allocating component vectors:
+        // 1) shallower paths come first, 2) tie-break by walking parents comparing intern ids.
+        let depth_self = self.depth();
+        let depth_other = other.depth();
+        if depth_self != depth_other {
+            return depth_self.cmp(&depth_other);
+        }
+        let mut a = self.clone();
+        let mut b = other.clone();
+        while !a.is_root() && !b.is_root() {
+            let aid = a.get_file_name_os_str();
+            let bid = b.get_file_name_os_str();
+            if !aid.eq(bid) {
+                return aid.cmp(bid);
+            }
+            a = a.get_parent_descriptor();
+            b = b.get_parent_descriptor();
+        }
+        std::cmp::Ordering::Equal
+    }
+        /// build a new path descriptor by adding single path component to the current path
     pub fn join_leaf(&self, name: &str) -> PathDescriptor {
         let dir_entry = DirEntry::new(self.to_u64(), OsStr::new(name));
         Self::from_interned(Intern::from(dir_entry))
+    }
+    /// depth of this path from root
+    pub fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut cur = self.clone();
+        while !cur.is_root() {
+            depth = depth + 1;
+            cur = cur.get_parent_descriptor();
+        }
+        depth
     }
 
     /// get name of the file or folder
