@@ -1,6 +1,6 @@
 use crate::db::RowType::{DirGen, GenF};
 use crate::deletes::LibSqlDeletes;
-use crate::error::{AnyError, DbResult};
+use crate::error::{AnyError, DbResult, WrapError};
 use crate::inserts::LibSqlInserts;
 use crate::queries::LibSqlQueries;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -358,6 +358,9 @@ impl Node {
     pub fn is_generated(&self) -> bool {
         self.rtype == GenF || self.rtype == DirGen
     }
+    pub fn is_file(&self) -> bool {
+        self.rtype == RowType::File || self.rtype == GenF || self.rtype == RowType::TupF
+    }
 }
 
 pub trait MiscStatements {
@@ -369,8 +372,9 @@ pub trait MiscStatements {
     fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()>;
     /// Fetch current run status
     fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>>;
-    /// Mark missing FILE_SYS nodes that are not yet in delete list as deletes.
-    fn mark_missing_not_deleted(&self) -> DbResult<()>;
+
+    // mark missing not deleted FILE_SYS with checks
+    fn mark_missing_not_deleted_checked(&self) -> DbResult<()>;
 }
 
 // Check if the node table exists in .tup/db
@@ -397,25 +401,25 @@ impl<'a> MiscStatements for TupTransaction<'a> {
         self.connection().get_run_status()
     }
 
-    fn mark_missing_not_deleted(&self) -> DbResult<()> {
-        self.connection().mark_missing_not_deleted()
+    fn mark_missing_not_deleted_checked(&self) -> DbResult<()> {
+       self.connection().mark_missing_not_deleted_checked()
     }
 }
 
 impl<'a> MiscStatements for TupConnectionRef<'a> {
     fn enrich_modify_list(&self) -> DbResult<()> {
-        self.mark_orphans_to_delete()?;
-        self.mark_rules_with_changed_io()?;
+        self.mark_orphans_to_delete().map_err(AnyError::from).wrap_error("Mark orphans as deleted")?;
+        self.mark_rules_with_changed_io().wrap_error("Mark rules with changed io")?;
 
-        self.mark_tupfile_deps()?;
+        self.mark_tupfile_deps().wrap_error("Mark tupfile dependencies (included tupfiles->tupfiles)")?;
         for (i, sha) in self.fetch_modified_globs()?.into_iter() {
             self.update_node_sha(i, sha.as_str())?;
             self.mark_glob_deps(i)?;
         }
 
-        self.mark_group_deps()?;
-        self.prune_modify_list()?;
-        self.delete_nodes()?;
+        self.mark_group_deps().wrap_error("Mark group dependencies")?;
+        self.prune_modify_list().map_err(AnyError::from).wrap_error("Keep only rules as modified")?;
+        self.delete_nodes().map_err(AnyError::from).wrap_error("Delete nodes")?;
 
         Ok(())
     }
@@ -442,19 +446,8 @@ impl<'a> MiscStatements for TupConnectionRef<'a> {
         }
     }
 
-    fn mark_missing_not_deleted(&self) -> DbResult<()> {
-        self.execute(
-            "INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
-             SELECT n.id, n.type, 1
-             FROM Node n
-             JOIN NodeType nt ON nt.type_index = n.type
-             LEFT JOIN PresentList p ON p.id = n.id
-             LEFT JOIN ChangeList d ON d.id = n.id AND d.is_delete = 1
-             WHERE nt.class = 'FILE_SYS'
-               AND p.id IS NULL
-               AND d.id IS NULL",
-            [],
-        )?;
+    fn mark_missing_not_deleted_checked(&self) -> DbResult<()> {
+        self.mark_missing_not_deleted()?;
         Ok(())
     }
 }
@@ -752,71 +745,23 @@ pub fn db_path_str<P: AsRef<Path>>(p: P) -> String {
 
 impl MiscStatements for TupConnection {
     fn enrich_modify_list(&self) -> DbResult<()> {
-        self.mark_orphans_to_delete()?;
-        self.mark_rules_with_changed_io()?;
-
-        // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
-        self.mark_tupfile_deps()?; //-- included tup files -> Tupfile
-        for (i, sha) in self.fetch_modified_globs()?.into_iter() {
-            self.update_node_sha(i, sha.as_str())?;
-            self.mark_glob_deps(i)?; // modified glob -> Tupfile
-        }
-
-        self.mark_group_deps()?;
-        self.prune_modify_list()?;
-        self.delete_nodes()?;
-
+        TupConnectionRef(self.deref()).enrich_modify_list()?;
         Ok(())
     }
 
     fn set_run_status(&self, phase: &str, status: &str, ts: i64) -> DbResult<()> {
-        self.execute(
-            "INSERT OR REPLACE INTO RunStatus (id, phase, status, ts) VALUES (1, ?1, ?2, ?3)",
-            rusqlite::params![phase, status, ts],
-        )?;
+        TupConnectionRef(self.deref()).set_run_status(phase, status, ts)?;
         Ok(())
     }
 
     fn get_run_status(&self) -> DbResult<Option<(String, String, i64)>> {
-        let mut stmt =
-            self.prepare("SELECT phase, status, ts FROM RunStatus WHERE id = 1 LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            let phase: String = row.get(0)?;
-            let status: String = row.get(1)?;
-            let ts: i64 = row.get(2)?;
-            Ok(Some((phase, status, ts)))
-        } else {
-            Ok(None)
-        }
+        TupConnectionRef(self.deref()).get_run_status()
     }
 
-    fn mark_missing_not_deleted(&self) -> DbResult<()> {
+    fn mark_missing_not_deleted_checked(&self) -> DbResult<()> {
         // If PresentList is empty, treating everything as missing would mark the whole tree
         // for deletion. Skip in that case and let the next scan rebuild.
-        let present_count: i64 = self
-            .query_row("SELECT COUNT(1) FROM PresentList", [], |row| row.get(0))
-            .unwrap_or(0);
-        if present_count == 0 {
-            log::warn!(
-                "PresentList is empty; skipping mark_missing_not_deleted to avoid mass deletes"
-            );
-            return Ok(());
-        }
-        // Mark FILE_SYS nodes that are absent from PresentList and not already marked delete.
-        self.execute(
-            "INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
-             SELECT n.id, n.type, 1
-             FROM Node n
-             JOIN NodeType nt ON nt.type_index = n.type
-             LEFT JOIN PresentList p ON p.id = n.id
-             LEFT JOIN ChangeList d ON d.id = n.id AND d.is_delete = 1
-             WHERE nt.class = 'FILE_SYS'
-               AND p.id IS NULL
-               AND d.id IS NULL",
-            [],
-        )?;
-        Ok(())
+       TupConnectionRef(self.deref()).mark_missing_not_deleted_checked()
     }
 }
 

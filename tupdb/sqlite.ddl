@@ -43,10 +43,10 @@ CREATE TABLE ChangeList
 (
     id        integer PRIMARY KEY not null,
     type      integer             not null,
-    is_delete integer             not null,
+    change integer             not null,
     UNIQUE (id),
     FOREIGN KEY (id) references Node (id) on DELETE CASCADE,
-    CHECK (is_delete in (0, 1) )
+    CHECK (change in (0, 1) )
 );
 CREATE UNIQUE INDEX idx_ChangeList_id ON ChangeList (id);
 CREATE TABLE NODESHA

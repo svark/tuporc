@@ -21,6 +21,8 @@ pub enum AnyError {
     Db(Arc<rusqlite::Error>),
     CbErr(CallBackError),
     ConflictingParents(i64, String),
+    ShaError(String),
+    WithContext(String, Box<AnyError>),
 }
 
 impl AnyError {
@@ -38,6 +40,9 @@ impl AnyError {
             _ => false,
         }
     }
+    pub fn with_context(ctx: String, err: AnyError) -> Self {
+        AnyError::WithContext(ctx, Box::new(err))
+    }
 }
 
 impl Display for AnyError {
@@ -47,6 +52,12 @@ impl Display for AnyError {
             AnyError::CbErr(e) => e.inner.fmt(f),
             AnyError::ConflictingParents(i1, s) => {
                 write!(f, "Conflicting parents for {} {}", i1, s)
+            }
+            AnyError::ShaError(e) => {
+                write!(f, "SHA error: {}", e)
+            }
+            AnyError::WithContext(ctx, err) => {
+                write!(f, "{}:\n {}", ctx, err)
             }
         }
     }
@@ -60,6 +71,17 @@ impl AnyError {
         match self {
             AnyError::Db(e) => e.deref().eq(&rusqlite::Error::QueryReturnedNoRows),
             _ => false,
+        }
+    }
+}
+pub trait WrapError {
+    fn wrap_error(self, ctx: &str) -> Self;
+}
+impl <T> WrapError for DbResult<T> {
+    fn wrap_error(self, ctx: &str) -> Self {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(AnyError::with_context(ctx.to_string(), e)),
         }
     }
 }

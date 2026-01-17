@@ -117,4 +117,5 @@ impl LibSqlDeletes for Connection {
         log::debug!("Dropped tupfile_entries table");
         Ok(())
     }
+
 }

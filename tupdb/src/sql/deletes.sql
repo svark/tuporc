@@ -52,18 +52,18 @@ where id = :dir_id;
 DELETE
 from ChangeList
 where id = :id
-  and is_delete = 0;
+  and change = 0;
 -- <eos>
 
 -- name: delete_from_normal_link!
--- Delete a link from the database if the from_id or the to_id is in ChangeList (is_delete=1)
+-- Delete a link from the database if the from_id or the to_id is in ChangeList (change=1)
 -- # Parameters
 DELETE
 FROM NormalLink
 WHERE EXISTS (
     SELECT 1
     FROM ChangeList CL
-    WHERE CL.is_delete = 1
+    WHERE CL.change = 1
       AND (CL.id = NormalLink.from_id OR CL.id = NormalLink.to_id)
 );
 -- <eos>
@@ -75,7 +75,7 @@ WHERE EXISTS (
 DELETE
 from ChangeList
 where id = :id
-  and is_delete = 1;
+  and change = 1;
 -- <eos>
 
 
@@ -85,20 +85,20 @@ where id = :id
 DELETE
 from ChangeList
 where EXISTS (SELECT 1 from PresentList as P where P.id = ChangeList.id)
-  and is_delete = 1;
+  and change = 1;
 -- <eos>
 
 -- name: prune_delete_list_inner!
 -- Prune the delete list
 -- # Parameters
 DELETE
-from ChangeList where is_delete = 1;
+from ChangeList where change = 1;
 -- <eos>
 
 -- name: delete_tupfile_entries_not_in_present_list_inner!
 -- Delete all tupfile entries that are not in the present list
 -- # Parameters
-INSERT INTO ChangeList (id, type, is_delete)
+INSERT OR REPLACE INTO ChangeList (id, type, change)
 SELECT t.id, t.type, 1
 FROM TupfileEntities t
          LEFT JOIN PresentList p ON t.id = p.id
@@ -106,9 +106,9 @@ WHERE p.id IS NULL;
 -- <eos>
 
 -- name: enrich_delete_list_for_missing_dirs_inner!
--- Add all FILE_SYS nodes whose parent directory id does not exist to ChangeList (is_delete=1)
+-- Add all FILE_SYS nodes whose parent directory id does not exist to ChangeList (change=1)
 -- This captures orphans created when a directory row was deleted without cascading to children.
-INSERT OR REPLACE INTO ChangeList (id, type, is_delete)
+INSERT OR REPLACE INTO ChangeList (id, type, change)
 SELECT n.id, n.type, 1
 FROM Node n
          LEFT JOIN Node d ON d.id = n.dir
@@ -120,13 +120,13 @@ WHERE d.id IS NULL
 -- <eos>
 
 -- name: enrich_delete_list_with_dir_dependents_inner!
--- Add nodes whose parent directory is marked for deletion into ChangeList (is_delete=1)
-INSERT OR REPLACE INTO ChangeList(id, type, is_delete)
+-- Add nodes whose parent directory is marked for deletion into ChangeList (change=1)
+INSERT OR REPLACE INTO ChangeList(id, type, change)
 SELECT n.id,
        n.type,
        1
 FROM Node n
-         JOIN ChangeList d ON d.is_delete = 1 AND n.dir = d.id;
+         JOIN ChangeList d ON d.change = 1 AND n.dir = d.id;
 -- <eos>
     
 -- name: delete_orphaned_tupentries_inner!
@@ -134,20 +134,20 @@ FROM Node n
 -- # Parameters
 insert or
 REPLACE
-into ChangeList(id, type, is_delete)
+into ChangeList(id, type, change)
 SELECT n.id, n.type, 1
 from Node n
-         JOIN ChangeList dl on dl.is_delete = 1 AND n.srcid = dl.id
+         JOIN ChangeList dl on dl.change = 1 AND n.srcid = dl.id
 where n.type = (SELECT type_index from NodeType where type = 'Rule')
   and dl.type = (SELECT type_index from NodeType where type = 'TupF');
 
 -- <eos>
 INSERT or
 REPLACE
-into ChangeList(id, type, is_delete)
+into ChangeList(id, type, change)
 SELECT n.id, n.type, 1
 from Node n
-         JOIN ChangeList dl on dl.is_delete = 1 AND dl.id = n.srcid
+         JOIN ChangeList dl on dl.change = 1 AND dl.id = n.srcid
 where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
   and dl.type = (SELECT type_index from NodeType where type = 'Rule');
 
@@ -157,7 +157,7 @@ where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
 -- Delete all nodes from the delete list
 DELETE
 from Node
-where id in (SELECT id from ChangeList where is_delete = 1);
+where id in (SELECT id from ChangeList where change = 1);
 
 -- <eos>
 -- name: unmark_modified_inner!
@@ -166,7 +166,7 @@ where id in (SELECT id from ChangeList where is_delete = 1);
 -- param: id : i64 - id of the node to delete
 DELETE
 from ChangeList
-where is_delete = 0
+where change = 0
   and id = :id;
 
 -- <eos>
@@ -225,7 +225,7 @@ WITH RECURSIVE
             )
     )
 Insert or REPLACE
-into ChangeList(id, type, is_delete)
+into ChangeList(id, type, change)
 SELECT id, type, 1 from orphan_dirgens;
 -- <eos>
 

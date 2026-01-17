@@ -63,10 +63,10 @@ Create Table IF NOT EXISTS ChangeList
 (
     id        integer PRIMARY KEY not null,
     type      integer             not null,
-    is_delete integer             not null,
+    change integer             not null,
     UNIQUE (id),
     FOREIGN KEY (id) references Node (id) on DELETE CASCADE,
-    CHECK (is_delete in (0, 1) )
+    CHECK (change in (0, 1, 2) )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ChangeList_id ON ChangeList (id);
@@ -109,12 +109,17 @@ CREATE TABLE IF NOT EXISTS RunStatus
 CREATE VIEW ModifyList AS
 SELECT id, type
 from ChangeList
-where is_delete = 0;
+where change = 0;
 --- Setup deletelist view
 CREATE VIEW DeleteList AS
 SELECT id, type
 from ChangeList
-where is_delete = 1;
+where change = 1;
+--- Setup unborn list view
+CREATE VIEW UnbornList AS
+SELECT id
+from ChangeList
+where change = 2; -- ouputs that are expected but not yet created
 
 -- Persisted list of currently present filesystem nodes (rebuilt each scan/parse).
 CREATE TABLE IF NOT EXISTS PresentList
@@ -137,13 +142,13 @@ FROM NormalLink;
 CREATE VIEW LiveNode AS
 SELECT *
 FROM Node n
-WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.is_delete = 1);
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.change = 1);
 
 CREATE VIEW LiveNormalLink AS
 SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type
 FROM NormalLink nl
-WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.is_delete = 1)
-  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.is_delete = 1);
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.change = 1)
+  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.change = 1);
 --- Pragma settings for the database
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;

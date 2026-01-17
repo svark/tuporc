@@ -28,7 +28,7 @@ pub trait LibSqlInserts {
         node: &Node,
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
-    ) -> Result<bool, AnyError>;
+    ) -> Result<u8, AnyError>;
     /// `upsert_node` is akin to the sqlite upsert operation
     /// for existing nodes it updates the node's columns, marking the node to the modify list/present list in this process.
     /// for new nodes it adds the node to Node table and marks the node in modify list/present list tables
@@ -57,6 +57,7 @@ pub trait LibSqlInserts {
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError>;
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()>;
+    fn mark_unborn(&self, id: i64) -> Result<()>;
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_deleted(&self, id: i64, rtype: &RowType) -> Result<()>;
@@ -88,6 +89,7 @@ pub trait LibSqlInserts {
     fn upsert_node_sha(&self, node_id: i64, sha: &str) -> DbResult<UpsertStatus>;
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
+    fn mark_missing_not_deleted(&self) -> DbResult<()>;
 }
 
 pub enum UpsertStatus {
@@ -150,8 +152,8 @@ impl LibSqlInserts for Connection {
         node: &Node,
         existing_node: &Node,
         compute_sha256: impl FnMut() -> String,
-    ) -> Result<bool, AnyError> {
-        let mut modify = false;
+    ) -> Result<u8, AnyError> {
+        let mut modify = 0u8;
         // verify that columns of this row are the same as `node`'s, if not update them
         if existing_node.get_type().ne(&node.get_type()) {
             if existing_node.is_generated() {
@@ -166,6 +168,12 @@ impl LibSqlInserts for Connection {
                     existing_node.get_type(),
                     node.get_type()
                 );
+                if node.is_generated() && node.is_file() {
+                    // a file is now recognized as generated for the first time
+                    // update to unborn, a rule is expected to generate it
+                    //self.mark_unborn(existing_node.get_id())?;
+                    modify = 2;
+                }
                 //node_statements.update_node_type(existing_node.get_id(), *node.get_type())?;
                 self.update_node_type(existing_node.get_id(), *node.get_type())?;
                 // modify = true;
@@ -179,15 +187,19 @@ impl LibSqlInserts for Connection {
                 node.get_mtime()
             );
             self.update_mtime_ns(node.get_mtime(), existing_node.get_id())?;
-            modify = true;
+            if  modify == 0
+            {
+                modify = 1;
+            }
             if self
                 .replace_node_sha(existing_node.get_id(), compute_sha256)
                 .as_ref()
                 .is_ok_and(UpsertStatus::is_unchanged)
             {
-                modify = false;
+                if  modify == 1  {
+                    modify = 0u8;
+                }
             }
-            //if compute_sha256
         }
         if existing_node.get_display_str() != node.get_display_str() {
             log::debug!(
@@ -197,7 +209,9 @@ impl LibSqlInserts for Connection {
                 node.get_display_str()
             );
             self.update_node_display_str(node.get_display_str(), existing_node.get_id())?;
-            modify = true;
+            if  modify == 0  {
+                modify = 1u8;
+            }
         }
         if existing_node.get_flags() != node.get_flags() {
             log::debug!(
@@ -207,7 +221,9 @@ impl LibSqlInserts for Connection {
                 node.get_flags()
             );
             self.update_node_flags(node.get_flags(), existing_node.get_id())?;
-            modify = true;
+            if  modify == 0  {
+                modify = 1u8;
+            }
         }
         if existing_node.get_srcid() != node.get_srcid() {
             log::debug!(
@@ -217,7 +233,9 @@ impl LibSqlInserts for Connection {
                 node.get_srcid()
             );
             self.update_node_srcid(node.get_srcid(), existing_node.get_id())?;
-            modify = true;
+            if  modify == 0  {
+                modify = 1u8;
+            }
         }
 
         self.mark_present(existing_node.get_id(), existing_node.get_type())?;
@@ -235,8 +253,11 @@ impl LibSqlInserts for Connection {
         let allow_modify = !is_fresh_db || node.get_type().eq(&TupF);
         if existing_node.is_valid() {
             let modify = self.update_columns(node, &existing_node, compute_sha)?;
-            if modify && allow_modify {
+            if modify == 1 && allow_modify {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
+            }
+            else if modify == 2 && allow_modify {
+                self.mark_unborn(existing_node.get_id())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
@@ -260,13 +281,21 @@ impl LibSqlInserts for Connection {
     ) -> Result<Node, AnyError> {
         if existing_node.is_valid() {
             let modify = self.update_columns(node, &existing_node, compute_sha)?;
-            if modify {
+            if modify == 1 {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
+            }
+            else if modify == 2 {
+                self.mark_unborn(existing_node.get_id())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
             let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
-            self.mark_modified(node.get_id(), node.get_type())?;
+            if node.get_type() == &RowType::GenF {
+                self.mark_unborn(node.get_id())?;
+            }
+            else {
+                self.mark_modified(node.get_id(), node.get_type())?;
+            }
             self.mark_present(node.get_id(), node.get_type())?;
             // node sha is not computed unless needed for a rule
             Ok::<Node, AnyError>(node)
@@ -315,6 +344,10 @@ impl LibSqlInserts for Connection {
     }
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()> {
         self.add_to_modify_list(id, *rtype as u8)?;
+        Ok(())
+    }
+    fn mark_unborn(&self, id: i64) -> Result<()> {
+        self.add_to_unborn_list(id)?;
         Ok(())
     }
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()> {
@@ -421,9 +454,11 @@ impl LibSqlInserts for Connection {
     }
     fn mark_tupfile_outputs(&self, mut tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()> {
         tupfile_ids.try_for_each(|tupfile_id| -> DbResult<()> {
-            self.add_rules_and_outputs_of_tupfile_entities(tupfile_id)?;
+            self.add_rules_to_tupfile_entities(tupfile_id)?;
             Ok(())
         })?;
+
+        self.add_outputs_to_tupfile_entities_inner()?;
         Ok(())
     }
 
@@ -463,10 +498,13 @@ impl LibSqlInserts for Connection {
         node_id: i64,
         mut sha: impl FnMut() -> String,
     ) -> DbResult<UpsertStatus> {
-        let s = self.fetch_saved_nodesha256(node_id)?;
-        let oldsha = sha();
-        if oldsha.ne(&s) {
-            self.update_node_sha(node_id, oldsha.as_str())?;
+        let oldsha = self.fetch_saved_nodesha256(node_id)?;
+        let newsha = sha();
+        if newsha.is_empty() {
+            return Err(AnyError::ShaError(format!("Empty sha for {}", node_id)));
+        }
+        if newsha.ne(&oldsha) {
+            self.update_node_sha(node_id, newsha.as_str())?;
             Ok(UpsertStatus::Updated(node_id))
         } else {
             Ok(UpsertStatus::Unchanged(node_id))
@@ -508,5 +546,9 @@ impl LibSqlInserts for Connection {
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()> {
         let _ = self.insert_into_dirpathbuf_inner(id, dir, name)?;
         Ok(())
+    }
+     fn mark_missing_not_deleted(&self) -> DbResult<()> {
+        self.mark_missing_not_deleted_inner()?;
+         Ok(())
     }
 }

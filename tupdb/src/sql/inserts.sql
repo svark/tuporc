@@ -4,9 +4,19 @@
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype : u8 - type of the node to add
-INSERT or IGNORE into ChangeList(id, type, is_delete)
+INSERT or IGNORE into ChangeList(id, type, change)
 Values (:id, :rtype, 0);
 -- <eos>
+
+-- name: add_to_unborn_list!
+-- Add a node to the unborn list
+-- # Parameters
+-- param: id : i64 - id of the node to add
+INSERT or REPLACE into ChangeList(id, type, change)
+Values (:id, 4, 2)
+;
+-- <eos>
+
 -- name: add_rules_with_changed_io_to_modify_list_inner!
 -- Add all rules with modified (outside of build system) outputs to the modify list
 -- BEGIN TRANSACTION;
@@ -24,16 +34,16 @@ REPLACE
 into ChangeList
 SELECT nl.to_id,
        nl.to_type,
-       1 -- sticky links trigger a delete on target rule if input to rule is in delete set
+       1 -- 1 indicates delete, sticky links trigger a delete on target rule if input to rule is in delete set
 from NormalLink nl
-         JOIN ChangeList dl on dl.id = nl.from_id AND dl.is_delete = 1
+         JOIN DeleteList dl on dl.id = nl.from_id
 WHERE nl.to_type = (SELECT type_index from NodeType where type = 'Rule') -- rule
   and nl.is_sticky = 1;
 
 INSERT or ignore into ChangeList
 SELECT nl.to_id, nl.to_type, 0 -- ModifyList non-sticky links trigger only a modify on target rule
 from NormalLink nl
-         JOIN ChangeList cl on cl.id = nl.from_id
+         JOIN ModifyList cl on cl.id = nl.from_id
 WHERE nl.to_type = 1 -- rule type
   and nl.is_sticky = 0;
 -- COMMIT ;
@@ -181,12 +191,15 @@ where id = :id;
 -- Insert a rule into the success list
 -- # Parameters
 -- param: rule_id : i64 - id of the rule to insert
-INSERT or IGNORE into SuccessList (id)
-SELECT :rule_id
-UNION ALL
-SELECT from_id
-from NormalLink
-where to_id = :rule_id;
+DELETE from ChangeList
+where id = :rule_id
+  and change = 0;
+
+INSERT or REPLACE into ChangeList (id, type, change)
+SELECT id, type, 0
+from Node n JOIN NormalLink nl on nl.to_id = n.id
+WHERE nl.from_id = :rule_id
+  AND n.type = (SELECT type_index from NodeType where type = 'GenF');
 
 -- <eos>
 -- name: insert_glob_watch_dir!
@@ -205,17 +218,17 @@ VALUES (:dir_id, :glob_id, 0, 9);
 -- param: rtype: u8 - type of the node to add
 INSERT or
 REPLACE
-into ChangeList(id, type, is_delete)
+into ChangeList(id, type, change)
 Values (:id, :rtype, 1)
-ON CONFLICT DO UPDATE SET is_delete = 1
-where ChangeList.is_delete = 0;
+ON CONFLICT DO UPDATE SET change = 1
+where ChangeList.change = 0;
 -- <eos>
 
 -- name: add_not_present_to_delete_list_inner!
 -- Add all deleted files and folders and env vars to the delete list
 INSERT OR
 REPLACE
-INTO ChangeList (id, type, is_delete)
+INTO ChangeList (id, type, change)
 SELECT Node.id, Node.type, 1
 FROM Node
          LEFT JOIN PresentList ON Node.id = PresentList.id
@@ -226,7 +239,7 @@ WHERE PresentList.id IS NULL
   AND Node.id IN (SELECT id FROM TupfileEntities);
 -- <eos>
 
--- name: add_rules_and_outputs_of_tupfile_entities!
+-- name: add_rules_to_tupfile_entities!
 -- Add all rules/tasks of parsed tupfiles and their outputs to CurrentTupfiles, Also add outputs of rules/tasks that are already in CurrentTupfiles
 -- # Parameters
 -- param: tupfile_id : i64- id of the tupfiles to add
@@ -235,13 +248,20 @@ SELECT id, type
 FROM Node
 WHERE srcid = :tupfile_id
   AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task' or type='Glob' or type='Excl');
-
-INSERT INTO TupfileEntities (id, type)
-SELECT id, type
-FROM Node
-WHERE srcid IN (SELECT id FROM TupfileEntities);
 -- <eos>
 
+-- name: add_outputs_to_tupfile_entities_inner!
+-- Add all outputs of rules/tasks that are already in CurrentTupfiles
+WITH existing AS (
+    -- snapshot current TupfileEntities to avoid recursive self-reference
+    SELECT id FROM TupfileEntities
+)
+INSERT INTO TupfileEntities (id, type)
+SELECT DISTINCT  id, type
+FROM Node
+WHERE srcid IN existing
+  AND type IN (SELECT type_index FROM NodeType WHERE type IN ('GenF','DirGen'));
+-- <eos>
 
 
 -- name: add_message!
@@ -267,7 +287,7 @@ VALUES (:path, :pid, :gen, :typ, :childcnt);
 
 -- name: mark_dependent_tupfiles_inner!
 -- Enrich the modify list with tupfiles that use modified globs
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR IGNORE INTO ChangeList (id, type, change)
 SELECT nl.to_id, nl.to_type, 0
 from ChangeList cl
          INNER JOIN NormalLink nl on nl.from_id = cl.id
@@ -276,7 +296,7 @@ WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
 -- <eos>
 -- name: mark_dependent_tupfiles_of_tupfiles_inner!
 -- Enrich the modify list with all rules that have modified outputs
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR IGNORE INTO ChangeList (id, type, change)
 SELECT nl.to_id, nl.to_type, 0
 from NormalLink nl
 inner JOIN ChangeList cl on cl.id = nl.from_id
@@ -289,7 +309,7 @@ AND   nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
 -- Enrich the modify list with all rules that have modified outputs
 -- # Parameters
 -- param: glob_id : i64 - id of the glob
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR IGNORE INTO ChangeList (id, type, change)
 SELECT nl.to_id, nl.to_type, 0
 from NormalLink nl
 where nl.from_id = :glob_id
@@ -305,7 +325,7 @@ WHERE type NOT IN
 -- <eos>
 -- name: mark_rules_depending_on_modified_groups_inner!
 -- Enrich the modify list with all rules that depend on modified groups
-INSERT OR IGNORE INTO ChangeList (id, type, is_delete)
+INSERT OR IGNORE INTO ChangeList (id, type, change)
 SELECT nl.to_id, nl.to_type, 0
 from ChangeList cl
          INNER JOIN NormalLink nl on nl.from_id = cl.id
@@ -316,7 +336,7 @@ WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'Group')
 -- name: push_remaining_tupfile_entries_to_deletelist_inner!
 -- Push the remaining tupfile entries to the delete list
 -- # Parameters
-INSERT or IGNORE INTO ChangeList (id, type, is_delete)
+INSERT or IGNORE INTO ChangeList (id, type, change)
 SELECT id, type, 1
 from TupfileEntities;
 -- <eos>
@@ -338,3 +358,15 @@ INSERT INTO DirPathBuf (id, dir, name)  VALUES (:id, :dir, :name);
 -- param: event : i32 - event that triggered the monitoring (added or modified=1, deleted = 0)
 INSERT INTO MONITORED_FILES (name, generation_id, event)
 VALUES (:name, :generation_id, :event);
+-- <eos>
+
+-- name: mark_missing_not_deleted_inner!
+-- Mark files that are missing but not marked as such
+INSERT OR REPLACE INTO ChangeList (id, type, change)
+SELECT n.id, n.type, 1
+FROM Node n
+         JOIN NodeType nt ON nt.type_index = n.type
+         LEFT JOIN PresentList p ON p.id = n.id
+WHERE nt.class = 'FILE_SYS'
+  AND p.id IS NULL
+-- <eos>
