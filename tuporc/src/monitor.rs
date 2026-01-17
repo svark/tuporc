@@ -302,22 +302,23 @@ fn run_monitor(
         while let Ok((path, added)) = path_receiver.try_recv() {
             pending.push((path, added));
         }
-        if !pending.is_empty() {
-            let tx = conn.transaction()?;
-            for (path, added) in pending {
-                if build_in_progess_new_stat {
-                    tx.insert_monitored(
-                        path.as_path().to_string_lossy().as_ref(),
-                        generation_id,
-                        added as _,
-                    )
-                    .expect("failed to add monitored file to db");
-                } else {
-                    update_nodes(&tx, &path, added == 1)?;
-                }
-            }
-            tx.commit()?;
+        if pending.is_empty() {
+            continue;
         }
+        let tx = conn.transaction()?;
+        for (path, added) in pending {
+            if build_in_progess_new_stat {
+                tx.insert_monitored(
+                    path.as_path().to_string_lossy().as_ref(),
+                    generation_id,
+                    added as _,
+                )
+                .expect("failed to add monitored file to db");
+            } else {
+                update_nodes(&tx, &path, added == 1)?;
+            }
+        }
+        tx.commit()?;
     }
     Ok(())
 }

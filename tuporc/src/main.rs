@@ -135,14 +135,14 @@ impl TermProgress {
 
     pub fn progress(&self, pb: &ProgressBar) {
         if let Some(l) = pb.length() {
-            if l < pb.position() {
+            if pb.position() < l {
                 pb.inc(1);
             }
         } else {
             pb.tick();
         }
         if let Some(l) = self.pb_main.length() {
-            if l < self.pb_main.position() {
+            if self.pb_main.position() < l {
                 self.pb_main.inc(1);
             }
         } else {
@@ -154,16 +154,18 @@ impl TermProgress {
         pb.finish_with_message(msg);
     }
 
+    pub fn finish_main(&self, msg: impl Into<Cow<'static, str>>) {
+        self.finish(&self.pb_main, msg);
+    }
+
     pub fn abandon(&self, pb: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
-        if let Some(_) = pb.length() {
-            pb.abandon_with_message(msg);
-        } else {
+        {
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.red} {msg}")
                     .unwrap()
                     // For more spinners check out the cli-spinners project:
                     // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
-                    .tick_strings(&["+", "x", "*"]),
+                    .tick_strings(&["+", "x"]),
             );
             pb.abandon_with_message(msg);
         }
@@ -354,12 +356,8 @@ fn main() -> Result<()> {
                         })?;
 
                 let term_progress =
-                    term_progress.set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
-                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), &term_progress, keep_going).inspect_err(
-                    |e| {
-                        term_progress.abandon_main(format!("Parsing failed with error: {}", e));
-                    },
-                )?
+                    TermProgress::new("Parsing tupfiles");
+                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), term_progress, keep_going)?;
             }
             Action::Upd {
                 mut target,
@@ -449,10 +447,10 @@ fn main() -> Result<()> {
                         connection_pool,
                         tupfiles,
                         root.as_path(),
-                        &term_progress,
+                        term_progress,
                         keep_going,
                     )?;
-                    term_progress.clear();
+                    let term_progress = TermProgress::new("Executing ");
                     let exec_options = execute::ExecOptions {
                         keep_going,
                         verbose: args.verbose,

@@ -26,7 +26,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use indicatif::ProgressBar;
 use parking_lot::Mutex;
 use tupdb::db::{
-    MiscStatements, Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef,
+     Node, RowType, TupConnection, TupConnectionPool, TupConnectionRef,
 };
 use tupdb::deletes::LibSqlDeletes;
 use tupdb::inserts::LibSqlInserts;
@@ -315,7 +315,7 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
     metadata: Option<Metadata>,
     rtype: &RowType,
     srcid: i64,
-) -> Option<NodeAtPath> {
+) -> NodeAtPath {
     let mtime = metadata
         .and_then(time_since_unix_epoch)
         .unwrap_or(Duration::from_secs(0))
@@ -328,7 +328,7 @@ pub(crate) fn prepare_node_at_path<S: AsRef<str>>(
         *rtype,
         srcid,
     );
-    Some(NodeAtPath::new(node, p))
+    NodeAtPath::new(node, p)
 }
 /// insert directory entries into Node table if not already added.
 fn insert_direntries(
@@ -349,8 +349,7 @@ fn insert_direntries(
             mt,
             &RowType::Dir,
             -1,
-        )
-        .expect("Unable to prepare root node for insertion");
+        );
 
         let compute_root_sha = || compute_dir_hash(root).ok();
 
@@ -367,8 +366,7 @@ fn insert_direntries(
                 mt,
                 &File,
                 -1,
-            )
-            .expect("Unable to prepare tup.config node for insertion");
+            );
             let pathbuf = root.join(TUP_CONFIG);
             let tup_config_sha = || compute_hash(pathbuf.clone()).unwrap_or_default();
             let _ =
@@ -494,9 +492,7 @@ fn insert_direntries(
                             };
                             let node_at_path =
                                 prepare_node_at_path(dirid, file_name, hashed_path, metadata, &rtype, -1);
-                            if let Some(node_at_path) = node_at_path {
-                                ns.send(node_at_path).expect("Failed to send prepared node");
-                            }
+                            ns.send(node_at_path).expect("Failed to send prepared node");
                         }
                         drop(ns);
                         log::debug!("finished processing dire entries");

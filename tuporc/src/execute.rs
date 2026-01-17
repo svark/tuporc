@@ -181,6 +181,7 @@ pub(crate) fn execute_targets(
         println!("Nothing to do");
         return Ok(());
     }
+    drop(tup_connection);
     let _ = exec_nodes_to_run(
         connection_pool.clone(),
         rule_nodes,
@@ -190,6 +191,7 @@ pub(crate) fn execute_targets(
         &target,
         &exec_options,
     )?;
+
     Ok(())
 }
 
