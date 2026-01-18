@@ -121,6 +121,7 @@ pub trait LibSqlQueries {
     fn fetch_monitored_files(&self, gen_id: i64) -> DbResult<Vec<(String, bool)>>;
 
     fn has_no_rules_task_or_globs(&self) -> DbResult<bool>;
+    fn is_node_present(&self, node_id: i64) -> bool;
 }
 impl LibSqlQueries for rusqlite::Connection {
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node> {
@@ -544,5 +545,12 @@ impl LibSqlQueries for rusqlite::Connection {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
             Err(e) => Err(e.into()),
         }
+    }
+    fn is_node_present(&self, node_id: i64) -> bool {
+        let has_node : bool = self.is_node_present_inner(node_id, |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count == 1)
+        }).unwrap_or_default();
+        has_node
     }
 }

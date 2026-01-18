@@ -4,7 +4,7 @@
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype : u8 - type of the node to add
-INSERT or IGNORE into ChangeList(id, type, change)
+INSERT or REPLACE into ChangeList(id, type, change)
 Values (:id, :rtype, 0);
 -- <eos>
 
@@ -261,6 +261,10 @@ SELECT DISTINCT  id, type
 FROM Node
 WHERE srcid IN existing
   AND type IN (SELECT type_index FROM NodeType WHERE type IN ('GenF','DirGen'));
+---- mark for delete until we verify they are present
+INSERT or REPLACE  into ChangeList (id, type, change)
+SELECT id, type, 1
+FROM TupfileEntities;
 -- <eos>
 
 

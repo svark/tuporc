@@ -23,6 +23,14 @@ where dir = :dir
   and name = :name;
 -- <eos>
 
+-- name: is_node_present_inner?
+-- Check if a node is present in the LiveNode table
+-- # Parameters
+-- param: id : i64 - id of the node
+-- returns: bool
+SELECT 1 FROM LiveNode WHERE id = :id;
+-- <eos>
+    
 -- name: fetch_node_by_id_inner?
 -- Fetch a node by id
 -- # Parameters

@@ -13,7 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, MAIN_SEPARATOR};
 use std::sync::Arc;
 use std::time::Duration;
-pub const MAX_CONNECTIONS : u32 = 20;
+pub const MAX_CONNECTIONS: u32 = 20;
 //returns change status of a db command
 pub enum UpsertStatus {
     Inserted(i64),
@@ -402,7 +402,7 @@ impl<'a> MiscStatements for TupTransaction<'a> {
     }
 
     fn mark_missing_not_deleted_checked(&self) -> DbResult<()> {
-       self.connection().mark_missing_not_deleted_checked()
+        self.connection().mark_missing_not_deleted_checked()
     }
 }
 
@@ -639,7 +639,7 @@ pub fn start_connection(database_url: &str, max_pool_size: u32) -> DbResult<TupC
     Ok(pool)
 }
 
-pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
+pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<f64> {
     #[cfg(debug_assertions)]
     let start_time = std::time::Instant::now();
 
@@ -690,12 +690,9 @@ pub fn create_dirpathbuf_temptable(conn: &mut Connection) -> DbResult<()> {
 
     // Log the elapsed time
     #[cfg(debug_assertions)]
-    eprintln!(
-        "DirPathBuf table created in {:.4} seconds.",
-        start_time.elapsed().as_secs_f64(),
-    );
-
-    Ok(())
+    return Ok(start_time.elapsed().as_secs_f64());
+    #[cfg(not(debug_assertions))]
+    return Ok(0.0f64);
 }
 
 pub fn create_presentlist_temptable(conn: &TupConnection) -> DbResult<()> {
@@ -761,7 +758,7 @@ impl MiscStatements for TupConnection {
     fn mark_missing_not_deleted_checked(&self) -> DbResult<()> {
         // If PresentList is empty, treating everything as missing would mark the whole tree
         // for deletion. Skip in that case and let the next scan rebuild.
-       TupConnectionRef(self.deref()).mark_missing_not_deleted_checked()
+        TupConnectionRef(self.deref()).mark_missing_not_deleted_checked()
     }
 }
 

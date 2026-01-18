@@ -42,15 +42,14 @@ pub trait LibSqlInserts {
     fn upsert_node(
         &self,
         node: &Node,
-        existing_node: &Node,
+        existing_node: (&Node,bool),
         f: impl FnMut() -> String,
     ) -> Result<Node, AnyError>;
-    fn fetch_upsert_node(
-        &self,
-        node: &Node,
-        compute_sha: impl FnMut() -> String,
-    ) -> Result<Node, AnyError>;
-    /// Same as fetch_upsert_node but does not hide delete-marked rows (used during scan).
+    /// Add or update a node, returning the upserted node.
+    /// If the node exists, its columns are updated as needed.
+    /// If it is new, it is inserted.
+    /// The compute_sha closure is called only if needed to compute the node's sha256.
+    /// Returns the upserted Node.
     fn fetch_upsert_node_raw(
         &self,
         node: &Node,
@@ -276,7 +275,7 @@ impl LibSqlInserts for Connection {
     fn upsert_node(
         &self,
         node: &Node,
-        existing_node: &Node,
+        (existing_node, present): (&Node, bool),
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError> {
         if existing_node.is_valid() {
@@ -286,6 +285,9 @@ impl LibSqlInserts for Connection {
             }
             else if modify == 2 {
                 self.mark_unborn(existing_node.get_id())?;
+            }
+            else if !present {
+                self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
@@ -301,16 +303,16 @@ impl LibSqlInserts for Connection {
             Ok::<Node, AnyError>(node)
         }
     }
-    fn fetch_upsert_node(
+    fn fetch_upsert_node_raw(
         &self,
         node: &Node,
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError> {
-        let existing_node = self
-            .fetch_node_by_dir_and_name(node.get_dir(), node.get_name())
+       let existing_node = self
+            .fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
             .unwrap_or(Node::unknown());
-
-        if existing_node.get_srcid() != -1 && node.get_srcid() == -1 {
+       let alive_node = existing_node.is_valid() && self.is_node_present(existing_node.get_id());
+       if existing_node.get_srcid() != -1 && node.get_srcid() == -1 && alive_node {
             if existing_node.get_srcid() != node.get_srcid() {
                 // fetch previously stored rule name for better error message
                 let name = self
@@ -330,17 +332,7 @@ impl LibSqlInserts for Connection {
                 ));
             }
         }
-        self.upsert_node(node, &existing_node, compute_sha)
-    }
-    fn fetch_upsert_node_raw(
-        &self,
-        node: &Node,
-        compute_sha: impl FnMut() -> String,
-    ) -> Result<Node, AnyError> {
-        let existing_node = self
-            .fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
-            .unwrap_or(Node::unknown());
-        self.upsert_node(node, &existing_node, compute_sha)
+        self.upsert_node(node, (&existing_node, alive_node), compute_sha)
     }
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()> {
         self.add_to_modify_list(id, *rtype as u8)?;
