@@ -4,7 +4,7 @@ use crate::TermProgress;
 use bimap::BiMap;
 use crossbeam::channel::{Receiver, Sender};
 use eyre::{bail, eyre, Context, OptionExt, Report, Result};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar};
 use log::debug;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -528,7 +528,7 @@ fn receive_resolved_statements(
         if poisoned.load(Ordering::SeqCst) {
             break;
         }
-        term_progress.progress(&pb_ref);
+        term_progress.update_pb(&pb_ref);
         collect_db_insertions(
             &conn_ref,
             resolved_rules,
@@ -853,15 +853,14 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let conn = dbref.conn.get()?;
         //conn.enrich_modify_list()?;
         {
-            let pb_enrich = term_progress.get_main();
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
-            pb_enrich.tick();
+            term_progress.update_main();
 
             conn.mark_group_deps().context("Mark group dependencies")?;
-            pb_enrich.tick();
+            term_progress.update_main();
             conn.prune_modify_list().context("Prune modify list")?;
-            pb_enrich.tick();
+            term_progress.update_main();
         }
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id());
         conn.mark_tupfile_outputs(tupfile_ids)
@@ -1066,20 +1065,20 @@ pub fn gather_modified_tupfiles(
 
     let term_progress = TermProgress::new("Gathering modified Tupfiles");
     term_progress.pb_main.set_message("Creating temp tables");
-    term_progress.progress(&term_progress.pb_main);
     let time = create_dirpathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill dirpathbuf table")?;
     #[cfg(debug_assertions)]
      term_progress.set_message("Created dirpathbuf table in {time:?}");
     let _ = time;
+    term_progress.update_main();
 
     create_tuppathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill tuppathbuf table")?;
-    term_progress.progress(&term_progress.pb_main);
+    term_progress.update_main();
 
     create_presentlist_temptable(conn)?;
 
-    term_progress.progress(&term_progress.pb_main);
+    term_progress.update_main();
     // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
     conn.mark_tupfile_deps()
         .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
@@ -1087,7 +1086,7 @@ pub fn gather_modified_tupfiles(
         conn.update_node_sha(i, sha.as_str())?;
         conn.mark_glob_deps(i).context("Mark glob dependencies")?; // modified glob -> Tupfile
     }
-    term_progress.progress(&term_progress.pb_main);
+    term_progress.update_main();
 
     let mut target_dirs_and_names = Vec::new();
     if !targets.is_empty() {
@@ -1119,10 +1118,9 @@ pub fn gather_modified_tupfiles(
         {
             tupfiles.push(n);
         }
-        term_progress.progress(&term_progress.pb_main);
         Ok(())
     })?;
-    term_progress.clear();
+    term_progress.finish_main("Gathered modified Tupfiles");
     Ok(tupfiles)
 }
 
@@ -1286,14 +1284,39 @@ fn parse_in_scope<'scope, 'b>(
 where
     'b: 'scope,
 {
+    let term_progress = term_progress.clone();
+
+    term_progress.suspend();
     let poisoned = Arc::new(AtomicBool::new(false));
     let first_err = Arc::new(Mutex::new(None));
     let total_tupfiles = tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
         .count();
-    let parse_pb = term_progress
-        .make_child_len_progress_bar("Parsing tupfiles", std::cmp::max(1, total_tupfiles) as u64);
+   let num_lua = tupfiles
+            .iter()
+            .filter(|x| x.get_name().ends_with(".lua"))
+            .count();
+    let parse_pb = term_progress.make_child_len_progress_bar(
+        "Parsing tupfiles-1",
+        std::cmp::max(1, total_tupfiles) as u64,
+    );
+    let resolve_pb = term_progress.make_child_len_progress_bar(
+        "Resolving statements",
+        std::cmp::max(1, total_tupfiles) as u64,
+    );
+    let lua_pb = if num_lua == 0 {
+        None
+    } else {
+        Some(term_progress.make_child_len_progress_bar(
+            "Parsing lua build files",
+            num_lua as u64,
+        ))
+    };
+    let lua_pb_main = lua_pb.clone();
+    let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
+    term_progress.set_message("Starting..");
+
     tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
@@ -1305,7 +1328,6 @@ where
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             let term_progress = term_progress.clone();
-            term_progress.pb_main.tick();
             s.spawn(move |_| {
                 if let Err(e) = parse_one_tupfile(
                     tupfile,
@@ -1320,7 +1342,6 @@ where
                 }
             });
         });
-    drop(parse_pb);
     drop(sender);
     // create threads to receive resolved statements and batch insert them to db
     let (insert_sender, insert_receiver) = crossbeam::channel::unbounded::<TupBuildGraphSnapshot>();
@@ -1335,10 +1356,7 @@ where
             1,
             std::cmp::min(rayon::current_num_threads(), std::cmp::max(1, non_lua_count)),
         );
-        let resolve_pb = term_progress.make_child_len_progress_bar(
-            "Resolving statements",
-            std::cmp::max(1, total_tupfiles) as u64,
-        );
+
         for _worker_idx in 0..num_receivers {
             let parser_c = parser.clone();
             let pb_ref = resolve_pb.clone();
@@ -1368,28 +1386,21 @@ where
                 })();
                 if let Err(e) = result {
                     record_error(&first_err, e);
-                    pb_ref.abandon();
-                }else {
-                    pb_ref.inc(1);
                 }
             });
         }
-        let num_lua = tupfiles
-            .iter()
-            .filter(|x| x.get_name().ends_with(".lua"))
-            .count();
+
         if num_lua != 0 {
+            let lua_pb_worker = lua_pb.clone();
             let mut parser_c = parser.clone();
             let insert_sender = insert_sender.clone();
             let rwbufs = parser_c.read_write_buffers().clone();
             let term_progress = term_progress.clone();
-            let pb = term_progress
-                .make_child_len_progress_bar("Parsing lua build files", num_lua as u64);
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             s.spawn(move |_| {
                 let res = (|| -> Result<()> {
-                    let pb_ref = pb.clone();
+                    let pb_ref = lua_pb_worker.clone().unwrap();
                     let conn = parser_c.get_searcher().conn.get()?;
                     for tupfile_lua in tupfiles
                         .iter()
@@ -1417,9 +1428,10 @@ where
                         pb_ref.set_message(format!("Done parsing {}", path));
                     }
                     drop(insert_sender);
+                    pb_ref.finish_and_clear();
                     Ok(())
                 })();
-                if let Err(e) = handle_result(&term_progress, &poisoned, &pb, res) {
+                if let Err(e) = handle_result(&term_progress, &poisoned, lua_pb.as_ref().unwrap(), res) {
                     record_error(&first_err, e);
                 }
             });
@@ -1429,9 +1441,6 @@ where
     {
         let parser_c = parser.clone();
         let rwbufs = parser.read_write_buffers().clone();
-        let pb_insert = term_progress.make_child_len_progress_bar("Inserting nodes", 1);
-        pb_insert.set_length(1);
-        pb_insert.set_position(0);
 
         let psx = parser_c.get_searcher();
         let mut c = psx.conn.get()?;
@@ -1481,7 +1490,7 @@ where
                     //check_uniqueness_of_parent_rule(&tx.connection(), &rwbufs, &outs, crossref)?;
                     let _ = insert_links(&mut tx, &tup_id, crossref, tup_link_info.get_links())
                         .context(format!("Inserting links for {}", tup_id))?;
-                    term_progress.progress(&pb_insert);
+                    term_progress.update_pb(&pb_insert);
                 } // end recv of insert_receiver
             } // end select
         }
@@ -1503,6 +1512,11 @@ where
         pb_insert.finish_and_clear();
     }
 
+    parse_pb.finish_and_clear();
+    resolve_pb.finish_and_clear();
+    if let Some(pb) = lua_pb_main {
+        pb.finish_and_clear();
+    }
     let pb = term_progress.get_main();
     term_progress.finish(&pb, "Done parsing tupfiles");
     term_progress.clear();
@@ -1520,6 +1534,7 @@ fn handle_result(
     pb_ref: &ProgressBar,
     status: Result<()>,
 ) -> Result<()> {
+
     match status {
         Err(e) => {
             log::error!("Error: {}", e);
@@ -1528,7 +1543,7 @@ fn handle_result(
             Err(e)
         }
         _ => {
-            term_progress.finish(&pb_ref, "Done processing parsed tupfiles");
+            // expected to be cleared already
             Ok(())
         }
     }
@@ -1604,12 +1619,12 @@ fn parse_one_tupfile(
         Ok(_) => {
             pb.set_message(format!("Done parsing {}", tupfile.get_name()));
             log::info!("Finished parsing :{}", tupfile_name);
-            term_progress.progress(&pb);
+            term_progress.update_pb(&pb);
         }
         Err(e) if keep_going => {
             log::error!("{}", e);
             pb.set_message(format!("Error parsing {}", tupfile.get_name()));
-            term_progress.progress(&pb);
+            term_progress.update_pb(&pb);
         }
         Err(e) => {
             log::error!("{}", e);
@@ -1621,8 +1636,6 @@ fn parse_one_tupfile(
     }
     drop(sender);
     log::info!("Finished parsing tupfile {}", tupfile_name);
-    pb.tick();
-    //term_progress.finish(&pb, format!("Done parsing {}", tupfile_name));
     Ok(())
 }
 
@@ -2126,7 +2139,7 @@ fn insert_nodes(
         insert_node(tx, &read_write_buf, crossref, node_to_insert)
             .wrap_err(format!("Inserting node :{:?}", node_to_insert))?;
         {
-            term_progress.progress(pb);
+            term_progress.update_pb(&pb);
         }
     }
 
@@ -2146,7 +2159,7 @@ fn insert_nodes(
                 log::warn!("Error while inserting env var: {:?}", e);
             }
         }
-        term_progress.progress(pb);
+        term_progress.update_pb(pb);
     }
     check_cancel()?;
 

@@ -73,16 +73,15 @@ impl TermProgress {
     }
 
     pub fn make_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
-        let pb_main = ProgressBar::new(len);
+        let pb = ProgressBar::new(len);
         let sty_main = ProgressStyle::with_template(
             "{bar:40.green/yellow} [{elapsed}<{eta}] {pos:>4}/{len:4} {msg}",
         )
         .unwrap();
-        pb_main.set_style(sty_main);
-        pb_main.set_message(msg);
-        let _ = self.mb.clear();
-        self.mb.add(pb_main.clone());
-        pb_main
+        pb.set_style(sty_main);
+        let pb = self.mb.add(pb);
+        pb.set_message(msg);
+        pb
     }
     pub fn make_progress_bar(&self, msg: &'static str) -> ProgressBar {
         let pb = ProgressBar::new_spinner();
@@ -93,16 +92,17 @@ impl TermProgress {
                 // For more spinners check out the cli-spinners project:
                 // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
                 .tick_strings(&["⢹",
-			"⢺",
-			"⢼",
-			"⣸",
-			"⣇",
-			"⡧",
-			"⡗",
-			"⡏"]),
+                "⢺",
+                "⢼",
+                "⣸",
+                "⣇",
+                "⡧",
+                "⡗",
+                "⡏"]),
         );
+        let pb = self.mb.add(pb);
         pb.set_message(msg);
-        self.mb.add(pb)
+        pb
     }
 
     pub fn make_child_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
@@ -113,12 +113,14 @@ impl TermProgress {
             )
                 .unwrap().progress_chars("##-"),
         );
+        let pb = self.mb.add(pb);
         pb.set_message(msg);
-        self.mb.add(pb)
+        pb
     }
 
 
     fn set_main_with_ticker(self, msg: &'static str) -> TermProgress {
+        self.pb_main.reset();
         self.pb_main.enable_steady_tick(Duration::from_millis(120));
         self.pb_main.set_style(
             ProgressStyle::with_template("{spinner:.green} [{elapsed}] {msg}")
@@ -136,6 +138,11 @@ impl TermProgress {
     }
 
     pub fn progress(&self, pb: &ProgressBar) {
+        self.update_pb(pb);
+        self.update_main();
+    }
+
+    pub(crate) fn update_pb(&self, pb: &ProgressBar) {
         if let Some(l) = pb.length() {
             if pb.position() < l {
                 pb.inc(1);
@@ -143,6 +150,9 @@ impl TermProgress {
         } else {
             pb.tick();
         }
+    }
+
+    fn update_main(&self) {
         if let Some(l) = self.pb_main.length() {
             if self.pb_main.position() < l {
                 self.pb_main.inc(1);
@@ -178,6 +188,12 @@ impl TermProgress {
 
     pub fn set_message(&self, msg: &str) {
         self.mb.println(msg).expect("Failed to print message");
+    }
+
+    pub fn suspend(&self) {
+        self.mb.suspend(|| {
+            // no-op
+        });
     }
 
     pub fn clear(&self) {
@@ -578,20 +594,7 @@ fn scan_and_get_tupfiles(
     skip_scan: bool,
     targets: &Vec<String>,
 ) -> Result<Vec<Node>> {
-    let lock_file_path = root.join(".tup/build_lock");
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true) // Create the file if it doesn't exist
-        .open(&lock_file_path)
-        .wrap_err_with(|| {
-            format!(
-                "Failed to open/create build lock file at '{}'",
-                lock_file_path.display()
-            )
-        })?;
-    // Apply an exclusive lock
-    file.try_lock_exclusive()
-        .map_err(|_| eyre!("Build was already started!"))?;
+    let _ = lock(root)?;
 
     // if the monitor is running avoid scanning
     if !skip_scan {
@@ -627,20 +630,8 @@ fn scan_and_get_all_tupfiles(
         }
     }
 
-    let lock_file_path = root.join(".tup/build_lock");
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true) // Create the file if it doesn't exist
-        .open(&lock_file_path)
-        .wrap_err_with(|| {
-            format!(
-                "Failed to open/create build lock file at '{}'",
-                lock_file_path.display()
-            )
-        })?;
+    let _ = lock(root)?;
     // Apply an exclusive lock
-    file.try_lock_exclusive()
-        .map_err(|_| eyre!("Build was already started!"))?;
 
     // if the monitor is running avoid scanning
     if !skip_scan {
@@ -652,4 +643,21 @@ fn scan_and_get_all_tupfiles(
         pool.get()
             .wrap_err("Failed to get database connection from pool")?,
     )
+}
+
+fn lock(root: &PathBuf) -> Result<File> {
+    let lock_file_path = root.join(".tup/build_lock");
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true) // Create the file if it doesn't exist
+        .open(&lock_file_path)
+        .wrap_err_with(|| {
+            format!(
+                "Failed to open/create build lock file at '{}'",
+                lock_file_path.display()
+            )
+        })?;
+    file.try_lock_exclusive()
+        .map_err(|_| eyre!("Build was already started!"))?;
+    Ok(file)
 }
