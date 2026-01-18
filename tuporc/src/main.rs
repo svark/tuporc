@@ -92,7 +92,14 @@ impl TermProgress {
                 .unwrap()
                 // For more spinners check out the cli-spinners project:
                 // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
-                .tick_strings(&["+", "x", "*"]),
+                .tick_strings(&["⢹",
+			"⢺",
+			"⢼",
+			"⣸",
+			"⣇",
+			"⡧",
+			"⡗",
+			"⡏"]),
         );
         pb.set_message(msg);
         self.mb.add(pb)
@@ -102,32 +109,27 @@ impl TermProgress {
         let pb = ProgressBar::new(len);
         pb.set_style(
             ProgressStyle::with_template(
-                "{bar:40.cyan/blue} [{elapsed}<{eta}] {pos:>4}/{len:4} {msg}",
+                "{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}",
             )
-                .unwrap(),
+                .unwrap().progress_chars("##-"),
         );
         pb.set_message(msg);
-        self.mb.add(pb.clone());
-        pb
+        self.mb.add(pb)
     }
 
-    pub fn set_main_with_len(mut self, msg: &'static str, len: u64) -> TermProgress {
-        let pb_main = ProgressBar::new(len);
-        let sty_main =
-            ProgressStyle::with_template("{bar:40.green/yellow} {eta} {pos:>4}/{len:4}").unwrap();
-        pb_main.set_style(sty_main);
-        pb_main.set_message(msg);
-        self.clear();
-        self.pb_main = pb_main;
-        self
-    }
 
     fn set_main_with_ticker(self, msg: &'static str) -> TermProgress {
         self.pb_main.enable_steady_tick(Duration::from_millis(120));
         self.pb_main.set_style(
             ProgressStyle::with_template("{spinner:.green} [{elapsed}] {msg}")
                 .unwrap()
-                .tick_strings(&["+", "x", "*"]),
+                .tick_strings(&[	"⢺",
+			"⢼",
+			"⣸",
+			"⣇",
+			"⡧",
+			"⡗",
+			"⡏"]),
         );
         self.pb_main.set_message(msg);
         self
@@ -150,8 +152,8 @@ impl TermProgress {
         }
     }
 
-    pub fn finish(&self, pb: &ProgressBar, msg: impl Into<Cow<'static, str>>) {
-        pb.finish_with_message(msg);
+    pub fn finish(&self, pb: &ProgressBar, _: impl Into<Cow<'static, str>>) {
+        pb.finish_and_clear();
     }
 
     pub fn finish_main(&self, msg: impl Into<Cow<'static, str>>) {
@@ -347,17 +349,17 @@ fn main() -> Result<()> {
 
                 let pool = start_tup_connection(args.db_pool_size)
                     .wrap_err("Parse action: could not establish connection to .tup/db")?;
-                let term_progress = TermProgress::new("Scanning ");
-                let skip_scan = skip_scan || monitor::is_monitor_running();
-                let tupfiles =
-                    scan_and_get_tupfiles(&root, pool.clone(), &term_progress, skip_scan, &target)
-                        .inspect_err(|e| {
-                            term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                        })?;
-
-                let term_progress =
-                    TermProgress::new("Parsing tupfiles");
-                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), term_progress, keep_going)?;
+                let tupfiles = {
+                    let term_progress = TermProgress::new("Scanning ");
+                    let skip_scan = skip_scan || monitor::is_monitor_running();
+                    let tupfiles =
+                        scan_and_get_tupfiles(&root, pool.clone(), &term_progress, skip_scan, &target)
+                            .inspect_err(|e| {
+                                term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                            })?;
+                    tupfiles
+                };
+                parse_tupfiles_in_db(pool, tupfiles, root.as_path(), keep_going)?;
             }
             Action::Upd {
                 mut target,
@@ -441,13 +443,10 @@ fn main() -> Result<()> {
                         skip_scan,
                         &target,
                     )?;
-                    let term_progress = term_progress
-                        .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
                     parse_tupfiles_in_db(
                         connection_pool,
                         tupfiles,
                         root.as_path(),
-                        term_progress,
                         keep_going,
                     )?;
                     let term_progress = TermProgress::new("Executing ");
@@ -503,7 +502,7 @@ fn main() -> Result<()> {
 
                 let tupfiles_with_vars = {
                     let term_progress = term_progress
-                        .set_main_with_len("Parsing tupfiles", 2 * tupfiles.len() as u64);
+                        .set_main_with_ticker("Parsing tupfiles");
                     let tupfiles_with_vars = parse_tupfiles_in_db_for_dump(
                         pool.clone(),
                         tupfiles,
@@ -609,7 +608,6 @@ fn scan_and_get_tupfiles(
     gather_modified_tupfiles(
         &mut conn,
         targets,
-        term_progress.clone(),
         inspect_dirpath_buf,
     )
 }

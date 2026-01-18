@@ -1088,7 +1088,7 @@ fn link_output_to_task(
                         use tupdb::inserts::LibSqlInserts as _;
                         let inserted = process_checker
                             .conn
-                            .fetch_upsert_node(&gen_node, || String::new())
+                            .fetch_upsert_node_raw(&gen_node, || String::new())
                             .map_err(|e| {
                                 eyre!("Failed to create task output node '{}': {}", file_node, e)
                             })?;

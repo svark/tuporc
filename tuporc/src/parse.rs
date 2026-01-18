@@ -8,6 +8,7 @@ use indicatif::ProgressBar;
 use log::debug;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -824,14 +825,14 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     connection: TupConnectionPool,
     tupfiles: Vec<Node>,
     root: P,
-    term_progress: TermProgress,
     keep_going: bool,
 ) -> Result<()> {
-    term_progress.clear();
     if tupfiles.is_empty() {
         log::warn!("No Tupfiles to parse");
         return Ok(());
     }
+    let term_progress =  TermProgress::new("Parsing tupfiles");
+
     {
         let mut conn = connection.get()?;
         let tx = conn.transaction()?;
@@ -846,14 +847,13 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
     //conn.prune_modified_list_basic()?;
     let db = DbPathSearcher::new(connection.clone(), root.as_ref());
     let parser = TupParser::try_new_from(root.as_ref(), db)?;
-    let term_progress = term_progress.set_main_with_ticker("Parsing tupfiles");
+    //let term_progress = term_progress.set_main_with_ticker("Parsing tupfiles");
     {
         let dbref = parser.get_searcher();
         let conn = dbref.conn.get()?;
         //conn.enrich_modify_list()?;
         {
             let pb_enrich = term_progress.get_main();
-            pb_enrich.set_message("Enriching modify list");
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
             pb_enrich.tick();
@@ -862,22 +862,20 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             pb_enrich.tick();
             conn.prune_modify_list().context("Prune modify list")?;
             pb_enrich.tick();
-            pb_enrich.set_message("Done enriching modify list");
         }
         let tupfile_ids = tupfiles.iter().map(|t| t.get_id());
         conn.mark_tupfile_outputs(tupfile_ids)
             .context("Mark tupfile outputs")?;
     }
-    let t = term_progress.clone();
-    let res = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), term_progress, keep_going);
+    let res = parse_and_add_rules_to_db(parser, tupfiles.as_slice(), term_progress.clone(), keep_going);
     match res {
         Err(e) => {
             log::error!("Error during parsing tupfiles: {}", e);
-            t.abandon_main("Error ");
-            eprintln!("Error during parsing tupfiles: {}", e);
+            term_progress.abandon_main("Error ");
+            return Err(e);
         }
         _ => {
-            t.finish_main("Parsing completed");
+            term_progress.finish_main("Parsing completed");
         }
     }
     {
@@ -904,7 +902,7 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
             // Enforce unique producer per output (Rule or Task): check if an existing producer exists
             {
                 let mut stmt = tx
-                    .prepare("SELECT from_id FROM NormalLink WHERE to_id = ?1 AND to_type IN (4, 7) LIMIT 1")
+                    .prepare("SELECT from_id FROM LiveNormalLink WHERE to_id = ?1 AND to_type IN (4, 7) LIMIT 1")
                     .map_err(|e| eyre!("DB prepare failed while checking producer uniqueness: {}", e))?;
                 let mut rows = stmt.query([output_id.0]).map_err(|e| {
                     eyre!("DB query failed while checking producer uniqueness: {}", e)
@@ -993,7 +991,7 @@ fn insert_links(
     // collect all un-added groups and add them in a single transaction.
     for l in link_collector.links() {
         insert_link(&tx, l, crossref)
-            .context(format!("Inserting link {:?} in tupfile {:?}", l, tup_id,))?;
+            .context(format!("Inserting link {} in tupfile {}", l, tup_id,))?;
     }
     Ok(())
 }
@@ -1062,16 +1060,18 @@ fn fetch_deeper_dirs(
 pub fn gather_modified_tupfiles(
     conn: &mut TupConnection,
     targets: &Vec<String>,
-    term_progress: TermProgress,
     inspect_dir_path_buf: bool,
 ) -> Result<Vec<Node>> {
     let mut tupfiles = Vec::new();
 
-    let term_progress = term_progress.set_main_with_ticker("Gathering modified Tupfiles");
+    let term_progress = TermProgress::new("Gathering modified Tupfiles");
     term_progress.pb_main.set_message("Creating temp tables");
     term_progress.progress(&term_progress.pb_main);
-    create_dirpathbuf_temptable(conn)
+    let time = create_dirpathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill dirpathbuf table")?;
+    #[cfg(debug_assertions)]
+     term_progress.set_message("Created dirpathbuf table in {time:?}");
+    let _ = time;
 
     create_tuppathbuf_temptable(conn)
         .with_context(|| "Failed to create and fill tuppathbuf table")?;
@@ -1122,6 +1122,7 @@ pub fn gather_modified_tupfiles(
         term_progress.progress(&term_progress.pb_main);
         Ok(())
     })?;
+    term_progress.clear();
     Ok(tupfiles)
 }
 
@@ -1140,13 +1141,12 @@ pub fn gather_tupfiles(mut conn: TupConnection) -> Result<Vec<Node>> {
 fn parse_and_add_rules_to_db(
     mut parser: TupParser<DbPathSearcher>,
     tupfiles: &[Node],
-    mut term_progress: TermProgress,
+    term_progress: TermProgress,
     keep_going: bool,
 ) -> Result<TupParser<DbPathSearcher>> {
     let cancel_flag = cancel_flag();
     cancel_flag.store(false, Ordering::SeqCst);
-    term_progress.finish_main("_");
-    term_progress = term_progress.set_main_with_ticker("Parsing Tupfiles");
+    //let term_progress = term_progress.set_main_with_ticker("Parsing Tupfiles");
     //let mut del_stmt = conn.delete_tup_rule_links_prepare()?;
     let (sender, receiver) = crossbeam::channel::unbounded();
     let mut crossref = CrossRefMaps::default();
@@ -1167,22 +1167,21 @@ fn parse_and_add_rules_to_db(
         .build()?;
     let parse_result = Arc::new(Mutex::new(None));
     thread_pool.scope(|scope| {
-        let t = term_progress.clone();
         if let Err(e) = parse_in_scope(
             scope,
             &mut parser,
             tupfiles,
-            term_progress,
+            &term_progress,
             sender,
             receiver,
             &mut crossref,
             keep_going,
         ) {
             *parse_result.lock().expect("poisoned parse result mutex") = Some(e);
-            t.abandon_main("Error during parsing");
+            term_progress.abandon_main("Error during parsing");
         }
         else {
-            t.finish_main("Done");
+            term_progress.finish_main("Done");
         }
     });
     if let Some(err) = parse_result
@@ -1278,7 +1277,7 @@ fn parse_in_scope<'scope, 'b>(
     s: &rayon::Scope<'scope>,
     parser: &'scope mut TupParser<DbPathSearcher>,
     tupfiles: &'b [Node],
-    term_progress: TermProgress,
+    term_progress: &TermProgress,
     sender: Sender<StatementsToResolve>,
     receiver: Receiver<StatementsToResolve>,
     mut crossref: &'scope mut CrossRefMaps,
@@ -1289,13 +1288,12 @@ where
 {
     let poisoned = Arc::new(AtomicBool::new(false));
     let first_err = Arc::new(Mutex::new(None));
-    let _total_tupfiles = tupfiles
+    let total_tupfiles = tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
         .count();
-    let parse_pb = term_progress.get_main().clone();
-    //parse_pb.set_message("Parsing tupfiles");
-    //parse_pb.set_length(total_tupfiles as u64);
+    let parse_pb = term_progress
+        .make_child_len_progress_bar("Parsing tupfiles", std::cmp::max(1, total_tupfiles) as u64);
     tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
@@ -1307,6 +1305,7 @@ where
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             let term_progress = term_progress.clone();
+            term_progress.pb_main.tick();
             s.spawn(move |_| {
                 if let Err(e) = parse_one_tupfile(
                     tupfile,
@@ -1321,6 +1320,7 @@ where
                 }
             });
         });
+    drop(parse_pb);
     drop(sender);
     // create threads to receive resolved statements and batch insert them to db
     let (insert_sender, insert_receiver) = crossbeam::channel::unbounded::<TupBuildGraphSnapshot>();
@@ -1335,12 +1335,13 @@ where
             1,
             std::cmp::min(rayon::current_num_threads(), std::cmp::max(1, non_lua_count)),
         );
-        let resolve_pb =
-            term_progress.make_child_len_progress_bar("Resolving statements", num_receivers as u64);
-        for worker_idx in 0..num_receivers {
+        let resolve_pb = term_progress.make_child_len_progress_bar(
+            "Resolving statements",
+            std::cmp::max(1, total_tupfiles) as u64,
+        );
+        for _worker_idx in 0..num_receivers {
             let parser_c = parser.clone();
             let pb_ref = resolve_pb.clone();
-            pb_ref.set_message(format!("Resolving statements worker {}", worker_idx + 1));
             let insert_sender = insert_sender.clone();
             let rwbufs = parser_c.read_write_buffers().clone();
             let receiver = receiver.clone();
@@ -1397,7 +1398,7 @@ where
                     {
                         check_cancel()?;
                         if poisoned.load(Ordering::SeqCst) {
-                            log::debug!("parsing lua build files cancelled");
+                            debug!("parsing lua build files cancelled");
                             break;
                         }
                         let path = tupfile_lua.get_name();
@@ -1441,12 +1442,12 @@ where
             crossbeam::select! {
                 recv(ticker) -> _ => {
                     if poisoned.load(Ordering::SeqCst) {
-                        log::debug!("recvd user interrupt");
+                        debug!("recvd user interrupt");
                         loop_aborted = true;
                         break;
                     }
                     if check_cancel().is_err() {
-                        log::debug!("insertion cancelled");
+                        debug!("insertion cancelled");
                         loop_aborted = true;
                         break;
                     }
@@ -1587,7 +1588,7 @@ fn parse_one_tupfile(
         bail!("Parsing aborted due to error or cancellation");
     }
     log::info!("Parsing :{}", tupfile_name);
-    //pb.set_message(format!("Parsing :{tupfile_name}"));
+    pb.set_message(format!("Parsing :{tupfile_name}"));
     match parser_clone
         .parse_tupfile(tupfile.get_name(), sender.clone())
         .map_err(|error| {
@@ -1601,7 +1602,7 @@ fn parse_one_tupfile(
             )
         }) {
         Ok(_) => {
-           // pb.set_message(format!("Done parsing {}", tupfile.get_name()));
+            pb.set_message(format!("Done parsing {}", tupfile.get_name()));
             log::info!("Finished parsing :{}", tupfile_name);
             term_progress.progress(&pb);
         }
@@ -1825,7 +1826,24 @@ enum Link {
     TupfileToRule(TupPathDescriptor, RuleDescriptor),
 }
 
-/// Place holder for all types of links that would go into db in the NormalLink table.
+impl Display for Link {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Link::DirToGlob(d, g, _) => { write!(f, "DirToGlob({}->{})", d, g) },
+            Link::InputToRule(i, r) => { write!(f, "InputToRule({}->{})", i, r) },
+            Link::RuleToOutput(r, o) => { write!(f, "RuleToOutput({}->{})", r, o) },
+            Link::OutputToGroup(o, g) => { write!(f, "OutputToGroup({}->{})", o, g) },
+            Link::GroupToRule(g, r) => { write!(f, "GroupToRule({}->{})", g, r) },
+            Link::EnvToRule(e, r) => { write!(f, "EnvToRule({}->{})", e, r) },
+            Link::TupfileToTupfile(t0, t2) => { write!(f, "TupfileToTupfile({}->{})", t0, t2) },
+            Link::GlobToTupfile(g, t) => { write!(f, "GlobToTupfile({}->{})", g, t) },
+            Link::TupfileToRule(g, r) => {
+                write!(f, "TupfileToRule({}->{})", g, r)
+            }
+        }
+    }
+}
+/// Placeholder for all types of links that would go into db in the NormalLink table.
 #[derive(Debug, Clone, Default)]
 struct LinkCollector {
     links: HashSet<Link>,
@@ -2233,7 +2251,7 @@ fn insert_node(
     };
     let sha = compute_sha(); // need to compute sha before upsert for new nodes and modified nodes
     let (db_id, db_par_id) = {
-        let upsnode = tx.fetch_upsert_node(&node, || sha.clone())?;
+        let upsnode = tx.fetch_upsert_node_raw(&node, || sha.clone())?;
         (upsnode.get_id(), upsnode.get_dir())
     };
     if !db_id.is_negative() {
