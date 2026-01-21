@@ -1904,6 +1904,7 @@ impl LinkCollector {
         t: &PathDescriptor,
         tup: &TupPathDescriptor,
     ) {
+        if t.eq(&tup) { return; }
         self.links
             .insert(Link::TupfileToTupfile(t.clone(), tup.clone()));
     }
