@@ -19,7 +19,7 @@ use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
-use tupdb::db::{start_connection, Node, TupConnection, TupConnectionPool};
+use tupdb::db::{start_io_connection, Node, TupConnection, TupConnectionPool};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::{BufferObjects, PathBuffers};
 use tupparser::decode::decode_group_captures;
@@ -27,7 +27,7 @@ use tupparser::statements::{Loc, TupLoc};
 use tupparser::TupPathDescriptor;
 
 use crate::parse::{cancel_flag, ConnWrapper};
-use crate::{TermProgress, IO_DB};
+use crate::{TermProgress};
 use tupdb::db::RowType;
 use tupdb::db::RowType::Excluded;
 use tupdb::error::{AnyError, DbResult};
@@ -92,7 +92,7 @@ fn prepare_for_execution(
                 .clone();
             dag.add_dependency(node1, node2).map_err(|e| {
                 term_progress.abandon(&pbar, "Cyclic dependency detected!");
-                AnyError::from(e.to_string())
+                AnyError::from(format!("Cycle detect when connecting {} {} \n{}", x, y, e.to_string()))
             })?;
             term_progress.progress(&pbar);
             Ok(())
@@ -398,7 +398,14 @@ fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> R
             dir_ids.push(id);
         }
     }
-    Ok(dir_ids)
+    let mut rule_ids = Vec::new();
+    for dirid in dir_ids.iter() {
+        conn.for_each_rule_in_dir(*dirid, |r| {
+            rule_ids.push(r);
+            Ok(())
+        })?;
+    }
+    Ok(rule_ids)
 }
 fn execute_rule(
     rule_node: &Node,
@@ -452,6 +459,10 @@ fn exec_nodes_to_run(
             if let Some(rule_node_in_dag) = fwd_refs.get_by_left(&id) {
                 for target_id in target_ids.iter() {
                     let t = *target_id as i32;
+                    if t == id {
+                        valid_rules.push(r);
+                        break;
+                    }
                     if let Some(target_node_in_dag) = fwd_refs.get_by_left(&t) {
                         if dag.contains_transitive_dependency(rule_node_in_dag, target_node_in_dag)
                         {
@@ -858,9 +869,8 @@ fn listen_to_processes(
     poisoned: PoisonedState,
     mut proc_receivers: ProcReceivers,
 ) -> Result<()> {
-    let io_conn_pool = start_connection(IO_DB, 2).expect("Failed to open in memory db");
+    let io_conn_pool = start_io_connection( 2 ).expect("Failed to open in memory db");
     let mut io_conn = io_conn_pool.get()?;
-    tupdb::db::create_dyn_io_temp_tables(&mut io_conn)?;
     let mut process_checker = ProcessIOChecker::new(conn)?;
     let mut deleted_child_procs = std::collections::BTreeSet::new();
 

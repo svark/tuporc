@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use crate::parse::{cancel_flag, CrossRefMaps};
 use crate::scan::scan_root;
-use crate::{start_tup_connection, TermProgress, IO_DB};
+use crate::{TermProgress};
 use crossbeam::channel::Receiver;
 use eyre::{Report, Result};
-use tupdb::db::{start_connection, RowType, TupConnection, TupTransaction};
+use tupdb::db::{start_tup_connection, start_io_connection, RowType, TupConnection, TupTransaction};
 //use fs2::FileExt;
 use fs4::fs_std::FileExt;
 use ignore::gitignore::Gitignore;
@@ -351,7 +351,7 @@ fn is_ignorable<P: AsRef<Path>>(path: P, ign: &Gitignore, is_dir: bool) -> bool 
 }
 
 fn stop_monitor() -> Result<()> {
-    let conn = start_connection(IO_DB,1)?;
+    let conn = start_io_connection(1)?;
     conn.get()?
         .execute("INSERT INTO messages (message) VALUES ('QUIT')", [])?;
     Ok(())

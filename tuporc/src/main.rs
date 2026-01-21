@@ -32,15 +32,13 @@ use crate::parse::{gather_modified_tupfiles, parse_tupfiles_in_db, parse_tupfile
 use fs4::fs_std::FileExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tupdb::db::{
-    delete_db, init_db, is_initialized, log_sqlite_version, start_connection, MiscStatements,
+    delete_db, init_db, is_initialized, log_sqlite_version, start_tup_connection, MiscStatements,
     TupConnectionPool,
 };
 use tupdb::db::{Node, RowType};
 use tupdb::queries::LibSqlQueries;
 use tupparser::buffers::NormalPath;
 use tupparser::locate_file;
-static TUP_DB: &str = ".tup/db";
-static IO_DB: &str = ".tup/io.db";
 mod execute;
 mod monitor;
 mod parse;
@@ -51,12 +49,6 @@ static APPNAME: &str = "tuporc";
 pub(crate) struct TermProgress {
     mb: MultiProgress,
     pb_main: ProgressBar,
-}
-
-fn start_tup_connection(pool_size: u32) -> Result<TupConnectionPool> {
-    let pool = start_connection(TUP_DB, pool_size)
-        .wrap_err_with(|| format!("Failed to open tup database at '{}'", TUP_DB))?;
-    Ok(pool)
 }
 
 impl TermProgress {
@@ -91,14 +83,7 @@ impl TermProgress {
                 .unwrap()
                 // For more spinners check out the cli-spinners project:
                 // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
-                .tick_strings(&["⢹",
-                "⢺",
-                "⢼",
-                "⣸",
-                "⣇",
-                "⡧",
-                "⡗",
-                "⡏"]),
+                .tick_strings(&["⢹", "⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"]),
         );
         let pb = self.mb.add(pb);
         pb.set_message(msg);
@@ -108,16 +93,14 @@ impl TermProgress {
     pub fn make_child_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
         let pb = ProgressBar::new(len);
         pb.set_style(
-            ProgressStyle::with_template(
-                "{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}",
-            )
-                .unwrap().progress_chars("##-"),
+            ProgressStyle::with_template("{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}")
+                .unwrap()
+                .progress_chars("##-"),
         );
         let pb = self.mb.add(pb);
         pb.set_message(msg);
         pb
     }
-
 
     fn set_main_with_ticker(self, msg: &'static str) -> TermProgress {
         self.pb_main.reset();
@@ -125,13 +108,7 @@ impl TermProgress {
         self.pb_main.set_style(
             ProgressStyle::with_template("{spinner:.green} [{elapsed}] {msg}")
                 .unwrap()
-                .tick_strings(&[	"⢺",
-			"⢼",
-			"⣸",
-			"⣇",
-			"⡧",
-			"⡗",
-			"⡏"]),
+                .tick_strings(&["⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"]),
         );
         self.pb_main.set_message(msg);
         self
@@ -227,7 +204,7 @@ enum Action {
     #[clap(about = "Clean and initialize database again")]
     ReInit {
         #[clap(short = 'g', default_value = "false")]
-        keep_gen_files : bool,
+        keep_gen_files: bool,
     },
 
     #[clap(about = "Scans the file system for changes since the last scan")]
@@ -300,11 +277,11 @@ fn main() -> Result<()> {
             Action::Init => {
                 init_db().wrap_err("Failed to initialize .tup/db")?;
             }
-            Action::ReInit { keep_gen_files}  => {
+            Action::ReInit { keep_gen_files } => {
                 {
                     change_root()?;
                     let pool = start_tup_connection(db_pool_size)
-                        .wrap_err("Failed to connect to tup database during reinit")?;
+                        .wrap_err("Failed to connect to tup database during reinitialization")?;
                     let conn = pool
                         .get()
                         .wrap_err("Failed to get database connection from pool")?;
@@ -312,11 +289,10 @@ fn main() -> Result<()> {
                     if is_initialized(&conn, "DirPathBuf") && !keep_gen_files {
                         conn.for_each_gen_file(|node| {
                             if node.get_type().eq(&RowType::GenF) {
-                                let _ = std::fs::remove_file(node.get_name()).or_else(  |_| {
+                                let _ = std::fs::remove_file(node.get_name()).or_else(|_| {
                                     log::warn!("No such file {}", node.get_name());
                                     Ok::<(), io::Error>(())
-                                }
-                                );
+                                });
                             }
                             Ok(())
                         })?;
@@ -337,7 +313,9 @@ fn main() -> Result<()> {
                 delete_db().wrap_err("Reinit: failed to delete existing .tup directory")?;
                 init_db().wrap_err("Reinit: failed to initialize .tup/db")?;
             }
-            Action::Scan  { num_jobs: _num_jobs }=> {
+            Action::Scan {
+                num_jobs: _num_jobs,
+            } => {
                 change_root()?;
                 let pool = start_tup_connection(args.db_pool_size)
                     .wrap_err("Scan action: could not establish connection to .tup/db")?;
@@ -368,11 +346,16 @@ fn main() -> Result<()> {
                 let tupfiles = {
                     let term_progress = TermProgress::new("Scanning ");
                     let skip_scan = skip_scan || monitor::is_monitor_running();
-                    let tupfiles =
-                        scan_and_get_tupfiles(&root, pool.clone(), &term_progress, skip_scan, &target)
-                            .inspect_err(|e| {
-                                term_progress.abandon_main(format!("Scan failed with error:{}", e))
-                            })?;
+                    let tupfiles = scan_and_get_tupfiles(
+                        &root,
+                        pool.clone(),
+                        &term_progress,
+                        skip_scan,
+                        &target,
+                    )
+                    .inspect_err(|e| {
+                        term_progress.abandon_main(format!("Scan failed with error:{}", e))
+                    })?;
                     tupfiles
                 };
                 parse_tupfiles_in_db(pool, tupfiles, root.as_path(), keep_going)?;
@@ -459,12 +442,7 @@ fn main() -> Result<()> {
                         skip_scan,
                         &target,
                     )?;
-                    parse_tupfiles_in_db(
-                        connection_pool,
-                        tupfiles,
-                        root.as_path(),
-                        keep_going,
-                    )?;
+                    parse_tupfiles_in_db(connection_pool, tupfiles, root.as_path(), keep_going)?;
                     let term_progress = TermProgress::new("Executing ");
                     let exec_options = execute::ExecOptions {
                         keep_going,
@@ -517,8 +495,7 @@ fn main() -> Result<()> {
                         })?;
 
                 let tupfiles_with_vars = {
-                    let term_progress = term_progress
-                        .set_main_with_ticker("Parsing tupfiles");
+                    let term_progress = term_progress.set_main_with_ticker("Parsing tupfiles");
                     let tupfiles_with_vars = parse_tupfiles_in_db_for_dump(
                         pool.clone(),
                         tupfiles,
@@ -608,11 +585,7 @@ fn scan_and_get_tupfiles(
         .wrap_err("Failed to get database connection from pool")?;
     // conn.execute("PRAGMA optimize" ,[])?;
     let inspect_dirpath_buf = std::env::var("INSPECT_DIRPATHBUF").is_ok();
-    gather_modified_tupfiles(
-        &mut conn,
-        targets,
-        inspect_dirpath_buf,
-    )
+    gather_modified_tupfiles(&mut conn, targets, inspect_dirpath_buf)
 }
 
 fn scan_and_get_all_tupfiles(
@@ -621,14 +594,6 @@ fn scan_and_get_all_tupfiles(
     term_progress: &TermProgress,
     skip_scan: bool,
 ) -> Result<Vec<Node>> {
-    {
-        let conn = pool.get().expect("Failed to get connection");
-        if !is_initialized(&conn, "Node") {
-            return Err(eyre!(
-                "Tup database is not initialized, use `tup init' to initialize",
-            ));
-        }
-    }
 
     let _ = lock(root)?;
     // Apply an exclusive lock
