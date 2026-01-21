@@ -451,6 +451,15 @@ FROM sub_tree;
 -- <eos>
 
 
+-- name: for_each_rule_in_dir_inner&
+-- Fetch the rule ids in a directory
+-- # Parameters
+-- param: dir_id : i64 - id of the directory
+SELECT id
+FROM LiveNode
+WHERE dir = :dir_id
+  AND type = (SELECT type_index from NodeType where type = 'Rule');
+-- <eos>
     
 -- name: check_is_in_update_universe_inner?
 -- Check if the given id is in the update universe

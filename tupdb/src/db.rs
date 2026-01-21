@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 pub const MAX_CONNECTIONS: u32 = 20;
 //returns change status of a db command
+pub static TUP_DB: &str = ".tup/db";
+pub static IO_DB: &str = ".tup/io.db";
 pub enum UpsertStatus {
     Inserted(i64),
     Updated(i64),
@@ -469,7 +471,7 @@ pub fn init_db() -> DbResult<()> {
             "Unable to access or create .tup directory before initializing DB: {e}"
         ))
     })?;
-    let conn = Connection::open(".tup/db").map_err(|e| {
+    let conn = Connection::open(TUP_DB).map_err(|e| {
         AnyError::from(format!(
             "Failed to open connection to .tup/db while initializing: {e}"
         ))
@@ -479,10 +481,26 @@ pub fn init_db() -> DbResult<()> {
             "Node table already exists in .tup/db",
         )));
     }
+    let io_conn = Connection::open(IO_DB).map_err(|e| {
+        AnyError::from(format!(
+            "Failed to open connection to .tup/io.db while initializing: {e}"
+        ))
+    })?;
+    if is_initialized(&io_conn, "DYNIO") {
+        return Err(AnyError::from(String::from(
+            "DynIO table already exists in .tup/io.db",
+        )));
+    }
     conn.execute_batch(include_str!("sql/node_table.sql"))
         .map_err(|e| {
             AnyError::from(format!(
                 "Failed to execute schema creation statements for .tup/db: {e}"
+            ))
+        })?;
+    io_conn.execute_batch(include_str!("sql/dynio.sql"))
+        .map_err(|e| {
+            AnyError::from(format!(
+                "Failed to execute schema creation statements for .tup/io.db: {e}"
             ))
         })?;
 
@@ -606,16 +624,16 @@ impl DerefMut for TupConnection {
         &mut self.0
     }
 }
-pub fn start_connection(database_url: &str, max_pool_size: u32) -> DbResult<TupConnectionPool> {
+fn start_connection(database_url: &str, max_pool_size: u32, expected_table: &str) -> DbResult<TupConnectionPool> {
     let pool = TupConnectionPool::new(database_url, max_pool_size);
     let conn = pool.get().map_err(|e| {
         AnyError::from(format!(
             "Failed to obtain connection for {database_url}: {e}"
         ))
     })?;
-    if !is_initialized(&conn, "Node") {
+    if !is_initialized(&conn, expected_table) {
         return Err(AnyError::from(String::from(format!(
-            "Node table not found in {database_url}"
+            "{expected_table} table not found in {database_url}"
         ))));
     }
     conn.execute("PRAGMA optimize;", []).map_err(|e| {
@@ -636,6 +654,16 @@ pub fn start_connection(database_url: &str, max_pool_size: u32) -> DbResult<TupC
             println!("Sqlite compile options: {}", i.unwrap_or("_".to_string()));
         }
     }
+    Ok(pool)
+}
+pub fn start_tup_connection(pool_size: u32) -> DbResult<TupConnectionPool> {
+    let pool = start_connection(TUP_DB, pool_size, "Node")
+        .wrap_error(&format!("Failed to open tup database at '{}'", TUP_DB))?;
+    Ok(pool)
+}
+pub fn start_io_connection(pool_size: u32) -> DbResult<TupConnectionPool> {
+    let pool = start_connection(IO_DB, pool_size, "DYNIO")
+        .wrap_error(&format!("Failed to open tup database at '{}'", IO_DB))?;
     Ok(pool)
 }
 

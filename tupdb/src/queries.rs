@@ -122,6 +122,9 @@ pub trait LibSqlQueries {
 
     fn has_no_rules_task_or_globs(&self) -> DbResult<bool>;
     fn is_node_present(&self, node_id: i64) -> bool;
+    
+    fn for_each_rule_in_dir<F>(&self, dir_id: i64, f: F) -> DbResult<()>
+    where F: FnMut(i64) -> DbResult<()>;
 }
 impl LibSqlQueries for rusqlite::Connection {
     fn fetch_node_by_dir_and_name(&self, dir: i64, name: &str) -> DbResult<Node> {
@@ -552,5 +555,16 @@ impl LibSqlQueries for rusqlite::Connection {
             Ok(count == 1)
         }).unwrap_or_default();
         has_node
+    }
+
+    fn for_each_rule_in_dir<F>(&self, dir_id: i64, mut f: F) -> DbResult<()> 
+    where F: FnMut(i64) -> DbResult<()>
+    {
+        self.fetch_rule_nodes_by_dir_inner(dir_id, |row| {
+            let rule_node_id: i64 = row.get(0)?;
+            f(rule_node_id).map_err(internal_sqlite_error)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
