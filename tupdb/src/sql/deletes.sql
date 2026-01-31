@@ -105,6 +105,22 @@ FROM TupfileEntities t
 WHERE p.id IS NULL;
 -- <eos>
 
+-- name: delete_links_not_in_present_list_inner!
+-- Delete links for a tupfile that were not re-inserted during parse
+-- # Parameters
+-- param: tup_id : i64 - id of the tupfile
+DELETE
+FROM NormalLink
+WHERE srcid = :tup_id
+  AND NOT EXISTS (
+    SELECT 1
+    FROM LinkPresentList pl
+    WHERE pl.from_id = NormalLink.from_id
+      AND pl.to_id = NormalLink.to_id
+      AND pl.srcid = NormalLink.srcid
+);
+-- <eos>
+
 -- name: enrich_delete_list_for_missing_dirs_inner!
 -- Add all FILE_SYS nodes whose parent directory id does not exist to ChangeList (change=1)
 -- This captures orphans created when a directory row was deleted without cascading to children.
@@ -183,24 +199,26 @@ from Messages;
 -- <eos>
 
 -- name: delete_groups_with_no_ref_count_inner!
--- Count the number of tupfiles writing to-- <eos>reading from a group and delete the group if there is none
-DELETE
+-- If no rule found writing to or reading from a group then delete the group
+INSERT or REPLACE  INTO ChangeList (id, type, change)
+SELECT Node.id, Node.type, 1
 FROM Node
 WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Group')
   AND NOT EXISTS (SELECT 1
-                  FROM NormalLink
-                  WHERE Node.id = NormalLink.to_id
-                     or Node.id = NormalLink.from_id);
+                  FROM LiveNormalLink
+                  WHERE Node.id = LiveNormalLink.to_id
+                     or Node.id = LiveNormalLink.from_id);
 -- <eos>
 
 -- name: delete_glob_with_no_ref_count_inner!
 -- Count the number of tupfiles reading from a glob and delete the glob if the count is 0
-DELETE
+INSERT or REPLACE  INTO ChangeList (id, type, change)
+SELECT Node.id, Node.type, 1
 FROM Node
 WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Glob')
   AND NOT EXISTS (SELECT 1
-                  FROM NormalLink
-                  WHERE Node.id = NormalLink.from_id);
+                  FROM LiveNormalLink
+                  WHERE Node.id = LiveNormalLink.from_id);
 -- <eos>
 
 -- name: mark_orphan_dirgen_nodes_inner!

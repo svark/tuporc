@@ -361,11 +361,11 @@ impl DynDepTracker {
         Ok(())
     }
     pub fn stop(&mut self) {
-        println!("Stopping trace");
+        //println!("Stopping trace");
         self.kernel_trace.take().map(|kt| {
             kt.stop().expect("unable to stop trace");
         });
-        println!("Done!");
+        //println!("Done!");
     }
 }
 

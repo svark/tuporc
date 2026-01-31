@@ -58,6 +58,16 @@ INSERT or IGNORE into PresentList(id, type)
 Values (:id, :rtype);
 -- <eos>
 
+-- name: add_to_link_present_list!
+-- Add a link to the present list
+-- # Parameters
+-- param: from_id : i64 - id of the node from which the link originates
+-- param: to_id : i64 - id of the node to which the link points
+-- param: srcid : i64 - id of the tupfile that generated this link
+INSERT or IGNORE into LinkPresentList(from_id, to_id, srcid)
+Values (:from_id, :to_id, :srcid);
+-- <eos>
+
 -- name: insert_link_inner!
 -- Insert a link between two nodes
 -- # Parameters
@@ -68,9 +78,12 @@ Values (:id, :rtype);
 -- param: to_type : u8 - type of the node to which the link points
 INSERT OR
 REPLACE
-into NormalLink (from_id, to_id, is_sticky, tup_id, to_type)
-Values (:from_id, :to_id, :is_sticky, :tup_id :to_type)
-ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :is_sticky AND to_type = :to_type;
+into NormalLink (from_id, to_id, is_sticky, srcid, to_type)
+Values (:from_id, :to_id, :is_sticky, NULLIF(:tup_id, -1), :to_type)
+ON CONFLICT (from_id, to_id) DO UPDATE
+    SET is_sticky = :is_sticky,
+        to_type = :to_type,
+        srcid = NULLIF(:tup_id, -1);
 -- <eos>
 
 -- name: insert_node_compact_inner ->

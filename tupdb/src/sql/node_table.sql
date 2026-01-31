@@ -137,7 +137,7 @@ SELECT *
 FROM Node;
 
 CREATE VIEW RawNormalLink AS
-SELECT from_id, to_id, is_sticky, to_type
+SELECT from_id, to_id, is_sticky, to_type, srcid
 FROM NormalLink;
 
 -- LiveNode/LiveNormalLink filter out rows marked for deletion in ChangeList.
@@ -147,7 +147,7 @@ FROM Node n
 WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.change = 1);
 
 CREATE VIEW LiveNormalLink AS
-SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type
+SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type, nl.srcid
 FROM NormalLink nl
 WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.change = 1)
   AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.change = 1);

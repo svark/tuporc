@@ -59,6 +59,7 @@ pub trait LibSqlInserts {
     fn mark_unborn(&self, id: i64) -> Result<()>;
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
+    fn mark_link_present(&self, from_id: i64, to_id: i64, srcid: i64) -> Result<()>;
     fn mark_deleted(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn update_mtime(&self, nodeid: i64, mtime: i64) -> DbResult<()>;
     fn update_node_type(&self, nodeid: i64, row_type: RowType) -> DbResult<()>;
@@ -338,6 +339,10 @@ impl LibSqlInserts for Connection {
     }
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()> {
         self.add_to_present_list(id, *rtype as u8)?;
+        Ok(())
+    }
+    fn mark_link_present(&self, from_id: i64, to_id: i64, srcid: i64) -> Result<()> {
+        self.add_to_link_present_list(from_id, to_id, srcid)?;
         Ok(())
     }
     fn mark_deleted(&self, id: i64, rtype: &RowType) -> Result<()> {

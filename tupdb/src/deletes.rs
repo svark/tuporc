@@ -13,6 +13,7 @@ pub trait LibSqlDeletes {
     fn mark_orphan_dirgen_nodes(&self) -> Result<usize>;
 
     fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>;
+    fn delete_links_not_in_present_list(&self, tup_id: i64) -> Result<usize>;
 
     fn mark_orphans_to_delete(&self) -> Result<()>;
 
@@ -27,6 +28,9 @@ pub trait LibSqlDeletes {
     fn mark_missing_dirs_to_delete(&self) -> Result<usize>;
 
     fn drop_tupfile_entries_table(&self) -> Result<()>;
+
+    fn delete_orphaned_groups(&self) -> Result<()>;
+    fn delete_orphaned_globs(&self) -> Result<()>;
 }
 
 impl LibSqlDeletes for Connection {
@@ -77,6 +81,15 @@ impl LibSqlDeletes for Connection {
         log::debug!("Deleted tupfile_entries not in PresentList table");
         Ok(())
     }
+    fn delete_links_not_in_present_list(&self, tup_id: i64) -> Result<usize> {
+        let sz = self.delete_links_not_in_present_list_inner(tup_id)?;
+        log::debug!(
+            "Deleted {} link(s) not re-inserted for tupfile {}",
+            sz,
+            tup_id
+        );
+        Ok(sz)
+    }
     fn mark_orphans_to_delete(&self) -> Result<()> {
         self.delete_orphaned_tupentries_inner()?;
         log::debug!("Deleted orphaned tupfile_entries");
@@ -118,4 +131,13 @@ impl LibSqlDeletes for Connection {
         Ok(())
     }
 
+    fn delete_orphaned_groups(&self) -> Result<()> {
+        let _ = self.delete_groups_with_no_ref_count_inner()?;
+        Ok(())
+    }
+
+    fn delete_orphaned_globs(&self) -> Result<()> {
+        let _ = self.delete_glob_with_no_ref_count_inner()?;
+        Ok(())
+    }
 }

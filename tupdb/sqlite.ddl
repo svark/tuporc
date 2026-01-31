@@ -16,23 +16,25 @@ CREATE TABLE sqlite_sequence
     name,
     seq
 );
-CREATE UNIQUE INDEX NodeIdIndex on Node (id)
-CREATE INDEX NodeSrcIdIndex on Node (srcid)
-CREATE UNIQUE INDEX NodeDirNameIndex on Node (dir, name)
+CREATE UNIQUE INDEX NodeIdIndex on Node (id);
+CREATE INDEX NodeSrcIdIndex on Node (srcid);
+CREATE UNIQUE INDEX NodeDirNameIndex on Node (dir, name);
 CREATE TABLE NormalLink
 (
     from_id  INTEGER,           -- id of the node that is the source of the link
     to_id    INTEGER,           -- id of the node that is the target of the link
-    issticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
+    is_sticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
     to_type  INTEGER,           -- type of the target node
+    srcid    INTEGER default NULL,  -- id of Tupfile that generated this link; NULL/-1 means non-generated or unknown
     unique (from_id, to_id),    -- from_id and to_id make a unique pair for a link
     FOREIGN KEY (from_id) references Node (id) on DELETE CASCADE,
     FOREIGN KEY (to_id) references Node (id) on DELETE CASCADE,
-    CHECK (issticky in (0, 1) ) -- issticky can only be 0 or 1 indicating if this is hard link where delete should cascade
-)
-CREATE INDEX NormalLinkDstIdx ON NormalLink (to_id)
-CREATE INDEX NormalLinkSrcIdx ON NormalLink (from_id)
-CREATE INDEX NormalLinkTypeIdx ON NormalLink (to_type)
+    CHECK (is_sticky in (0, 1) ) -- is_sticky can only be 0 or 1 indicating if this is hard link where delete should cascade
+);
+CREATE INDEX NormalLinkDstIdx ON NormalLink (to_id);
+CREATE INDEX NormalLinkSrcIdx ON NormalLink (from_id);
+CREATE INDEX NormalLinkTypeIdx ON NormalLink (to_type);
+CREATE INDEX NormalLinkSrcIdIdx ON NormalLink (srcid);
 CREATE TABLE NodeType
 (
     type_index INTEGER PRIMARY KEY not NULL,
@@ -89,3 +91,14 @@ CREATE TABLE TupfileEntities
     id   INTEGER PRIMARY KEY not NULL,
     type INTEGER
 );
+-- LiveNode/LiveNormalLink filter out rows marked for deletion in ChangeList.
+CREATE VIEW LiveNode AS
+SELECT *
+FROM Node n
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.change = 1);
+
+CREATE VIEW LiveNormalLink AS
+SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type, nl.srcid
+FROM NormalLink nl
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.change = 1)
+  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.change = 1);

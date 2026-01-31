@@ -69,6 +69,138 @@ impl PoisonedState {
         *p == 1 && (!self.keep_going || *p > 1)
     }
 }
+use std::collections::{HashSet, VecDeque};
+use incremental_topo::Node as N;
+/// Find one path `start -> ... -> goal` using only IncrementalTopo queries.
+///
+/// This is *debug-only* and can be expensive on big graphs because we don't have adjacency lists.
+/// Strategy:
+///  1) Candidate set = descendants(start) plus start
+///  2) Prune candidates to only those that can still reach `goal` (via contains_transitive_dependency)
+///  3) BFS where "neighbors(u)" are found by scanning `candidates` and testing contains_dependency(u,v)
+fn find_path_via_queries(
+    dag: &IncrementalTopo,
+    start: &N,
+    goal: &N,
+    max_candidates: usize,
+    max_bfs_visits: usize,
+) -> Option<Vec<N>> {
+    if start == goal {
+        return Some(vec![start.clone()]);
+    }
+
+    // Quick sanity: If there's no transitive path, there's nothing to reconstruct.
+    if !dag.contains_transitive_dependency(start, goal) {
+        return None;
+    }
+
+    // 1) Collect descendants(start)
+    let mut candidates: Vec<N> = Vec::new();
+    candidates.push(start.clone());
+
+    // descendants_unsorted yields (topo_rank, Node) pairs
+    if let Ok(it) = dag.descendants_unsorted(start) {
+        for (_rank, n) in it {
+            candidates.push(n);
+            if candidates.len() >= max_candidates {
+                break; // safety cap
+            }
+        }
+    }
+
+    // 2) Prune: keep only nodes that can still reach goal (or are goal)
+    //    This shrinks the scan space massively in many real graphs.
+    let mut pruned: Vec<N> = Vec::with_capacity(candidates.len());
+    for n in &candidates {
+        if n == goal || dag.contains_transitive_dependency(n, goal) {
+            pruned.push(n.clone());
+        }
+    }
+
+    let pruned_set: HashSet<N> = pruned.iter().copied().collect();
+
+    // 3) BFS with "neighbor discovery" by probing contains_dependency(u,v)
+    let mut q = VecDeque::new();
+    let mut parent: HashMap<N, N> = HashMap::new();
+
+    q.push_back(start);
+    parent.insert(*start, *start);
+
+    let mut visits = 0usize;
+
+    while let Some(u) = q.pop_front() {
+        visits += 1;
+        if visits > max_bfs_visits {
+            break;
+        }
+
+        // neighbors(u) = { v in pruned_set | direct edge u->v exists }
+        // contains_dependency checks direct edge existence
+        for v in &pruned {
+            if v == u || parent.contains_key(&v) {
+                continue;
+            }
+            if !pruned_set.contains(&v) {
+                continue;
+            }
+            if dag.contains_dependency(u, v) {
+                parent.insert(*v, *u);
+
+                if v == goal {
+                    // reconstruct path
+                    let mut path = vec![goal.clone()];
+                    let mut cur = goal;
+                    while cur != start {
+                        cur = &parent[cur];
+                        path.push(cur.clone());
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+
+                q.push_back(v);
+            }
+        }
+    }
+
+    None
+}
+
+/// Helper: call this when add_dependency(prec, succ) fails with CycleDetected.
+/// It prints the discovered cycle: succ -> ... -> prec -> succ
+fn print_cycle_on_failure(
+    dag: &IncrementalTopo,
+    prec: N,
+    succ: N,
+    bimap: BiHashMap<i32, incremental_topo::Node>,
+) -> String {
+    // If add_dependency(prec, succ) fails with CycleDetected, then succ reaches prec already.
+    // So we search succ -> ... -> prec.
+    let path = find_path_via_queries(dag, &succ, &prec, 200_000, 5_000_000);
+
+    let prec_db_id = bimap.get_by_right(&prec).cloned();
+    let succ_db_id = bimap.get_by_right(&succ).cloned();
+    match path {
+        Some(p) => {
+            let e1 = format!(" Adding edge prec -> succ would form a cycle:\n attempted edge: {:?} -> {:?}",
+                             prec_db_id, succ_db_id);
+            let e2 =
+            format!(
+                "  existing path:  {}",
+                p.iter().map(|n| format!("{}", bimap.get_by_right(n).unwrap_or(&0))).collect::<Vec<_>>().join(" -> ")
+            );
+            let e3 = format!(
+                "  full cycle:     {} -> {:?}",
+                p.iter().map(|n| format!("{}", bimap.get_by_right(n).unwrap_or(&0))).collect::<Vec<_>>().join(" -> "),
+                succ_db_id
+            );
+            e1 + &e2 + &e3
+        }
+        None => {
+            "CycleDetected reported, but failed to reconstruct a path (caps too small?).".to_string()
+        }
+    }
+}
 
 fn prepare_for_execution(
     connection_pool: TupConnectionPool,
@@ -90,9 +222,13 @@ fn prepare_for_execution(
                 .entry(y)
                 .or_insert_with(|| dag.add_node())
                 .clone();
-            dag.add_dependency(node1, node2).map_err(|e| {
+            dag.add_dependency(node1, node2).map_err(|_| {
                 term_progress.abandon(&pbar, "Cyclic dependency detected!");
-                AnyError::from(format!("Cycle detect when connecting {} {} \n{}", x, y, e.to_string()))
+                let bimap = BiHashMap::<i32, incremental_topo::Node>::from_iter(
+                    unique_node_ids.iter().map(|(x, n)| (*x, n.clone())),
+                );
+                let err = print_cycle_on_failure(&dag, node1, node2, bimap);
+                AnyError::from(err)
             })?;
             term_progress.progress(&pbar);
             Ok(())
@@ -572,7 +708,7 @@ fn exec_nodes_to_run(
         for o in topo_orders_set {
             let max_idx = valid_rules.partition_point(|x| {
                 let id = x.get_id() as i32;
-                topo_order.get(&id).unwrap().cmp(&o) == std::cmp::Ordering::Less
+                topo_order.get(&id).unwrap().cmp(&o) != std::cmp::Ordering::Greater
             }); // we limit ourselves to nodes with same topo order, so that dependent rules are run later
 
             rule_for_child_id.write().clear();
@@ -759,7 +895,7 @@ impl<'a> ProcessIOChecker<'a> {
         let srcid = self.conn.fetch_node_srcid(rule_id as _)?;
         Ok(srcid)
     }
-    
+
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
         //let fetch_outputs = self.fetch_rule_outputs(rule_id)?;
         let mut nodes = Vec::new();
