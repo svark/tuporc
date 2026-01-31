@@ -346,7 +346,7 @@ fn main() -> Result<()> {
                 let tupfiles = {
                     let term_progress = TermProgress::new("Scanning ");
                     let skip_scan = skip_scan || monitor::is_monitor_running();
-                    let tupfiles = scan_and_get_tupfiles(
+                    let tupfiles = scan_and_get_modified_tupfiles(
                         &root,
                         pool.clone(),
                         &term_progress,
@@ -435,7 +435,7 @@ fn main() -> Result<()> {
                         tx.commit()?;
                     }
                     let skip_scan = monitor::is_monitor_running() || skip_scan;
-                    let tupfiles = scan_and_get_tupfiles(
+                    let tupfiles = scan_and_get_modified_tupfiles(
                         &root,
                         connection_pool.clone(),
                         &term_progress,
@@ -564,7 +564,7 @@ fn change_root() -> Result<()> {
     })
 }
 
-fn scan_and_get_tupfiles(
+fn scan_and_get_modified_tupfiles(
     root: &PathBuf,
     connection_pool: TupConnectionPool,
     term_progress: &TermProgress,
