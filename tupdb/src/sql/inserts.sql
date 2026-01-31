@@ -64,11 +64,12 @@ Values (:id, :rtype);
 -- param: from_id : i64 - id of the node from which the link originates
 -- param: to_id : i64 - id of the node to which the link points
 -- param: is_sticky : u8 - whether the link is sticky
+-- param: tup_id : i64 - id of the tupfile that created this link, -1 for NULL
 -- param: to_type : u8 - type of the node to which the link points
 INSERT OR
 REPLACE
-into NormalLink (from_id, to_id, is_sticky, to_type)
-Values (:from_id, :to_id, :is_sticky, :to_type)
+into NormalLink (from_id, to_id, is_sticky, tup_id, to_type)
+Values (:from_id, :to_id, :is_sticky, :tup_id :to_type)
 ON CONFLICT (from_id, to_id) DO UPDATE SET is_sticky = :is_sticky AND to_type = :to_type;
 -- <eos>
 
@@ -92,7 +93,7 @@ Values (:dir, :name, :mtime_ns, :rtype);
 -- param: rtype: u8 - type of the node
 -- param: display_str : &str - string to display in the UI
 -- param: flags : &str - flags for the node
--- param: srcid : i64 - id of the directory containing tupfile that generated the node
+-- param: srcid : i64 - id of tupfile or rule that created this node, -1 for NULL
 INSERT into Node (dir, name, mtime_ns, type, display_str, flags, srcid)
 Values (:dir, :name, :mtime_ns, :rtype, :display_str, :flags, NULLIF(:srcid, -1));
 -- <eos>
@@ -207,8 +208,8 @@ WHERE nl.from_id = :rule_id
 -- # Parameters
 -- param: dir_id : i64 - id of the directory to insert
 -- param: glob_id : i64 - id of the glob to insert
-INSERT or IGNORE INTO NormalLink (from_id, to_id, is_sticky, to_type)
-VALUES (:dir_id, :glob_id, 0, 9);
+INSERT or IGNORE INTO NormalLink (from_id, to_id, is_sticky, srcid, to_type)
+VALUES (:dir_id, :glob_id, 0,  :srcid,9);
 -- <eos>
 
 -- name: add_to_delete_list!

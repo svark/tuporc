@@ -66,16 +66,8 @@ pub trait LibSqlInserts {
     fn update_flags(&self, nodeid: i64, flags: &str) -> DbResult<()>;
     fn update_srcid(&self, nodeid: i64, srcid: i64) -> DbResult<()>;
     fn update_node_sha(&self, nodeid: i64, sha: &str) -> DbResult<()>;
-    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()>;
-    /// Insert or validate a unique Output -> Producer link (Producer can be Rule or Task).
-    /// Enforces that a given output node has at most one producer globally (Rule or Task).
-    /// If an existing different producer is found, returns an error.
-    fn upsert_output_producer_link(
-        &self,
-        output_id: i64,
-        producer_id: i64,
-        producer_type: RowType,
-    ) -> DbResult<()>;
+    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, tup_id: i64, dst_type: RowType) -> DbResult<()>;
+
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
     fn mark_tupfile_outputs(&self, tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()>;
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
@@ -89,7 +81,7 @@ pub trait LibSqlInserts {
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
     fn mark_missing_not_deleted(&self) -> DbResult<()>;
-    
+
     fn prune_modifylist_of_non_rules(&self) -> DbResult<()> ;
 }
 
@@ -379,62 +371,8 @@ impl LibSqlInserts for Connection {
         self.insert_or_replace_node_sha(nodeid, sha)?;
         Ok(())
     }
-    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, dst_type: RowType) -> DbResult<()> {
-        self.insert_link_inner(src, dst, is_sticky, dst_type as u8)?;
-        Ok(())
-    }
-
-    fn upsert_output_producer_link(
-        &self,
-        output_id: i64,
-        producer_id: i64,
-        _producer_type: RowType,
-    ) -> DbResult<()> {
-        // Enforce uniqueness: at most one producer per output.
-        // Check for an existing producer edge to this output.
-        let mut stmt = self.prepare(
-            "SELECT from_id FROM NormalLink WHERE to_id =?1 AND to_type IN(4, 7) LIMIT 1",
-        )?;
-        let mut rows = stmt.query([output_id])?;
-        if let Some(row) = rows.next()? {
-            let existing_from_id: i64 = row.get(0)?;
-            if existing_from_id != producer_id {
-                // Load names for a clearer error message where possible
-                use crate::queries::LibSqlQueries as _;
-                let existing_name = self
-                    .fetch_node_name(existing_from_id)
-                    .unwrap_or_else(|_| existing_from_id.to_string());
-                let candidate_name = self
-                    .fetch_node_name(producer_id)
-                    .unwrap_or_else(|_| producer_id.to_string());
-                let output_name = self
-                    .fetch_node_name(output_id)
-                    .unwrap_or_else(|_| output_id.to_string());
-                return Err(AnyError::from(format!(
-                    "Output {} already has producer {}(id = {}), cannot also be produced by {}(id = {})",
-                    output_name, existing_name, existing_from_id, candidate_name, producer_id
-                )));
-            }
-            // Idempotent: same producer already linked; ensure/update link properties (sticky)
-            // to_type must be the output node's type (GenF/DirGen)
-            use crate::queries::LibSqlQueries as _;
-            let out_node = self
-                .fetch_node_by_id(output_id)
-                .map_err(|e| AnyError::from(e))?
-                .ok_or_else(|| AnyError::from(format!("Output node id {} not found", output_id)))?;
-            let out_ty = *out_node.get_type() as u8;
-            self.insert_link_inner(producer_id, output_id, 1, out_ty)?;
-            return Ok(());
-        }
-        // No existing producer; insert the new link (sticky)
-        // to_type must be the output node's type (GenF/DirGen)
-        use crate::queries::LibSqlQueries as _;
-        let out_node = self
-            .fetch_node_by_id(output_id)
-            .map_err(|e| AnyError::from(e))?
-            .ok_or_else(|| AnyError::from(format!("Output node id {} not found", output_id)))?;
-        let out_ty = *out_node.get_type() as u8;
-        self.insert_link_inner(producer_id, output_id, 1, out_ty)?;
+    fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, tup_id: i64, dst_type: RowType) -> DbResult<()> {
+        self.insert_link_inner(src, dst, is_sticky, tup_id, dst_type as u8)?;
         Ok(())
     }
 

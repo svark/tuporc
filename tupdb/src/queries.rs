@@ -45,6 +45,7 @@ pub trait LibSqlQueries {
     fn for_each_rule_input<F>(&self, rule_id: i64, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
+    fn fetch_node_srcid(&self, node_id: i64) -> DbResult<i64>;
     fn for_each_group_inputs<F>(&self, rule_id: i64, f: F) -> DbResult<()>
     where
         F: FnMut(Node) -> SqlResult<()>;
@@ -219,6 +220,14 @@ impl LibSqlQueries for rusqlite::Connection {
             f(node)
         })?;
         Ok(())
+    }
+    
+    fn fetch_node_srcid(&self, node_id: i64) -> DbResult<i64> {
+        let src_id = self.fetch_node_srcid_inner(node_id, |row| {
+            let src_id: i64 = row.get(0)?;
+            Ok(src_id)
+        })?;
+        Ok(src_id)
     }
 
     fn for_each_group_inputs<F>(&self, group_id: i64, f: F) -> DbResult<()>

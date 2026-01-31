@@ -755,6 +755,11 @@ impl<'a> ProcessIOChecker<'a> {
         })?;
         Ok(nodes)
     }
+    fn fetch_srcid(&mut self, rule_id: i32) -> Result<i64> {
+        let srcid = self.conn.fetch_node_srcid(rule_id as _)?;
+        Ok(srcid)
+    }
+    
     fn fetch_outputs(&mut self, rule_id: i32) -> Result<Vec<Node>> {
         //let fetch_outputs = self.fetch_rule_outputs(rule_id)?;
         let mut nodes = Vec::new();
@@ -784,22 +789,12 @@ impl<'a> ProcessIOChecker<'a> {
         Ok(())
     }
 
-    fn insert_link(&mut self, from_id: i64, to_id: i64, is_output: bool) -> Result<()> {
+    fn insert_link(&mut self, from_id: i64, to_id: i64, tup_id: i64, is_output: bool) -> Result<()> {
         self.conn
-            .insert_link(from_id, to_id, is_output.into(), RowType::Rule)?;
+            .insert_link(from_id, to_id, is_output.into(), tup_id, RowType::Rule)?;
         Ok(())
     }
 
-    fn upsert_output_producer(
-        &mut self,
-        output_id: i64,
-        producer_id: i64,
-        producer_type: RowType,
-    ) -> Result<()> {
-        self.conn
-            .upsert_output_producer_link(output_id, producer_id, producer_type)?;
-        Ok(())
-    }
 }
 
 impl<'b> IoConn<'b> {
@@ -941,6 +936,7 @@ fn verify_node_io(
     let io_vec = io_conn.fetch_io(ch_id)?;
     let node_id = node.get_id();
     let node_name = node.get_name();
+    let tup_id = process_checker.fetch_srcid(node_id as _)?;
     let inps = process_checker.fetch_inputs(node_id as _)?;
     let outs = process_checker.fetch_outputs(node_id as _)?;
     let flags = process_checker.fetch_flags(node_id as _)?;
@@ -953,11 +949,11 @@ fn verify_node_io(
             if input_matches_declared(&inps, &outs, file_node) {
                 continue;
             }
-            link_file_to_node(node_id, process_checker, file_node)?;
+            link_file_to_node(node_id, tup_id, process_checker, file_node)?;
         } else if *ty == EventType::Write as u8 {
-            // Tasks do not declare outputs. Any observed write from a Task is considered its output.
+            // Tasks do not declare outputs. Any observed write from a Task is ignored
             if node.get_type() == &RowType::Task {
-                link_output_to_task(node_id, process_checker, file_node)?;
+                //link_output_to_task(node_id, process_checker, file_node)?;
                 continue;
             }
             // Rules must write their declared outputs only.
@@ -1039,6 +1035,7 @@ fn output_matches_declared(outs: &Vec<Node>, file_node_name: &String) -> bool {
 
 fn link_file_to_node(
     rule_id: i64,
+    tup_id: i64,
     process_checker: &mut ProcessIOChecker,
     file_node: &str,
 ) -> Result<()> {
@@ -1048,69 +1045,13 @@ fn link_file_to_node(
             if let Ok(from_id) =
                 process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid)
             {
-                process_checker.insert_link(from_id, rule_id, false)?;
+                process_checker.insert_link(from_id, rule_id, tup_id, false)?;
             }
         }
     }
     Ok(())
 }
 
-fn link_output_to_task(
-    task_id: i64,
-    process_checker: &mut ProcessIOChecker,
-    file_node: &str,
-) -> Result<()> {
-    if let Ok(dirid) = process_checker.fetch_dirid(file_node) {
-        let p = Path::new(file_node);
-        if let Some(name) = p.file_name() {
-            // Try to find existing node id; if not found, insert a GenF node first.
-            let output_id =
-                match process_checker.fetch_node_id(name.to_string_lossy().as_ref(), dirid) {
-                    Ok(id) => {
-                        // Best-effort: if existing node has no srcid, set it to this task (treat srcid as generic producer)
-                        if let Ok(out_node) = process_checker.fetch_node_by_id(id) {
-                            if out_node.get_srcid() <= 0 {
-                                use tupdb::inserts::LibSqlInserts as _;
-                                let _ = process_checker.conn.update_srcid(id, task_id).map_err(
-                                    |e| {
-                                        eyre!(
-                                            "Failed to set srcid for task output '{}': {}",
-                                            file_node,
-                                            e
-                                        )
-                                    },
-                                )?;
-                            }
-                        }
-                        id
-                    }
-                    Err(_) => {
-                        // Create a GenF node with srcid = task_id (treat srcid as generic producer)
-                        let gen_node = Node::new_file_or_genf(
-                            -1,
-                            dirid,
-                            0,
-                            name.to_string_lossy().to_string(),
-                            RowType::GenF,
-                            task_id,
-                        );
-                        // Upsert node into DB so we can link to it
-                        use tupdb::inserts::LibSqlInserts as _;
-                        let inserted = process_checker
-                            .conn
-                            .fetch_upsert_node_raw(&gen_node, || String::new())
-                            .map_err(|e| {
-                                eyre!("Failed to create task output node '{}': {}", file_node, e)
-                            })?;
-                        inserted.get_id()
-                    }
-                };
-            // Create Producer (Task) -> Output edge with uniqueness enforced globally (Rule or Task)
-            process_checker.upsert_output_producer(output_id, task_id, RowType::Task)?;
-        }
-    }
-    Ok(())
-}
 
 fn input_matches_declared(inps: &Vec<Node>, outs: &Vec<Node>, file_node: &String) -> bool {
     for inp in inps.iter().chain(outs.iter()) {

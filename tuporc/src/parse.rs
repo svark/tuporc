@@ -890,14 +890,17 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
 
 fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) -> Result<()> {
     match link {
-        Link::InputToRule(i, rd) => {
+        Link::InputToRule(i, rd, td) => {
             let input_id = crossref.get_path_db_id_ok(&i)?;
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
-            tx.insert_link(input_id.0, rule_id.0, false.into(), Rule)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
+            tx.insert_link(input_id.0, rule_id.0, false.into(), tup_id, Rule)?;
         }
-        Link::RuleToOutput(rd, out) => {
+        Link::RuleToOutput(rd, out, td) => {
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
             let output_id = crossref.get_path_db_id_ok(&out)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
+            
             // Enforce unique producer per output (Rule or Task): check if an existing producer exists
             {
                 let mut stmt = tx
@@ -935,45 +938,49 @@ fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) ->
                     )
                 })?;
             let out_ty = *out_node.get_type();
-            tx.insert_link(rule_id.0, output_id.0, true.into(), out_ty)?;
+            tx.insert_link(rule_id.0, output_id.0, true.into(), tup_id, out_ty)?;
         }
-        Link::OutputToGroup(out, group) => {
+        Link::OutputToGroup(out, group, td) => {
             let output_id = crossref.get_path_db_id_ok(&out)?;
             let group_id = crossref.get_group_db_id_ok(&group)?;
-            tx.insert_link(output_id.0, group_id.0, true.into(), Group)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
+            tx.insert_link(output_id.0, group_id.0, true.into(), tup_id, Group)?;
         }
-        Link::GroupToRule(group, rd) => {
+        Link::GroupToRule(group, rd, td) => {
             let group_id = crossref.get_group_db_id_ok(&group)?;
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
-            tx.insert_link(group_id.0, rule_id.0, false.into(), Rule)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
+            tx.insert_link(group_id.0, rule_id.0, false.into(), tup_id, Rule)?;
         }
-        Link::EnvToRule(env, rd) => {
+        Link::EnvToRule(env, rd, td) => {
             let env_id = crossref.get_env_db_id_ok(&env)?;
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
-            tx.insert_link(env_id, rule_id.0, true.into(), Rule)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
+            tx.insert_link(env_id, rule_id.0, true.into(), tup_id, Rule)?;
         }
         Link::TupfileToTupfile(pd, tup_desc) => {
             let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
             let tupfile_read_id = crossref.get_path_db_id_ok(&pd)?;
-            tx.insert_link(tupfile_read_id.0, tupfile_id.0, true.into(), TupF)?;
+            tx.insert_link(tupfile_read_id.0, tupfile_id.0, true.into(), tupfile_id.0, TupF)?;
         }
         Link::GlobToTupfile(g, tup_desc) => {
             let glob_id = crossref.get_glob_db_id_ok(&g)?;
             let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
-            tx.insert_link(glob_id.0, tupfile_id.0, true.into(), TupF)?;
+            tx.insert_link(glob_id.0, tupfile_id.0, true.into(), tupfile_id.0, TupF)?;
         }
         Link::TupfileToRule(tup_desc, rd) => {
             let tupfile_id = crossref.get_tup_db_id_ok(&tup_desc)?;
             let rule_id = crossref.get_rule_db_id_ok(&rd)?;
-            tx.insert_link(tupfile_id.0, rule_id.0, false.into(), Rule)?;
+            tx.insert_link(tupfile_id.0, rule_id.0, false.into(), tupfile_id.0, Rule)?;
         }
-        Link::DirToGlob(dir, glob, depth) => {
+        Link::DirToGlob(dir, glob, depth, td) => {
             let dir_id = crossref.get_path_db_id_ok(&dir)?;
             let glob_id = crossref.get_glob_db_id_ok(&glob)?;
+            let tup_id = crossref.get_tup_db_id_ok(&td)?.0;
             let more_dirs = fetch_deeper_dirs(&tx.connection(), glob_id.0, *depth)?;
-            tx.insert_link(dir_id.0, glob_id.0, true.into(), Glob)?;
+            tx.insert_link(dir_id.0, glob_id.0, true.into(), tup_id, Glob)?;
             for d in more_dirs {
-                tx.insert_link(d, glob_id.0, true.into(), Glob)?;
+                tx.insert_link(d, glob_id.0, true.into(), tup_id, Glob)?;
             }
         }
     }
@@ -1005,17 +1012,17 @@ fn add_links_from_to_rules_and_groups(
         let tup_desc = rule_ref.get_tupfile_desc();
         link_collector.add_tupfile_to_rule(&tup_desc, rd);
         for p in rl.get_targets() {
-            link_collector.add_output_to_rule_link(rd, p);
+            link_collector.add_output_to_rule_link(rd, p, &tup_desc);
             if let Some(group_desc) = rl.get_group_desc() {
-                link_collector.add_output_to_group_link(p, &group_desc);
+                link_collector.add_output_to_group_link(p, &group_desc, &tup_desc);
             }
         }
         for s in rl.get_sources() {
-            link_collector.add_input_to_rule_link(s, rd);
-            link_collector.add_group_to_rule_link(s, rd);
+            link_collector.add_input_to_rule_link(s, rd, &tup_desc);
+            link_collector.add_group_to_rule_link(s, rd, &tup_desc);
         }
         for env in rl.get_env_list().iter() {
-            link_collector.add_env_to_rule_link(&env, rd);
+            link_collector.add_env_to_rule_link(&env, rd, &tup_desc);
         }
     }
 }
@@ -1031,9 +1038,9 @@ fn collect_links_from_to_globs(
         let non_pattern_path = glob_path.get_non_pattern_prefix_desc();
         let depth = glob_desc.components().count() - non_pattern_path.components().count();
         if depth > 1 {
-            link_collector.add_dir_to_glob_link_deep(non_pattern_path, glob_desc, depth);
+            link_collector.add_dir_to_glob_link_deep(non_pattern_path, glob_desc, depth, tup_desc);
         } else {
-            link_collector.add_dir_to_glob_link(non_pattern_path, glob_desc);
+            link_collector.add_dir_to_glob_link(non_pattern_path, glob_desc, tup_desc);
         }
     }
     Ok(())
@@ -1829,12 +1836,12 @@ struct Collector {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 enum Link {
-    DirToGlob(PathDescriptor, GlobPathDescriptor, usize),
-    InputToRule(PathDescriptor, RuleDescriptor),
-    RuleToOutput(RuleDescriptor, PathDescriptor),
-    OutputToGroup(PathDescriptor, GroupPathDescriptor),
-    GroupToRule(GroupPathDescriptor, RuleDescriptor),
-    EnvToRule(EnvDescriptor, RuleDescriptor),
+    DirToGlob(PathDescriptor, GlobPathDescriptor, usize, TupPathDescriptor),
+    InputToRule(PathDescriptor, RuleDescriptor, TupPathDescriptor),
+    RuleToOutput(RuleDescriptor, PathDescriptor, TupPathDescriptor),
+    OutputToGroup(PathDescriptor, GroupPathDescriptor, TupPathDescriptor),
+    GroupToRule(GroupPathDescriptor, RuleDescriptor, TupPathDescriptor),
+    EnvToRule(EnvDescriptor, RuleDescriptor, TupPathDescriptor),
     TupfileToTupfile(PathDescriptor, TupPathDescriptor),
     GlobToTupfile(GlobPathDescriptor, TupPathDescriptor),
     TupfileToRule(TupPathDescriptor, RuleDescriptor),
@@ -1843,12 +1850,12 @@ enum Link {
 impl Display for Link {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Link::DirToGlob(d, g, _) => { write!(f, "DirToGlob({}->{})", d, g) },
-            Link::InputToRule(i, r) => { write!(f, "InputToRule({}->{})", i, r) },
-            Link::RuleToOutput(r, o) => { write!(f, "RuleToOutput({}->{})", r, o) },
-            Link::OutputToGroup(o, g) => { write!(f, "OutputToGroup({}->{})", o, g) },
-            Link::GroupToRule(g, r) => { write!(f, "GroupToRule({}->{})", g, r) },
-            Link::EnvToRule(e, r) => { write!(f, "EnvToRule({}->{})", e, r) },
+            Link::DirToGlob(d, g, _, _) => { write!(f, "DirToGlob({}->{})", d, g) },
+            Link::InputToRule(i, r, _) => { write!(f, "InputToRule({}->{})", i, r) },
+            Link::RuleToOutput(r, o, _) => { write!(f, "RuleToOutput({}->{})", r, o) },
+            Link::OutputToGroup(o, g, _) => { write!(f, "OutputToGroup({}->{})", o, g) },
+            Link::GroupToRule(g, r, _) => { write!(f, "GroupToRule({}->{})", g, r) },
+            Link::EnvToRule(e, r, _) => { write!(f, "EnvToRule({}->{})", e, r) },
             Link::TupfileToTupfile(t0, t2) => { write!(f, "TupfileToTupfile({}->{})", t0, t2) },
             Link::GlobToTupfile(g, t) => { write!(f, "GlobToTupfile({}->{})", g, t) },
             Link::TupfileToRule(g, r) => {
@@ -1866,39 +1873,41 @@ impl LinkCollector {
     pub(crate) fn new() -> LinkCollector {
         LinkCollector::default()
     }
-    pub(crate) fn add_output_to_rule_link(&mut self, rd: &RuleDescriptor, output: &PathDescriptor) {
+    pub(crate) fn add_output_to_rule_link(&mut self, rd: &RuleDescriptor, output: &PathDescriptor, tup_desc: &TupPathDescriptor) {
         self.links
-            .insert(Link::RuleToOutput(rd.clone(), output.clone()));
+            .insert(Link::RuleToOutput(rd.clone(), output.clone(), tup_desc.clone()));
     }
 
-    pub(crate) fn add_dir_to_glob_link(&mut self, d: &PathDescriptor, g: &GlobPathDescriptor) {
-        self.links.insert(Link::DirToGlob(d.clone(), g.clone(), 1));
+    pub(crate) fn add_dir_to_glob_link(&mut self, d: &PathDescriptor, g: &GlobPathDescriptor, tup_desc: &TupPathDescriptor) {
+        self.links.insert(Link::DirToGlob(d.clone(), g.clone(), 1, tup_desc.clone()));
     }
     pub(crate) fn add_dir_to_glob_link_deep(
         &mut self,
         d: &PathDescriptor,
         g: &GlobPathDescriptor,
         depth: usize,
+        tup_desc: &TupPathDescriptor
     ) {
         self.links
-            .insert(Link::DirToGlob(d.clone(), g.clone(), depth));
+            .insert(Link::DirToGlob(d.clone(), g.clone(), depth, tup_desc.clone()));
     }
 
-    pub(crate) fn add_input_to_rule_link(&mut self, inp: &InputResolvedType, rd: &RuleDescriptor) {
+    pub(crate) fn add_input_to_rule_link(&mut self, inp: &InputResolvedType, rd: &RuleDescriptor, tup_desc: &TupPathDescriptor) {
         inp.get_resolved_path_desc().map(|p| {
-            self.links.insert(Link::InputToRule(p.clone(), rd.clone()));
+            self.links.insert(Link::InputToRule(p.clone(), rd.clone(), tup_desc.clone()));
         });
     }
     pub(crate) fn add_output_to_group_link(
         &mut self,
         output: &PathDescriptor,
         g: &GroupPathDescriptor,
+        tup_desc: &TupPathDescriptor
     ) {
         self.links
-            .insert(Link::OutputToGroup(output.clone(), g.clone()));
+            .insert(Link::OutputToGroup(output.clone(), g.clone(), tup_desc.clone()));
     }
-    pub(crate) fn add_env_to_rule_link(&mut self, e: &EnvDescriptor, rd: &RuleDescriptor) {
-        self.links.insert(Link::EnvToRule(e.clone(), rd.clone()));
+    pub(crate) fn add_env_to_rule_link(&mut self, e: &EnvDescriptor, rd: &RuleDescriptor, tup_desc: &TupPathDescriptor) {
+        self.links.insert(Link::EnvToRule(e.clone(), rd.clone(), tup_desc.clone()));
     }
     pub(crate) fn add_tupfile_to_tupfile_link(
         &mut self,
@@ -1918,9 +1927,9 @@ impl LinkCollector {
             .insert(Link::GlobToTupfile(g.clone(), tup.clone()));
     }
 
-    pub(crate) fn add_group_to_rule_link(&mut self, i: &InputResolvedType, rd: &RuleDescriptor) {
+    pub(crate) fn add_group_to_rule_link(&mut self, i: &InputResolvedType, rd: &RuleDescriptor, tup_desc : &TupPathDescriptor) {
         i.get_group_ref().map(|g| {
-            self.links.insert(Link::GroupToRule(g.clone(), rd.clone()));
+            self.links.insert(Link::GroupToRule(g.clone(), rd.clone(), tup_desc.clone()));
         });
     }
     pub(crate) fn add_tupfile_to_rule(&mut self, t: &TupPathDescriptor, rd: &RuleDescriptor) {

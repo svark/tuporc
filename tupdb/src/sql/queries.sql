@@ -160,26 +160,6 @@ SELECT id, dir, name
 from TupPathBuf;
 -- <eos>
 
--- name: fetch_dependent_tup_files_by_rule_id&
--- Fetch the dependent tup file ids from rule_id
--- # Parameters
--- param: rule_id : i64 - id of the rule
-SELECT id, dir, name
-from TUPPATHBUF
-where dir in
-      (SELECT dir
-       from Node
-       where type = (SELECT type_index from NodeType where type = 'Rule')
-         and id in
-             (WITH RECURSIVE dependents(x) AS (SELECT :rule_id
-                                               UNION
-                                               SELECT to_id
-                                               FROM LiveNormalLink
-                                                        JOIN dependents ON LiveNormalLink.from_id = x)
-              SELECT DISTINCT x
-              FROM dependents));
--- <eos>
-
 -- NodeSha table queries
 -- name: fetch_node_sha_by_id?
 -- Fetch the sha of a node by id
@@ -475,4 +455,14 @@ SELECT EXISTS(SELECT 1 FROM TupfileEntities WHERE id = :id);
 SELECT 1
 FROM Node
 WHERE type IN (SELECT type_index FROM NodeType WHERE type IN ('Rule', 'Task', 'Glob'));
+-- <eos>
+
+-- name: fetch_node_srcid_inner?
+-- Fetch the srcid of a node
+-- # Parameters
+-- param: node_id : i64 - id of the node
+-- returns: i64
+SELECT srcid
+FROM LiveNode
+WHERE id = :node_id;
 -- <eos>

@@ -24,6 +24,7 @@ CREATE TABLE NormalLink
     to_id     INTEGER,           -- id of the node that is the target of the link
     is_sticky INTEGER NOT NULL,  -- is this a sticky link (statically determined) or not
     to_type   INTEGER,           -- type of the target node
+    srcid     INTEGER default NULL,  -- id of Tupfile that generated this link; NULL/-1 means non-generated or unknown
     unique (from_id, to_id),     -- from_id and to_id make a unique pair for a link
     FOREIGN KEY (from_id) references Node (id) on DELETE CASCADE,
     FOREIGN KEY (to_id) references Node (id) on DELETE CASCADE,
@@ -35,6 +36,7 @@ CREATE TABLE NormalLink
 CREATE INDEX NormalLinkDstIdx ON NormalLink (to_id);
 CREATE INDEX NormalLinkSrcIdx ON NormalLink (from_id);
 CREATE INDEX NormalLinkTypeIdx ON NormalLink (to_type);
+CREATE INDEX NormalLinkSrcIdIdx ON NormalLink (srcid);
 
 
 --- NodeType holds the type of the node and the class it belongs to and its encoding 0-10 that is stored in Node table
