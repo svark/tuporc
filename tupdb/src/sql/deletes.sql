@@ -234,7 +234,7 @@ SELECT id, type, 1 from orphan_dirgens;
 -- Call this after the dependent rules have been added to the modify list or delete list
 DELETE
 FROM ChangeList
-where type not in (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'TupF');
+where type not in (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 -- <eos>
 
 -- name: drop_tupfile_entities_table_inner!

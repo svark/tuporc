@@ -22,8 +22,8 @@ Values (:id, 4, 2)
 -- BEGIN TRANSACTION;
 Insert or IGNORE into ChangeList
 SELECT n.srcid,
-       1, -- rule
-       0  -- change type 1 - ModifyList
+       (SELECT type FROM Node WHERE id = n.srcid),
+       0  -- change type 0 - ModifyList
 from Node n
          join ChangeList c on n.id = c.id
 where n.type = (SELECT type_index from NodeType where NodeType.type = 'GenF');
@@ -37,14 +37,14 @@ SELECT nl.to_id,
        1 -- 1 indicates delete, sticky links trigger a delete on target rule if input to rule is in delete set
 from NormalLink nl
          JOIN DeleteList dl on dl.id = nl.from_id
-WHERE nl.to_type = (SELECT type_index from NodeType where type = 'Rule') -- rule
+WHERE nl.to_type IN (SELECT type_index from NodeType where type = 'Rule' or type = 'Task') -- rule or task
   and nl.is_sticky = 1;
 
 INSERT or ignore into ChangeList
 SELECT nl.to_id, nl.to_type, 0 -- ModifyList non-sticky links trigger only a modify on target rule
 from NormalLink nl
          JOIN ModifyList cl on cl.id = nl.from_id
-WHERE nl.to_type = 1 -- rule type
+WHERE nl.to_type IN (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task') -- rule or task type
   and nl.is_sticky = 0;
 -- COMMIT ;
 -- <eos>
@@ -325,7 +325,7 @@ where nl.from_id = :glob_id
 DELETE
 FROM ChangeList
 WHERE type NOT IN
-      (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'TupF');
+      (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 -- <eos>
 -- name: mark_rules_depending_on_modified_groups_inner!
 -- Enrich the modify list with all rules that depend on modified groups
@@ -335,7 +335,7 @@ from ChangeList cl
          INNER JOIN NormalLink nl on nl.from_id = cl.id
          INNER JOIN NormalLink nl2 on nl.to_id = nl2.from_id
 WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'Group')
-  and nl2.to_type = (SELECT type_index FROM NodeType WHERE type = 'Rule');
+  and nl2.to_type IN (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 -- <eos>
 -- name: push_remaining_tupfile_entries_to_deletelist_inner!
 -- Push the remaining tupfile entries to the delete list

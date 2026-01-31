@@ -89,6 +89,8 @@ pub trait LibSqlInserts {
     fn insert_monitored(&self, path: &str, gen_id: i64, event: i32) -> DbResult<()>;
     fn insert_into_dirpathuf(&self, id: i64, dir: i64, name: &str) -> DbResult<()>;
     fn mark_missing_not_deleted(&self) -> DbResult<()>;
+    
+    fn prune_modifylist_of_non_rules(&self) -> DbResult<()> ;
 }
 
 pub enum UpsertStatus {
@@ -186,7 +188,7 @@ impl LibSqlInserts for Connection {
                 node.get_mtime()
             );
             self.update_mtime_ns(node.get_mtime(), existing_node.get_id())?;
-            if  modify == 0
+            if modify == 0
             {
                 modify = 1;
             }
@@ -195,7 +197,7 @@ impl LibSqlInserts for Connection {
                 .as_ref()
                 .is_ok_and(UpsertStatus::is_unchanged)
             {
-                if  modify == 1  {
+                if modify == 1 {
                     modify = 0u8;
                 }
             }
@@ -208,7 +210,7 @@ impl LibSqlInserts for Connection {
                 node.get_display_str()
             );
             self.update_node_display_str(node.get_display_str(), existing_node.get_id())?;
-            if  modify == 0  {
+            if modify == 0 {
                 modify = 1u8;
             }
         }
@@ -220,7 +222,7 @@ impl LibSqlInserts for Connection {
                 node.get_flags()
             );
             self.update_node_flags(node.get_flags(), existing_node.get_id())?;
-            if  modify == 0  {
+            if modify == 0 {
                 modify = 1u8;
             }
         }
@@ -232,7 +234,7 @@ impl LibSqlInserts for Connection {
                 node.get_srcid()
             );
             self.update_node_srcid(node.get_srcid(), existing_node.get_id())?;
-            if  modify == 0  {
+            if modify == 0 {
                 modify = 1u8;
             }
         }
@@ -254,8 +256,7 @@ impl LibSqlInserts for Connection {
             let modify = self.update_columns(node, &existing_node, compute_sha)?;
             if modify == 1 && allow_modify {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
-            }
-            else if modify == 2 && allow_modify {
+            } else if modify == 2 && allow_modify {
                 self.mark_unborn(existing_node.get_id())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
@@ -282,11 +283,9 @@ impl LibSqlInserts for Connection {
             let modify = self.update_columns(node, &existing_node, compute_sha)?;
             if modify == 1 {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
-            }
-            else if modify == 2 {
+            } else if modify == 2 {
                 self.mark_unborn(existing_node.get_id())?;
-            }
-            else if !present {
+            } else if !present {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
@@ -294,8 +293,7 @@ impl LibSqlInserts for Connection {
             let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
             if node.get_type() == &RowType::GenF {
                 self.mark_unborn(node.get_id())?;
-            }
-            else {
+            } else {
                 self.mark_modified(node.get_id(), node.get_type())?;
             }
             self.mark_present(node.get_id(), node.get_type())?;
@@ -308,11 +306,11 @@ impl LibSqlInserts for Connection {
         node: &Node,
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError> {
-       let existing_node = self
+        let existing_node = self
             .fetch_node_by_dir_and_name_raw(node.get_dir(), node.get_name())
             .unwrap_or(Node::unknown());
-       let alive_node = existing_node.is_valid() && self.is_node_present(existing_node.get_id());
-       if existing_node.get_srcid() != -1 && node.get_srcid() == -1 && alive_node {
+        let alive_node = existing_node.is_valid() && self.is_node_present(existing_node.get_id());
+        if existing_node.get_srcid() != -1 && node.get_srcid() == -1 && alive_node {
             if existing_node.get_srcid() != node.get_srcid() {
                 // fetch previously stored rule name for better error message
                 let name = self
@@ -444,7 +442,7 @@ impl LibSqlInserts for Connection {
         self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
         Ok(())
     }
-    fn mark_tupfile_outputs(&self, mut tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()> {
+    fn mark_tupfile_outputs(&self, mut tupfile_ids: impl Iterator<Item=i64>) -> DbResult<()> {
         tupfile_ids.try_for_each(|tupfile_id| -> DbResult<()> {
             self.add_rules_to_tupfile_entities(tupfile_id)?;
             Ok(())
@@ -539,8 +537,12 @@ impl LibSqlInserts for Connection {
         let _ = self.insert_into_dirpathbuf_inner(id, dir, name)?;
         Ok(())
     }
-     fn mark_missing_not_deleted(&self) -> DbResult<()> {
+    fn mark_missing_not_deleted(&self) -> DbResult<()> {
         self.mark_missing_not_deleted_inner()?;
-         Ok(())
+        Ok(())
+    }
+    fn prune_modifylist_of_non_rules(&self) -> Result<(), AnyError> {
+        self.prune_modifylist_of_non_rules_inner()?;
+        Ok(())
     }
 }

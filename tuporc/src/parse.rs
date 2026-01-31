@@ -1504,6 +1504,7 @@ where
         }
         tx.mark_absent_tupfile_entries_to_delete().context("Mark absent rules to delete list")?;
         tx.mark_orphans_to_delete().context("Mark outputs left without producers")?; // cascade deletion of orphaned nodes
+        tx.prune_modifylist_of_non_rules()?;// clean up modify list of non-rules
         log::info!("Marked orphaned entries to delete");
         tx.delete_nodes()?; // delete all marked nodes
         tx.prune_delete_list()?; // clean up delete list after deletions
