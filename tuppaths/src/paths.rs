@@ -187,6 +187,15 @@ impl MatchingPath {
             parent_descriptor: parent_desc,
         }
     }
+    pub fn join_with_relative<P: AsRef<Path>>(&self, p: P) ->Option<MatchingPath> {
+        self.path_descriptor.join(p).ok().map(|n|
+        MatchingPath {
+            path_descriptor: n,
+            glob_descriptor: self.glob_descriptor.clone(),
+            captured_globs: self.captured_globs.clone(),
+            parent_descriptor: self.parent_descriptor.clone(),
+        })
+    }
     /// Get path descriptor represented by this entry
     pub fn path_descriptor(&self) -> PathDescriptor {
         self.path_descriptor.clone()

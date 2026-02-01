@@ -243,7 +243,7 @@ impl PathDescriptor {
         })
     }
     /// Total ordering helper: shallower paths first; tie-break by osstr values up the parent chain.
-    pub fn dict_less(&self, other: &Self) -> std::cmp::Ordering {
+    pub fn dict_less(&self, other: &Self) -> Ordering {
         // Consistent ordering without allocating component vectors:
         // 1) shallower paths come first, 2) tie-break by walking parents comparing intern ids.
         let depth_self = self.depth();
@@ -262,7 +262,7 @@ impl PathDescriptor {
             a = a.get_parent_descriptor();
             b = b.get_parent_descriptor();
         }
-        std::cmp::Ordering::Equal
+        Ordering::Equal
     }
         /// build a new path descriptor by adding single path component to the current path
     pub fn join_leaf(&self, name: &str) -> PathDescriptor {
@@ -313,6 +313,17 @@ impl PathDescriptor {
         }
         path.pop();
         path
+    }
+    /// Root but one directory in the path
+    pub fn get_root_but_one(&self) -> PathDescriptor {
+        let mut cur_path = self.clone();
+        if cur_path.is_root() {
+            return cur_path;
+        }
+        while !cur_path.get_parent_descriptor().is_root() {
+            cur_path = cur_path.get_parent_descriptor();
+        }
+        cur_path
     }
 
     fn prepare_stored_path(&self) -> NormalPath {
