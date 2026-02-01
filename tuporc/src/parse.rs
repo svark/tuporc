@@ -795,7 +795,7 @@ pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(
                 .cloned()
             {
                 pb.set_message(format!("Parsing :{}", tupfile.get_name()));
-                let res = parser.parse_tupfile_immediate(tupfile.get_name());
+                let res = parser.parse_tupfile_immediate(tupfile.get_name(), None);
                 let statements_to_resolve = match res {
                     Ok(s) => s,
                     Err(e) => {
