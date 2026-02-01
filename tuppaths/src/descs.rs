@@ -56,7 +56,6 @@ impl PathStep {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RelativeDirEntry {
     basedir: PathDescriptor,
-    target: PathDescriptor,
     steps: Vec<PathStep>,
 }
 fn first_common_ancestor(base: PathDescriptor, target: PathDescriptor) -> PathDescriptor {
@@ -83,10 +82,10 @@ fn first_common_ancestor(base: PathDescriptor, target: PathDescriptor) -> PathDe
 
 impl RelativeDirEntry {
     /// Construct a new relative dir entry
-    pub fn new(basedir: PathDescriptor, target: PathDescriptor) -> Self {
+    pub fn new(basedir_: PathDescriptor, target_: PathDescriptor) -> Self {
         // find the first common ancestor and then find the steps to reach the target from the common ancestor
-        let mut basedir = basedir.clone();
-        let mut target = target.clone();
+        let mut basedir = basedir_.clone();
+        let mut target = target_.clone();
         /*debug!(
             "basedir:{:?} target:{:?}",
             basedir.get_path_ref(),
@@ -109,8 +108,7 @@ impl RelativeDirEntry {
         }
         steps.extend(fwd_steps);
         Self {
-            basedir,
-            target,
+            basedir: basedir_,
             steps,
         }
     }
@@ -132,7 +130,22 @@ impl RelativeDirEntry {
         let path = NormalPath::new_from_raw(path_os_string);
         path
     }
-
+    /// get target path descriptor
+    pub fn get_target(&self) -> PathDescriptor {
+        // use steps from base to reach target
+        let mut cur_path = self.basedir.clone();
+        for step in self.components() {
+            match step {
+                PathStep::Backward => {
+                    cur_path = cur_path.get_parent_descriptor();
+                }
+                PathStep::Forward(pd) => {
+                    cur_path = pd.clone();
+                }
+            }
+        }
+        cur_path
+    }
     /// directory components of this path including self
     pub fn components(&self) -> impl Iterator<Item = &PathStep> {
         self.steps.iter()
@@ -143,10 +156,6 @@ impl RelativeDirEntry {
         self.steps.iter().count()
     }
 
-    /// check if this path is root
-    pub fn is_empty(&self) -> bool {
-        self.basedir == self.target
-    }
 }
 
 impl AddAssign<&RelativeDirEntry> for PathDescriptor {

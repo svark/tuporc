@@ -187,6 +187,7 @@ impl MatchingPath {
             parent_descriptor: parent_desc,
         }
     }
+    /// Join a relative path to this matching path to create a new matching path
     pub fn join_with_relative<P: AsRef<Path>>(&self, p: P) ->Option<MatchingPath> {
         self.path_descriptor.join(p).ok().map(|n|
         MatchingPath {
@@ -206,8 +207,9 @@ impl MatchingPath {
     }
 
     /// Get Normalized path represented by this entry
-    pub fn get_path(&self) -> &NormalPath {
-        self.path_descriptor.get_path_ref()
+    pub fn get_path(&self) -> NormalPath {
+       RelativeDirEntry::new(self.parent_descriptor.clone(), self.path_descriptor.clone())
+            .get_target().get_path_ref().clone()
     }
 
     /// Get Normalized path relative to base directory from which parsing started
