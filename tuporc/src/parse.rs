@@ -763,6 +763,13 @@ impl PathSearcher for DbPathSearcher {
             .map(|id| (true, id))
             .unwrap_or((false, -1))
     }
+    fn is_file(&self, pd: &PathDescriptor) -> (bool, i64) {
+        let conn = self.conn.get().expect("connection not found");
+        let node = conn.fetch_node_by_path(pd.get_path_ref())
+            .map(| n| (true, n.get_id().clone(), n.get_type().clone()))
+            .unwrap_or((false, -1, RowType::Dir));
+        (node.0 && node.2.is_file(), node.1)
+    }
 }
 
 pub(crate) fn parse_tupfiles_in_db_for_dump<P: AsRef<Path>>(

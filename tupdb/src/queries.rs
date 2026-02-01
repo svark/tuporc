@@ -71,6 +71,8 @@ pub trait LibSqlQueries {
     ) -> DbResult<Option<i64>>;
 
     fn fetch_dirid_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<i64>;
+    
+   fn fetch_node_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<Node>;
 
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf>;
 
@@ -313,6 +315,14 @@ impl LibSqlQueries for rusqlite::Connection {
             Ok(dir_id)
         })?;
         Ok(dir_id)
+    }
+    
+    fn fetch_node_by_path<P: AsRef<Path>>(&self, path: P) -> DbResult<Node> {
+        let parent = path.as_ref().parent().unwrap_or(Path::new("."));
+        let name = path.as_ref().file_name().unwrap_or_default().to_string_lossy();
+        let dir_id = self.fetch_dirid_by_path(parent)?;
+        let node = self.fetch_node_by_dir_and_name(dir_id, &name)?;
+        Ok(node)
     }
 
     fn fetch_dirpath(&self, dir_id: i64) -> DbResult<PathBuf> {
