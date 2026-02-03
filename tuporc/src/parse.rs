@@ -318,8 +318,8 @@ impl NodeToInsert {
         None
     }
 
-    // use this only in the order of nodes returned by the parser
-    // for example when inserting nodes in the database, rules should be inserted first before outputs.
+    // use this only in the order of nodes returned by the parser,
+    // for example, when inserting nodes in the database, rules should be inserted first before outputs.
     // that way the srcid of outputs can be resolved via crossref
     pub fn get_node(
         &self,
@@ -511,7 +511,7 @@ fn receive_resolved_statements(
     conn_ref: &TupConnectionRef,
     rwbufs: &ReadWriteBufferObjects,
     poisoned: &Arc<AtomicBool>,
-    insert_sender: &Sender<TupBuildGraphSnapshot>,
+    insert_sender: Sender<TupBuildGraphSnapshot>,
 ) -> Result<()> {
     while let Ok(to_resolve) = receiver.recv() {
         let tup_desc = to_resolve.get_cur_file_desc().clone();
@@ -524,12 +524,13 @@ fn receive_resolved_statements(
             ))
             .inspect_err(|e| log::error!("error found resolving stmts in {tup_desc} -- {e}"))?;
         pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
-        let _cancelled = check_cancel()?;
-        if poisoned.load(Ordering::SeqCst) {
-            break;
+        if is_cancelled() || poisoned.load(Ordering::SeqCst) {
+            log::warn!("cancelled while resolving tupfile {}", tup_desc);
+            return Ok(());
         }
         term_progress.update_pb(&pb_ref);
-        collect_db_insertions(&conn_ref, resolved_rules, &rwbufs, insert_sender)?;
+        collect_db_insertions(&conn_ref, resolved_rules, &rwbufs, &insert_sender, poisoned)
+            .wrap_err("Collecting db insertions failed")?;
     }
     Ok(())
 }
@@ -654,6 +655,9 @@ impl DbPathSearcher {
                 })?;
         Ok(match_count)
     }
+    fn get_connection(&self) -> Result<TupConnection> {
+        self.conn.get().context("Connection not found")
+    }
 }
 impl PathDiscovery for DbPathSearcher {
     fn discover_paths_with_cb(
@@ -765,9 +769,10 @@ impl PathSearcher for DbPathSearcher {
     }
     fn is_file(&self, pd: &PathDescriptor) -> (bool, i64) {
         let conn = self.conn.get().expect("connection not found");
-        let node = conn.fetch_node_by_path(pd.get_path_ref())
-            .map(| n| (true, n.get_id().clone(), n.get_type().clone()))
-            .unwrap_or((false, -1, RowType::Dir));
+        let node = conn
+            .fetch_node_by_path(pd.get_path_ref())
+            .map(|n| (true, n.get_id().clone(), n.get_type().clone()))
+            .unwrap_or((false, -1, Dir));
         (node.0 && node.2.is_file(), node.1)
     }
 }
@@ -1013,7 +1018,7 @@ fn insert_links(
     crossref: &mut CrossRefMaps,
     link_collector: &LinkCollector,
 ) -> Result<()> {
-    // collect all un-added groups and add them in a single transaction.
+    // collect all unadded groups and add them in a single transaction.
     for l in link_collector.links() {
         insert_link(&tx, l, crossref)
             .context(format!("Inserting link {} in tupfile {}", l, tup_id,))?;
@@ -1081,7 +1086,7 @@ fn fetch_deeper_dirs(
 }
 
 // Gather all the modified tupfiles within directories specified
-// Processing Tupfiles within small set of directories with leave db in an incomplete state but is useful for debugging
+// Processing Tupfiles within a small set of directories with leave db in an incomplete state but is useful for debugging
 pub fn gather_modified_tupfiles(
     conn: &mut TupConnection,
     targets: &Vec<String>,
@@ -1092,20 +1097,20 @@ pub fn gather_modified_tupfiles(
     let term_progress = TermProgress::new("Gathering modified Tupfiles");
     term_progress.pb_main.set_message("Creating temp tables");
     let time = create_dirpathbuf_temptable(conn)
-        .with_context(|| "Failed to create and fill dirpathbuf table")?;
+        .with_context(|| "Failed to create and fill DirPathBuf table")?;
     #[cfg(debug_assertions)]
-    term_progress.set_message("Created dirpathbuf table in {time:?}");
+    term_progress.set_message("Created DirPathBuf table in {time:?}");
     let _ = time;
     term_progress.update_main();
 
     create_tuppathbuf_temptable(conn)
-        .with_context(|| "Failed to create and fill tuppathbuf table")?;
+        .with_context(|| "Failed to create and fill TupPathBuf table")?;
     term_progress.update_main();
 
     create_presentlist_temptable(conn)?;
 
     term_progress.update_main();
-    // trigger reparsing of Tupfiles which contain included modified Tupfiles or modified globs
+    // trigger reparsing of Tupfiles, which contain included modified Tupfiles or modified globs
     conn.mark_tupfile_deps()
         .context("Mark tupfile dependencies")?; //-- included tup files -> Tupfile
     for (i, sha) in conn.fetch_modified_globs()?.into_iter() {
@@ -1135,7 +1140,7 @@ pub fn gather_modified_tupfiles(
         .pb_main
         .set_message("Looking up modified Tupfiles");
     conn.for_each_modified_tupfile(|n: Node| {
-        // name stores full path here
+        // name stores a full path here
         debug!("tupfile to parse:{}", n.get_name());
         if target_dirs_and_names.is_empty()
             || target_dirs_and_names
@@ -1155,7 +1160,7 @@ pub fn gather_tupfiles(mut conn: TupConnection) -> Result<Vec<Node>> {
     create_dirpathbuf_temptable(&mut conn)?;
 
     conn.for_each_tupnode(|n: Node| {
-        // the field `name` in n stores full path here
+        // the field `name` in n stores the full path here
         tupfiles.push(n);
         Ok(())
     })?;
@@ -1223,6 +1228,9 @@ fn check_cancel() -> Result<()> {
     }
     Ok(())
 }
+fn is_cancelled() -> bool {
+    cancel_flag().load(Ordering::SeqCst)
+}
 /// A snapshot of the nodes and links to insert for a single tupfile
 #[derive(Debug, Clone)]
 struct TupBuildGraphSnapshot {
@@ -1264,9 +1272,9 @@ fn collect_db_insertions(
     resolved_rules: ResolvedRules,
     rwbufs: &ReadWriteBufferObjects,
     insert_sender: &Sender<TupBuildGraphSnapshot>,
+    poisoned: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let (envs_to_insert, mut nodes) =
-        collect_nodes_to_insert(&rwbufs, &resolved_rules, check_cancel)?;
+    let (envs_to_insert, mut nodes) = collect_nodes_to_insert(&rwbufs, &resolved_rules, poisoned)?;
 
     for node in nodes.iter_mut() {
         node.force_save_hash(conn_ref, rwbufs.get());
@@ -1289,11 +1297,38 @@ fn collect_db_insertions(
 }
 
 // Spawn multiple threads to parse tupfiles in parallel within a scope
-fn record_error(store: &Arc<Mutex<Option<Report>>>, err: Report) {
+fn record_error(
+    store: &Arc<Mutex<Vec<Report>>>,
+    err: Report,
+    keep_going: bool,
+    poisoned: &Arc<AtomicBool>,
+) {
     let mut guard = store.lock().expect("poisoned error store");
-    if guard.is_none() {
-        *guard = Some(err);
+    log::error!("Error: {}", err);
+
+    if keep_going || guard.is_empty() {
+        guard.push(err);
     }
+    if !keep_going {
+        poisoned.store(true, Ordering::SeqCst);
+    }
+}
+
+fn take_errors(store: &Arc<Mutex<Vec<Report>>>, keep_going: bool) -> Option<Report> {
+    let mut guard = store.lock().expect("poisoned error store");
+    if guard.is_empty() {
+        return None;
+    }
+    if !keep_going {
+        log::error!("Errors encountered during parsing, exiting");
+        return Some(guard.remove(0));
+    }
+    let errs = std::mem::take(&mut *guard);
+    let mut msg = String::from("Multiple errors occurred:\n");
+    for (idx, err) in errs.iter().enumerate() {
+        msg.push_str(&format!("{}. {}\n", idx + 1, err));
+    }
+    Some(eyre!(msg))
 }
 
 fn parse_in_scope<'scope, 'b>(
@@ -1313,7 +1348,7 @@ where
 
     term_progress.suspend();
     let poisoned = Arc::new(AtomicBool::new(false));
-    let first_err = Arc::new(Mutex::new(None));
+    let first_err = Arc::new(Mutex::new(Vec::new()));
     let total_tupfiles = tupfiles
         .iter()
         .filter(|x| !x.get_name().ends_with(".lua"))
@@ -1357,10 +1392,11 @@ where
                     parser_clone,
                     sender,
                     &pb,
-                    poisoned,
+                    poisoned.clone(),
                     keep_going,
                 ) {
-                    record_error(&first_err, e);
+                    term_progress.abandon(&pb, "Error parsing!".to_string());
+                    record_error(&first_err, e, keep_going, &poisoned);
                 }
             });
         });
@@ -1393,9 +1429,10 @@ where
             let term_progress = term_progress.clone();
             s.spawn(move |_| {
                 let result = (|| -> Result<()> {
-                    let conn = parser_c.get_searcher().conn.get()?;
+                    let searcher = parser_c.get_searcher();
+                    let conn = searcher.get_connection()?;
                     let conn_ref = conn.as_ref();
-                    let status = receive_resolved_statements(
+                    receive_resolved_statements(
                         &parser_c,
                         receiver,
                         &pb_ref,
@@ -1403,14 +1440,13 @@ where
                         &conn_ref,
                         &rwbufs,
                         &poisoned,
-                        &insert_sender,
+                        insert_sender,
                     )
-                    .context("Resolving statements in tupfiles");
-                    drop(insert_sender);
-                    handle_result(&term_progress, &poisoned, &pb_ref, status)
+                    .context("Resolving statements in tupfiles")
                 })();
                 if let Err(e) = result {
-                    record_error(&first_err, e);
+                    term_progress.abandon(&pb_ref, format!("Error resolving statements! {e}"));
+                    record_error(&first_err, e, keep_going, &poisoned);
                 }
             });
         }
@@ -1439,11 +1475,17 @@ where
                         }
                         let path = tupfile_lua.get_name();
                         pb_ref.set_message(format!("Parsing :{}", path));
-                        let (resolved_rules, _) = parser_c.parse(path).map_err(|e| {
-                            eyre!("Error: {}", parser_c.read_write_buffers().display_str(&e))
-                        })?;
+                        let (resolved_rules, _) = parser_c
+                            .parse(path)
+                            .context(format!("Parsing lua {}", path))?;
                         let conn_ref = conn.as_ref();
-                        collect_db_insertions(&conn_ref, resolved_rules, &rwbufs, &insert_sender)?;
+                        collect_db_insertions(
+                            &conn_ref,
+                            resolved_rules,
+                            &rwbufs,
+                            &insert_sender,
+                            &poisoned,
+                        )?;
                         pb_ref.inc(1);
                         pb_ref.set_message(format!("Done parsing {}", path));
                     }
@@ -1451,10 +1493,12 @@ where
                     pb_ref.finish_and_clear();
                     Ok(())
                 })();
-                if let Err(e) =
-                    handle_result(&term_progress, &poisoned, lua_pb.as_ref().unwrap(), res)
-                {
-                    record_error(&first_err, e);
+                if let Err(e) = res {
+                    term_progress.abandon(
+                        &lua_pb_worker.unwrap(),
+                        format!("Error parsing lua build files: {}", e),
+                    );
+                    record_error(&first_err, e, keep_going, &poisoned);
                 }
             });
         }
@@ -1473,12 +1517,12 @@ where
             crossbeam::select! {
                 recv(ticker) -> _ => {
                     if poisoned.load(Ordering::SeqCst) {
-                        debug!("recvd user interrupt");
+                        log::error!("recvd user interrupt");
                         loop_aborted = true;
                         break;
                     }
                     if check_cancel().is_err() {
-                        debug!("insertion cancelled");
+                        log::error!("insertion cancelled");
                         loop_aborted = true;
                         break;
                     }
@@ -1519,7 +1563,7 @@ where
         if loop_aborted {
             let _ = tx.rollback();
             term_progress.abandon(&pb_insert, "Insertion aborted");
-            if let Some(err) = first_err.lock().expect("poisoned error store").take() {
+            if let Some(err) = take_errors(&first_err, keep_going) {
                 return Err(err);
             }
             return Ok(());
@@ -1534,7 +1578,7 @@ where
             .context("Delete rules to delete list")?;
         tx.delete_orphaned_groups()
             .context("Delete groups with no ref count")?;
-        tx.prune_modifylist_of_non_rules()?; // clean up modify list of non-rules
+        tx.prune_modifylist_of_non_rules()?; // clean up ModifyList of non-rules
         log::info!("Marked orphaned entries to delete");
         tx.delete_nodes()?; // delete all marked nodes
         tx.prune_delete_list()?; // clean up delete list after deletions
@@ -1553,30 +1597,10 @@ where
     term_progress.clear();
     log::info!("Finished parse phase");
     log::info!("Finished resolving statements from parsed tupfiles");
-    if let Some(err) = first_err.lock().expect("poisoned error store").take() {
+    if let Some(err) = take_errors(&first_err, keep_going) {
         return Err(err);
     }
     Ok(())
-}
-
-fn handle_result(
-    term_progress: &TermProgress,
-    poisoned: &Arc<AtomicBool>,
-    pb_ref: &ProgressBar,
-    status: Result<()>,
-) -> Result<()> {
-    match status {
-        Err(e) => {
-            log::error!("Error: {}", e);
-            term_progress.abandon(&pb_ref, format!("Aborted processing parsed tupfiles : {e}"));
-            poisoned.store(true, Ordering::SeqCst);
-            Err(e)
-        }
-        _ => {
-            // expected to be cleared already
-            Ok(())
-        }
-    }
 }
 
 fn insert_nodes_wrapper(
@@ -1629,7 +1653,7 @@ fn parse_one_tupfile(
     let tupfile_name = tupfile.get_name();
     if poisoned.load(Ordering::SeqCst) {
         drop(sender);
-        term_progress.abandon(&pb, format!("Aborted parsing {tupfile_name}"));
+        term_progress.abandon(&pb, format!("Aborted parsing #{tupfile_name}#"));
         bail!("Parsing aborted due to error or cancellation");
     }
     log::info!("Parsing :{}", tupfile_name);
@@ -1746,7 +1770,7 @@ pub(crate) fn insert_path(
         cur_parent_id = next_id;
     }
 
-    // Finally insert the path itself (if still missing) and record it.
+    // Finally, insert the path itself (if still missing) and record it.
     if let Some((id, parent_id)) = cross_ref_maps.get_path_db_id(pd) {
         return Ok((id, parent_id));
     }
@@ -1764,7 +1788,7 @@ pub(crate) fn insert_path(
     Ok((nid, cur_parent_id))
 }
 
-/// inserts a node into the database. This is an upsert operation and will not modify the node if it already exists with same values
+/// Inserts a node into the database. This is an upsert operation and will not modify the node if it already exists with the same values
 fn insert_node_in_dir(
     tx: &TupTransaction,
     name: Cow<str>,
@@ -1809,7 +1833,7 @@ pub(crate) fn compute_path_hash(is_dir: bool, pbuf: HashedPath) -> String {
     }
 }
 
-/// Before we insert a child node, insert its parent and record its db id in cross_ref_maps against parent's PathDescriptor
+/// Before we insert a child node, insert its parent and record its db id in cross_ref_maps against the parent's PathDescriptor
 fn ensure_parent_inserted(
     tx: &TupTransaction,
     path_buffers: &impl PathBuffers,
@@ -1820,7 +1844,7 @@ fn ensure_parent_inserted(
     let pardir_type = if is_generated(&rtype) { DirGen } else { Dir };
     let parent_path = path_buffers.get_path(parent);
     if pardir_type.eq(&DirGen) {
-        // make sure directory is physically present for generated files
+        // make sure the directory is physically present for generated files
         let parent_path_from_root = path_buffers.get_root_dir().join(parent_path);
         if !parent_path_from_root.exists() {
             fs::create_dir_all(parent_path_from_root).map_err(|e| eyre!(e.to_string()))?;
@@ -1834,7 +1858,7 @@ fn ensure_parent_inserted(
     let (dir, pardir) = find_by_path(parent_path.as_path(), &tx.connection())
         .map(|n| (n.get_id(), n.get_dir()))
         .or_else(|_| -> Result<(i64, i64)> {
-            // try adding parent directory if not in db
+            // try adding a parent directory if not in db
             let (dir, pardir) =
                 insert_path(tx, path_buffers, parent, cross_ref_maps, pardir_type, -1)?;
             Ok((dir, pardir))
@@ -1842,7 +1866,7 @@ fn ensure_parent_inserted(
     Ok((dir, pardir))
 }
 
-//  Collector records the work done in inserting/verifying correctness of tup nodes into db.
+//  Collector records the work done in inserting/verifying the correctness of tup nodes into db.
 #[derive(Debug, Clone)]
 struct Collector {
     processed_globs: HashSet<PathDescriptor>,
@@ -2038,17 +2062,17 @@ impl Collector {
     fn nodes(self) -> Vec<NodeToInsert> {
         self.nodes_to_insert
     }
-    fn collect_output(&mut self, p: &PathDescriptor, srcid: SrcId) -> Result<()> {
+    fn collect_output(&mut self, p: &PathDescriptor, srcid: SrcId) {
         let root = self.read_write_buffer_objects.get_root();
         let hash = compute_hash::<&Path>(root.join(p.get_path_ref()).as_ref()).ok();
         self.nodes_to_insert
             .push(NodeToInsert::GeneratedFile(p.clone(), srcid, hash));
-        Ok(())
     }
 
     pub(crate) fn add_output(&mut self, p0: &PathDescriptor, id: SrcId) -> Result<()> {
         if self.processed_outputs.insert(p0.clone()) {
-            self.collect_output(p0, id)
+            self.collect_output(p0, id);
+            Ok(())
         } else {
             Err(eyre!(
                 "output already processed: {:?}",
@@ -2057,30 +2081,26 @@ impl Collector {
         }
     }
 
-    fn collect_glob(&mut self, p: &GlobPathDescriptor, tupid: TupPathDescriptor) -> Result<()> {
+    fn collect_glob(&mut self, p: &GlobPathDescriptor, tupid: TupPathDescriptor) {
         self.nodes_to_insert
             .push(NodeToInsert::Glob(p.clone(), tupid, None));
-        Ok(())
     }
 
-    fn collect_excluded(&mut self, p: &PathDescriptor) -> Result<()> {
+    fn collect_excluded(&mut self, p: &PathDescriptor) {
         self.nodes_to_insert
             .push(NodeToInsert::ExcludedFile(p.clone()));
-        Ok(())
     }
 
-    fn collect_input(&mut self, p: &PathDescriptor) -> Result<()> {
+    fn collect_input(&mut self, p: &PathDescriptor) {
         debug!("collecting input: {:?}", p.get_file_name().to_string());
         self.nodes_to_insert
             .push(NodeToInsert::InputFile(p.clone(), None));
-        Ok(())
     }
 
-    pub(crate) fn add_tupfile(&mut self, p0: &PathDescriptor) -> Result<()> {
+    pub(crate) fn add_tupfile(&mut self, p0: &PathDescriptor) {
         if self.processed.insert(p0.clone()) {
-            self.collect_input(p0)?;
+            self.collect_input(p0);
         }
-        Ok(())
     }
 
     fn collect_rule(&mut self, p: &RuleDescriptor, _hash: Option<String>) {
@@ -2095,30 +2115,24 @@ impl Collector {
         }
     }
 
-    fn add_input_for_insert(
-        &mut self,
-        resolved_input: &InputResolvedType,
-        id: TupPathDescriptor,
-    ) -> Result<()> {
+    fn add_input_for_insert(&mut self, resolved_input: &InputResolvedType, id: TupPathDescriptor) {
         if let Some(p) = resolved_input.get_glob_path_desc() {
             if self.processed_globs.insert(p.clone()) {
-                self.collect_glob(&p, id)?;
+                self.collect_glob(&p, id);
             }
         }
         if let Some(p) = resolved_input.get_resolved_path_desc() {
             if self.processed.insert(p.clone()) {
-                self.collect_input(&p)?;
+                self.collect_input(&p);
             }
         }
         self.add_group(resolved_input.get_group_input());
-        Ok(())
     }
 
-    fn add_excluded(&mut self, p: PathDescriptor) -> Result<()> {
+    fn add_excluded(&mut self, p: PathDescriptor) {
         if self.processed.insert(p.clone()) {
-            self.collect_excluded(&p)?;
+            self.collect_excluded(&p);
         }
-        Ok(())
     }
     fn add_task_node(&mut self, task_desc: &TaskDescriptor, hash: Option<String>) -> Result<()> {
         let task_instance = self.read_write_buffer_objects.get_task(task_desc);
@@ -2149,7 +2163,7 @@ impl Collector {
         }
         Ok(())
     }
-    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor, hash: Option<String>) -> Result<()> {
+    fn add_rule_node(&mut self, rule_desc: &RuleDescriptor, hash: Option<String>) {
         let rule_formula = self.read_write_buffer_objects.get_rule(rule_desc);
         let name = rule_formula.get_rule_str();
         let ref ph = self.read_write_buffer_objects;
@@ -2169,7 +2183,6 @@ impl Collector {
             }
             self.collect_rule(rule_desc, hash);
         }
-        Ok(())
     }
     pub(crate) fn add_group(&mut self, p0: Option<GroupPathDescriptor>) {
         if let Some(group) = p0 {
@@ -2262,17 +2275,14 @@ fn insert_nodes(
     Ok(())
 }
 
-fn collect_nodes_to_insert<F>(
+fn collect_nodes_to_insert(
     read_write_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
-    check_cancel: F,
-) -> Result<(HashSet<EnvDescriptor>, Vec<NodeToInsert>), Report>
-where
-    F: Fn() -> Result<(), Report>,
-{
+    poisoned: &Arc<AtomicBool>,
+) -> Result<(HashSet<EnvDescriptor>, Vec<NodeToInsert>), Report> {
     let mut envs_to_insert = HashSet::new();
 
-    // collect all un-added groups and add them in a single transaction.
+    // collect all unadded groups and add them in a single transaction.
     let mut nodes: Vec<_> = {
         let mut collector = Collector::new(read_write_buf.clone())?;
         for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
@@ -2281,7 +2291,7 @@ where
                 let tupid = tuploc.unwrap().get_tupfile_desc();
                 let rd = resolvedtask.get_task_descriptor();
                 for s in resolvedtask.get_deps() {
-                    collector.add_input_for_insert(s, tupid.clone())?;
+                    collector.add_input_for_insert(s, tupid.clone());
                 }
                 collector.add_task_node(rd, None)?;
                 let env_desc = resolvedtask.get_env_list();
@@ -2290,14 +2300,14 @@ where
         }
 
         for tupfile in resolved_rules.get_tupfiles_read() {
-            collector.add_tupfile(tupfile)?;
+            collector.add_tupfile(tupfile);
         }
         for rl in resolved_rules.get_resolved_links().iter() {
             let rd = rl.get_rule_desc();
             let rule_ref = rl.get_rule_ref();
             let tup_desc = rule_ref.get_tupfile_desc();
             //let dir = get_dir(&tup_desc, &crossref)?;
-            collector.add_rule_node(rd, None)?;
+            collector.add_rule_node(rd, None);
             for p in rl.get_targets() {
                 collector.add_output(p, SrcId::RuleId(rl.get_rule_desc().clone()))?
             }
@@ -2305,15 +2315,18 @@ where
             collector.add_group(group.cloned());
 
             for s in rl.get_sources() {
-                collector.add_input_for_insert(s, tup_desc.clone())?;
+                collector.add_input_for_insert(s, tup_desc.clone());
             }
             for p in rl.get_excluded_targets() {
-                collector.add_excluded(p.clone())?
+                collector.add_excluded(p.clone())
             }
             for env in rl.get_env_list().iter() {
                 collector.add_env(&env);
             }
-            check_cancel()?;
+        }
+        if is_cancelled() || poisoned.load(Ordering::SeqCst) {
+            log::error!("Collecting nodes to insert cancelled");
+            return Ok((envs_to_insert, Vec::new()));
         }
         collector.nodes()
     };
