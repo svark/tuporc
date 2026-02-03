@@ -78,7 +78,7 @@ impl NormalPath {
     /// Construct consuming the given pathbuf
     pub fn new(p: PathBuf) -> NormalPath {
         if p.as_os_str().is_empty() || p.as_os_str() == "/" || p.as_os_str() == "\\" {
-            NormalPath::default()
+            NormalPath{ inner: PathBuf::from(".")}
         } else {
             NormalPath { inner: p }
         }
