@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 pub use crate::descs::{GlobPathDescriptor, GroupPathDescriptor, PathDescriptor, RelativeDirEntry};
+use crate::descs::RelativePath;
 use crate::errors::Error;
 use crate::glob::{GlobBuilder, GlobMatcher};
 //use tap::Pipe;
@@ -205,13 +206,13 @@ impl MatchingPath {
     }
 
     /// Get Normalized path represented by this entry
-    pub fn get_path(&self) -> NormalPath {
+    pub fn get_path(&self) -> RelativePath {
        RelativeDirEntry::new(self.parent_descriptor.clone(), self.path_descriptor.clone())
-            .get_target().get_path_ref().clone()
+            .get_target()
     }
 
     /// Get Normalized path relative to base directory from which parsing started
-    pub fn get_relative_path(&self) -> NormalPath {
+    pub fn get_relative_path(&self) -> RelativePath {
         RelativeDirEntry::new(self.parent_descriptor.clone(), self.path_descriptor.clone())
             .get_path()
     }

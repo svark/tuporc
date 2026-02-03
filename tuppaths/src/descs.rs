@@ -113,7 +113,7 @@ impl RelativeDirEntry {
         }
     }
     /// Normalized path relative to basedir
-    pub fn get_path(&self) -> NormalPath {
+    pub fn get_path(&self) -> RelativePath {
         let mut first = true;
         let mut path_os_string = OsString::new();
         for step in self.components() {
@@ -128,10 +128,10 @@ impl RelativeDirEntry {
             });
         }
         let path = NormalPath::new_from_raw(path_os_string);
-        path
+        path.into()
     }
     /// get target path descriptor
-    pub fn get_target(&self) -> PathDescriptor {
+    pub fn get_target(&self) -> RelativePath {
         // use steps from base to reach target
         let mut cur_path = self.basedir.clone();
         for step in self.components() {
@@ -144,7 +144,7 @@ impl RelativeDirEntry {
                 }
             }
         }
-        cur_path
+        cur_path.get_path_ref().clone().into()
     }
     /// directory components of this path including self
     pub fn components(&self) -> impl Iterator<Item = &PathStep> {
@@ -552,3 +552,37 @@ pub type BinDescriptor = Descriptor<BinPathEntry>;
 
 /// ```TupPathDescriptor``` is a unique id given to a tupfile
 pub type TupPathDescriptor = PathDescriptor;
+/// Cousin of [NormalPath] that only has relative path components
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RelativePath {
+    inner: PathBuf,
+}
+impl RelativePath {
+    /// construct a new relative path from a pathbuf
+    pub fn new(inner: PathBuf) -> Self {
+        Self { inner }
+    }
+    /// join a relative path with a path component
+    pub fn join<P: AsRef<Path>>(&self, other: P) -> Self {
+        Self::new(self.inner.join(other))
+    }
+    /// get the pathbuf representation of the relative path
+    pub fn as_path(&self) -> &Path {
+        self.inner.as_path()
+    }
+}
+impl Display for RelativePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner.display())
+    }
+}
+impl AsRef<Path> for RelativePath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+impl From<NormalPath> for RelativePath {
+    fn from(normal_path: NormalPath) -> Self {
+        Self {inner: normal_path.to_path_buf()}
+    }
+}
