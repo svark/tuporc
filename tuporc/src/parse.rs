@@ -502,18 +502,76 @@ impl CrossRefMaps {
         self.task_id.insert(t.into(), (db_id, par_db_id));
     }
 }
-/// wait for the next [StatementsToResolve] and process them
-fn receive_resolved_statements(
-    parser: &TupParser<DbPathSearcher>,
+/// Progress context for updating the terminal
+struct ProgressContext {
+    pb_ref: ProgressBar,
+    term_progress: TermProgress,
+}
+
+/// Context for resolving statements and collecting db insertions
+struct ResolveContext {
+    parser: TupParser<DbPathSearcher>,
     receiver: Receiver<StatementsToResolve>,
-    pb_ref: &ProgressBar,
-    term_progress: &TermProgress,
-    conn_ref: &TupConnectionRef,
-    rwbufs: &ReadWriteBufferObjects,
-    poisoned: &Arc<AtomicBool>,
+    progress: ProgressContext,
+    poisoned: Arc<AtomicBool>,
     insert_sender: Sender<TupBuildGraphSnapshot>,
-) -> Result<()> {
-    while let Ok(to_resolve) = receiver.recv() {
+}
+
+impl ResolveContext {
+    fn new(
+        parser: TupParser<DbPathSearcher>,
+        receiver: Receiver<StatementsToResolve>,
+        progress: ProgressContext,
+        poisoned: Arc<AtomicBool>,
+        insert_sender: Sender<TupBuildGraphSnapshot>,
+    ) -> Self {
+        Self {
+            parser,
+            receiver,
+            progress,
+            poisoned,
+            insert_sender,
+        }
+    }
+    fn recv(&self) -> Result<StatementsToResolve> {
+        self.receiver
+            .recv()
+            .wrap_err("Failed to receive statements to resolve")
+    }
+    fn get_parser(&self) -> &TupParser<DbPathSearcher> {
+        &self.parser
+    }
+    fn get_poisoned(&self) -> &Arc<AtomicBool> {
+        &self.poisoned
+    }
+    fn get_sender(&self) -> &Sender<TupBuildGraphSnapshot> {
+        &self.insert_sender
+    }
+
+    fn progress(&self, tup_desc: &TupPathDescriptor) -> Result<()> {
+        self.progress
+            .pb_ref
+            .set_message(format!("Resolving {}", tup_desc));
+        if is_cancelled() || self.poisoned.load(Ordering::SeqCst) {
+            log::warn!("cancelled while resolving tupfile {}", tup_desc);
+            return Err(eyre!("cancelled while resolving tupfile {}", tup_desc));
+        }
+        self.progress.term_progress.update_pb(&self.progress.pb_ref);
+        Ok(())
+    }
+}
+
+/// wait for the next [StatementsToResolve] and process them
+fn receive_resolved_statements(ctx: ResolveContext) -> Result<()> {
+    let parser = ctx.get_parser();
+    let rwbufs = parser.read_write_buffers();
+    let conn = parser
+        .get_searcher()
+        .get_connection()
+        .context("Failed to get sqlite connection")?;
+    let conn_ref = conn.as_ref();
+
+    while let Ok(to_resolve) = ctx.recv() {
         let tup_desc = to_resolve.get_cur_file_desc().clone();
         log::info!("resolving statements for tupfile {:?}", tup_desc);
         let (resolved_rules, _) = parser
@@ -522,15 +580,16 @@ fn receive_resolved_statements(
                 "While processing statements for tupfile {}",
                 tup_desc
             ))
-            .inspect_err(|e| log::error!("error found resolving stmts in {tup_desc} -- {e}"))?;
-        pb_ref.set_message(format!("Resolving {}", resolved_rules.get_tupid()));
-        if is_cancelled() || poisoned.load(Ordering::SeqCst) {
-            log::warn!("cancelled while resolving tupfile {}", tup_desc);
-            return Ok(());
-        }
-        term_progress.update_pb(&pb_ref);
-        collect_db_insertions(&conn_ref, resolved_rules, &rwbufs, &insert_sender, poisoned)
-            .wrap_err("Collecting db insertions failed")?;
+            .inspect_err(|e| log::error!("Error while processing tupfile {}: {}", tup_desc, e))?;
+        ctx.progress(&tup_desc)?;
+        collect_db_insertions(
+            &conn_ref,
+            resolved_rules,
+            &rwbufs,
+            ctx.get_sender(),
+            ctx.get_poisoned(),
+        )
+        .context("Collecting db insertions failed")?;
     }
     Ok(())
 }
@@ -873,31 +932,21 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         conn.mark_tupfile_outputs(tupfile_ids)
             .context("Mark tupfile outputs")?;
     }
-    let res = parse_and_add_rules_to_db(
+    parse_and_add_rules_to_db(
         parser,
         tupfiles.as_slice(),
         term_progress.clone(),
         keep_going,
-    );
-    match res {
-        Err(e) => {
-            log::error!("Error during parsing tupfiles: {}", e);
-            term_progress.abandon_main("Error ");
-            return Err(e);
-        }
-        _ => {
-            term_progress.finish_main("Parsing completed");
-        }
-    }
-    {
+    )
+    .and_then(|_| {
         let conn = connection.get()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         conn.set_run_status("parse", "success", now)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn insert_link(tx: &TupTransaction, link: &Link, crossref: &mut CrossRefMaps) -> Result<()> {
@@ -1051,14 +1100,11 @@ fn add_links_from_to_rules_and_groups(
     }
 }
 
-fn collect_links_from_to_globs(
-    resolved_rules: &ResolvedRules,
-    link_collector: &mut LinkCollector,
-) -> Result<(), Report> {
+fn collect_links_from_to_globs(resolved_rules: &ResolvedRules, link_collector: &mut LinkCollector) {
     for glob_desc in resolved_rules.get_globs_read() {
         let tup_desc = resolved_rules.get_tupid();
         link_collector.add_glob_to_tupfile_link(glob_desc, tup_desc);
-        let glob_path = GlobPath::build_from(&PathDescriptor::default(), glob_desc)?;
+        let glob_path = GlobPath::build_from(&PathDescriptor::default(), glob_desc);
         let non_pattern_path = glob_path.get_non_pattern_prefix_desc();
         let depth = glob_desc.components().count() - non_pattern_path.components().count();
         if depth > 1 {
@@ -1067,7 +1113,6 @@ fn collect_links_from_to_globs(
             link_collector.add_dir_to_glob_link(non_pattern_path, glob_desc, tup_desc);
         }
     }
-    Ok(())
 }
 
 fn fetch_deeper_dirs(
@@ -1283,16 +1328,17 @@ fn collect_db_insertions(
     for tupfile_read in resolved_rules.get_tupfiles_read() {
         link_collector.add_tupfile_to_tupfile_link(tupfile_read, resolved_rules.get_tupid());
     }
-    collect_links_from_to_globs(&resolved_rules, &mut link_collector)
-        .context("Collecting links from/to globs")?;
+    collect_links_from_to_globs(&resolved_rules, &mut link_collector);
     add_links_from_to_rules_and_groups(&resolved_rules, &mut link_collector);
 
-    insert_sender.send(TupBuildGraphSnapshot::new(
-        resolved_rules.get_tupid().clone(),
-        envs_to_insert,
-        nodes,
-        link_collector,
-    ))?;
+    insert_sender
+        .send(TupBuildGraphSnapshot::new(
+            resolved_rules.get_tupid().clone(),
+            envs_to_insert,
+            nodes,
+            link_collector,
+        ))
+        .expect("Failed to send graph snapshot to insert thread");
     Ok(())
 }
 
@@ -1419,31 +1465,24 @@ where
         );
 
         for _worker_idx in 0..num_receivers {
-            let parser_c = parser.clone();
             let pb_ref = resolve_pb.clone();
-            let insert_sender = insert_sender.clone();
-            let rwbufs = parser_c.read_write_buffers().clone();
-            let receiver = receiver.clone();
             let poisoned = poisoned.clone();
             let first_err = first_err.clone();
             let term_progress = term_progress.clone();
+            let ctx = ResolveContext::new(
+                parser.clone(),
+                receiver.clone(),
+                ProgressContext {
+                    pb_ref: resolve_pb.clone(),
+                    term_progress: term_progress.clone(),
+                },
+                poisoned.clone(),
+                insert_sender.clone(),
+            );
             s.spawn(move |_| {
-                let result = (|| -> Result<()> {
-                    let searcher = parser_c.get_searcher();
-                    let conn = searcher.get_connection()?;
-                    let conn_ref = conn.as_ref();
-                    receive_resolved_statements(
-                        &parser_c,
-                        receiver,
-                        &pb_ref,
-                        &term_progress,
-                        &conn_ref,
-                        &rwbufs,
-                        &poisoned,
-                        insert_sender,
-                    )
-                    .context("Resolving statements in tupfiles")
-                })();
+                let result = {
+                    receive_resolved_statements(ctx).context("Resolving statements in tupfiles")
+                };
                 if let Err(e) = result {
                     term_progress.abandon(&pb_ref, format!("Error resolving statements! {e}"));
                     record_error(&first_err, e, keep_going, &poisoned);
@@ -2046,8 +2085,8 @@ impl LinkCollector {
 }
 
 impl Collector {
-    pub(crate) fn new(read_write_buffer_objects: ReadWriteBufferObjects) -> Result<Collector> {
-        Ok(Collector {
+    pub(crate) fn new(read_write_buffer_objects: ReadWriteBufferObjects) -> Collector {
+        Collector {
             processed_globs: HashSet::new(),
             processed: HashSet::new(),
             processed_groups: Default::default(),
@@ -2057,7 +2096,7 @@ impl Collector {
             //existing_nodeids: BTreeSet::new(),
             unique_rule_check: HashMap::new(),
             read_write_buffer_objects,
-        })
+        }
     }
     fn nodes(self) -> Vec<NodeToInsert> {
         self.nodes_to_insert
@@ -2134,7 +2173,7 @@ impl Collector {
             self.collect_excluded(&p);
         }
     }
-    fn add_task_node(&mut self, task_desc: &TaskDescriptor, hash: Option<String>) -> Result<()> {
+    fn add_task_node(&mut self, task_desc: &TaskDescriptor, hash: Option<String>) {
         let task_instance = self.read_write_buffer_objects.get_task(task_desc);
         let name = task_instance.get_target();
         let tuppath = task_instance.get_parent();
@@ -2153,7 +2192,7 @@ impl Collector {
         if prevline.is_none() {
             self.collect_task(task_desc, hash);
         } else {
-            bail!(
+            log::warn!(
                 "Task at  {}:{} was previously defined at line {}. \
                 Ensure that rule definitions take the inputs as arguments.",
                 tuppathstr.display(),
@@ -2161,7 +2200,6 @@ impl Collector {
                 prevline.unwrap()
             );
         }
-        Ok(())
     }
     fn add_rule_node(&mut self, rule_desc: &RuleDescriptor, hash: Option<String>) {
         let rule_formula = self.read_write_buffer_objects.get_rule(rule_desc);
@@ -2279,12 +2317,12 @@ fn collect_nodes_to_insert(
     read_write_buf: &ReadWriteBufferObjects,
     resolved_rules: &ResolvedRules,
     poisoned: &Arc<AtomicBool>,
-) -> Result<(HashSet<EnvDescriptor>, Vec<NodeToInsert>), Report> {
+) -> Result<(HashSet<EnvDescriptor>, Vec<NodeToInsert>)> {
     let mut envs_to_insert = HashSet::new();
 
     // collect all unadded groups and add them in a single transaction.
     let mut nodes: Vec<_> = {
-        let mut collector = Collector::new(read_write_buf.clone())?;
+        let mut collector = Collector::new(read_write_buf.clone());
         for resolvedtasks in resolved_rules.tasks_by_tup().iter() {
             let tuploc = resolvedtasks.first().map(|x| x.get_task_loc());
             for resolvedtask in resolvedtasks.iter() {
@@ -2293,7 +2331,7 @@ fn collect_nodes_to_insert(
                 for s in resolvedtask.get_deps() {
                     collector.add_input_for_insert(s, tupid.clone());
                 }
-                collector.add_task_node(rd, None)?;
+                collector.add_task_node(rd, None);
                 let env_desc = resolvedtask.get_env_list();
                 envs_to_insert.extend(env_desc.iter());
             }
@@ -2326,7 +2364,7 @@ fn collect_nodes_to_insert(
         }
         if is_cancelled() || poisoned.load(Ordering::SeqCst) {
             log::error!("Collecting nodes to insert cancelled");
-            return Ok((envs_to_insert, Vec::new()));
+            return Ok((HashSet::new(), Vec::new()));
         }
         collector.nodes()
     };
