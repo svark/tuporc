@@ -242,7 +242,7 @@ impl PathDescriptor {
                 Component::ParentDir => Ok(acc.as_ref().get_parent_descriptor()),
                 Component::CurDir => Ok(acc),
                 Component::RootDir => {
-                    debug!("switching to root dir from {:?}", acc.as_ref());
+                    log::error!("switching to root dir from {:?} when appending {}", acc.as_ref(), name.as_ref().display());
                     Ok(PathDescriptor::default())
                 },
                 Component::Prefix(_) =>

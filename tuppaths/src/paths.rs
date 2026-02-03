@@ -120,7 +120,7 @@ impl NormalPath {
         self.inner
             .as_path()
             .file_name()
-            .unwrap()
+            .unwrap_or(OsStr::new(""))
             .to_string_lossy()
             .to_string()
     }
@@ -318,7 +318,7 @@ impl GlobPath {
     pub fn build_from_relative_desc(
         tup_cwd: &PathDescriptor,
         glob_path: &RelativeDirEntry,
-    ) -> Result<Self, Error> {
+    ) -> Self {
         let mut ided_path = tup_cwd.clone();
         ided_path += glob_path;
         Self::build_from(tup_cwd, &ided_path)
@@ -327,14 +327,14 @@ impl GlobPath {
     pub fn build_from(
         tup_cwd: &PathDescriptor,
         glob_path_desc: &PathDescriptor,
-    ) -> Result<GlobPath, Error> {
+    )  -> GlobPath {
         let (prefix_path_desc, _has_glob) = get_non_pattern_prefix(glob_path_desc);
-        Ok(GlobPath {
+        GlobPath {
             glob_path_desc: glob_path_desc.clone(),
             non_pattern_prefix_desc: prefix_path_desc,
             tup_cwd: tup_cwd.clone(),
             glob: std::sync::OnceLock::new(),
-        })
+        }
     }
 
     ///  Glob path descriptor
