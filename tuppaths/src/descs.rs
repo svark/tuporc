@@ -243,11 +243,11 @@ impl PathDescriptor {
                 Component::CurDir => Ok(acc),
                 Component::RootDir => {
                    Err(Error::new_path_search_error(
-                       format!("attempting to join root dir to path descriptor in {}", name.as_ref().display())))
+                       format!("Attempting to join {} with root path {} - Provide only relative paths for rule building", self, name.as_ref().display())))
                 },
                 Component::Prefix(_) =>
                     Err(Error::new_path_search_error(
-                        format!("attempting to join unexpected path component:{} ++ {}\n Consider only relative paths or paths from tup root for rule building", self.get_path_to_root().as_path().display(), name.as_ref().display())))
+                        format!("Attempting to join unexpected path component:{} ++ {} - Provide only relative paths for rule building", self.get_path_to_root().as_path().display(), name.as_ref().display())))
             }
         })
     }
