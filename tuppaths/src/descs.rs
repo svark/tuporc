@@ -242,12 +242,12 @@ impl PathDescriptor {
                 Component::ParentDir => Ok(acc.as_ref().get_parent_descriptor()),
                 Component::CurDir => Ok(acc),
                 Component::RootDir => {
-                    log::error!("switching to root dir from {:?} when appending {}", acc.as_ref(), name.as_ref().display());
-                    Ok(PathDescriptor::default())
+                   Err(Error::new_path_search_error(
+                       format!("attempting to join root dir to path descriptor in {}", name.as_ref().display())))
                 },
                 Component::Prefix(_) =>
                     Err(Error::new_path_search_error(
-                        &format!("attempting to join unexpected path component:{} ++ {}\n Consider only relative paths or paths from tup root for rule building", self.get_path_to_root().as_path().display(), name.as_ref().display())))
+                        format!("attempting to join unexpected path component:{} ++ {}\n Consider only relative paths or paths from tup root for rule building", self.get_path_to_root().as_path().display(), name.as_ref().display())))
             }
         })
     }

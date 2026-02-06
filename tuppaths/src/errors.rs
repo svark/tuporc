@@ -14,8 +14,8 @@ pub enum Error {
 }
 impl Error {
     /// Create  a path search error
-    pub fn new_path_search_error(str: &str) -> Self {
-        Error::PathSearchError(str.to_string())
+    pub fn new_path_search_error(str: String) -> Self {
+        Error::PathSearchError(str)
     }
     /// Create a glob error
     pub fn new_glob_error(e: crate::glob::Error) -> Self {
