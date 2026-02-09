@@ -1,19 +1,23 @@
 extern crate crossbeam;
 extern crate execute;
 extern crate pathdiff;
-
+extern crate tupcompat;
 use crossbeam::channel::unbounded;
 use crossbeam::thread::scope;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::env;
 use std::env::current_dir;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::LineWriter;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use tupetw::{EventHeader, EventType};
 use tuppaths::paths::NormalPath;
+use tupcompat::shell;
+
 struct ProcHandler {
     validprocs: BTreeSet<u32>,
     roots: Vec<NormalPath>,
@@ -178,8 +182,14 @@ fn main() {
     let (trace_sender, trace_receiver) = unbounded();
     let mut tracker = tupetw::DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process().unwrap();
-    let mut cmd = execute::shell(shell_command);
+    let mut cmd = shell(shell_command.clone());
     let mut ch = cmd.spawn().expect("failed to spawn");
+    if shell_command.len() > 8000 {
+        if let Some(mut stdin) = ch.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(shell_command.as_bytes()).expect("failed to write to stdin");
+        }
+    }
     let ch_id = ch.id();
     log::info!("Child process id: {}", ch_id);
     let mut proc_handler = ProcHandler::new(args, ch_id);

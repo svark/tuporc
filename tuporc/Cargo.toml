@@ -31,7 +31,7 @@ notify = { version = "8.2.0", features = ["crossbeam-channel"] }
 fs4 = {version = "0.13.1", features = ["sync"]}
 ignore = "0.4.25"
 rayon = "1.11.0"
-
+tupcompat = { path = "../tupcompat" }
 [profile.release]
 lto = true
 

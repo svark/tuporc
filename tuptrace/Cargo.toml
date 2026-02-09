@@ -12,6 +12,7 @@ env_logger = "0.11.7"
 execute = "0.2.13"
 crossbeam = "0.8.4"
 clap = { version = "4.5.34", features = ["derive"] }
+tupcompat = { path = "../tupcompat" }
 
 [build-dependencies]
 embed-manifest = "1.4.0"

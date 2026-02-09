@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 use std::slice::Iter;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ use tupparser::buffers::{BufferObjects, PathBuffers};
 use tupparser::decode::decode_group_captures;
 use tupparser::statements::{Loc, TupLoc};
 use tupparser::TupPathDescriptor;
+use incremental_topo::Node as N;
 
 use crate::parse::{cancel_flag, ConnWrapper};
 use crate::{TermProgress};
@@ -90,22 +91,7 @@ impl PoisonedState {
         self.poisoned.load(Ordering::SeqCst)
     }
 }
-pub fn shell<S: AsRef<OsStr>>(cmd: S) -> Command {
-    let mut command = Command::new("sh.exe");
-    let cmd_ref = cmd.as_ref();
-    if cmd_ref.len() > 8000 {
-        command.arg("-s");
-        command.stdin(Stdio::piped());
-    } else {
-        command.arg("-c");
-        command.arg(cmd);
-    }
-
-    command
-}
 use std::collections::{HashSet, VecDeque};
-use std::ffi::OsStr;
-use incremental_topo::Node as N;
 /// Find one path `start -> ... -> goal` using only IncrementalTopo queries.
 ///
 /// This is *debug-only* and can be expensive on big graphs because we don't have adjacency lists.
@@ -588,7 +574,7 @@ fn execute_rule(
     term_progress: &TermProgress,
 ) -> Result<()> {
     let  command_line = rule_node.get_name().to_owned();
-    let mut cmd = shell(&command_line);
+    let mut cmd = tupcompat::shell(&command_line);
     cmd.current_dir(dirpath);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

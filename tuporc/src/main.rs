@@ -14,6 +14,7 @@ extern crate parking_lot;
 extern crate rayon;
 extern crate regex;
 extern crate tupdb;
+extern crate tupcompat;
 
 use std::borrow::Cow;
 use std::env::{current_dir, set_current_dir};

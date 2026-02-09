@@ -85,3 +85,44 @@ pub fn get_uname() -> String {
     }
     .to_string()
 }
+use std::ffi::{OsStr, OsString};
+use std::process::Stdio;
+use std::sync::LazyLock;
+
+#[cfg(unix)]
+#[inline]
+pub fn shell<S: AsRef<OsStr>>(cmd: S) -> Command {
+    use std::sync::LazyLock;
+
+    static SHELL: LazyLock<OsString> = LazyLock::new(|| {
+        env::var_os("SHELL").unwrap_or_else(|| OsString::from(String::from("sh")))
+    });
+
+    let mut command = Command::new(&*SHELL);
+
+    command.arg("-c");
+    command.arg(cmd);
+
+    command
+}
+
+/// Create a `Command` instance which can be executed by the current command language interpreter (shell).
+#[cfg(windows)]
+pub fn shell<S: AsRef<OsStr>>(cmd: S) -> std::process::Command {
+  static SHELL: LazyLock<OsString> = LazyLock::new(|| {
+        std::env::var_os("SHELL").unwrap_or_else(|| OsString::from(String::from("sh.exe")))
+    });
+
+    let mut command = std::process::Command::new(&*SHELL);
+
+    let cmd_ref = cmd.as_ref();
+    if cmd_ref.len() > 8000 {
+        command.arg("-s");
+        command.stdin(Stdio::piped());
+    } else {
+        command.arg("-c");
+        command.arg(cmd);
+    }
+
+    command
+}
