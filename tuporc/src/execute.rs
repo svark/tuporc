@@ -3,8 +3,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 use std::slice::Iter;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::yield_now;
@@ -12,13 +14,13 @@ use std::thread::yield_now;
 use bimap::hash::BiHashMap;
 use bimap::BiMap;
 use crossbeam::channel::{Receiver, Select, SelectedOperation};
-use ex::shell;
-use eyre::{eyre, Result};
+//use ex::shell;
+use eyre::{eyre, Report, Result};
 use incremental_topo::IncrementalTopo;
 use indicatif::ProgressBar;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use tupdb::db::{start_io_connection, Node, TupConnection, TupConnectionPool};
 use tupetw::{DynDepTracker, EventHeader, EventType};
 use tupparser::buffers::{BufferObjects, PathBuffers};
@@ -37,39 +39,72 @@ use tupdb::queries::LibSqlQueries;
 #[derive(Debug, Clone)]
 struct PoisonedState {
     keep_going: bool,
-    poisoned: Arc<RwLock<u8>>,
+    poisoned: Arc<AtomicBool>,
+    errors: Arc<Mutex<Vec<Report>>>,
 }
 
 impl PoisonedState {
     fn new(keep_going: bool) -> Self {
         Self {
             keep_going,
-            poisoned: Arc::new(RwLock::new(0)),
+            poisoned: Arc::new(AtomicBool::new(false)),
+            errors: Arc::new(Mutex::new(Vec::new())),
         }
     }
     fn is_poisoned(&self) -> bool {
-        *self.poisoned.read() != 0 || cancel_flag().load(std::sync::atomic::Ordering::Relaxed)
+        self.poisoned.load(Ordering::Relaxed) || cancel_flag().load(Ordering::Relaxed)
     }
-    fn update_poisoned(&self, poisoned: u8) -> bool {
-        if !self.is_poisoned() {
-            *self.poisoned.write() = poisoned;
-            true
-        } else {
-            false
+    fn record_error(&self, err: Report) {
+        let mut guard = self.errors.lock();
+        log::error!("Error: {}", err);
+
+        if self.keep_going || guard.is_empty() {
+            guard.push(err);
         }
+        if !self.keep_going {
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
+    }
+    fn take_errors(&self) -> Option<Report> {
+        let mut guard = self.errors.lock();
+        if guard.is_empty() {
+            return None;
+        }
+        if !self.keep_going {
+            return Some(guard.remove(0));
+        }
+        let errs = std::mem::take(&mut *guard);
+        let mut msg = String::from("Multiple errors occurred:\n");
+        for (idx, err) in errs.iter().enumerate() {
+            msg.push_str(&format!("{}. {}\n", idx + 1, err));
+        }
+        Some(eyre!(msg))
     }
     fn force_poisoned(&self) {
-        *self.poisoned.write() = 1;
+        self.poisoned.store(true, Ordering::SeqCst);
     }
     fn should_stop(&self) -> bool {
-        if cancel_flag().load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel_flag().load(Ordering::Relaxed) {
             return true;
         }
-        let p = self.poisoned.read();
-        *p == 1 && (!self.keep_going || *p > 1)
+        self.poisoned.load(Ordering::SeqCst)
     }
 }
+pub fn shell<S: AsRef<OsStr>>(cmd: S) -> Command {
+    let mut command = Command::new("sh.exe");
+    let cmd_ref = cmd.as_ref();
+    if cmd_ref.len() > 8000 {
+        command.arg("-s");
+        command.stdin(Stdio::piped());
+    } else {
+        command.arg("-c");
+        command.arg(cmd);
+    }
+
+    command
+}
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use incremental_topo::Node as N;
 /// Find one path `start -> ... -> goal` using only IncrementalTopo queries.
 ///
@@ -247,9 +282,10 @@ fn prepare_for_execution(
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecOptions {
-    pub keep_going: bool,
+    pub keep_going: bool, // keep going even if some rules fail
     pub term_progress: TermProgress,
-    pub num_jobs: usize,
+    pub num_jobs: usize, // number of parallel jobs
+    pub timeout: std::time::Duration, // timeout for each rule
     /// Verbose output
     #[allow(unused)]
     pub verbose: bool,
@@ -261,6 +297,7 @@ impl Default for ExecOptions {
             term_progress: TermProgress::new("Executing rules"),
             num_jobs: num_cpus::get(),
             verbose: false,
+            timeout: std::time::Duration::from_secs(15 * 60), // timeout for each rule
         }
     }
 }
@@ -547,23 +584,41 @@ fn execute_rule(
     rule_node: &Node,
     dirpath: &Path,
     spawned_child_id_sender: &crossbeam::channel::Sender<u32>,
-    children: &mut Vec<Arc<Mutex<(Child, String)>>>,
+    children: &mut Vec<Arc<Mutex<(Child, String, Instant)>>>,
+    term_progress: &TermProgress,
 ) -> Result<()> {
-    let mut cmd = shell(rule_node.get_name());
+    let  command_line = rule_node.get_name().to_owned();
+    let mut cmd = shell(&command_line);
     cmd.current_dir(dirpath);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
-    let ch = cmd.spawn()?;
+    let mut ch = cmd.spawn()?;
     let ch_id = ch.id();
+    if command_line.len() > 8000 {
+        if let Some(mut stdin) = ch.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(command_line.as_bytes())?;
+        }
+    }
     if rule_node.get_display_str().is_empty() {
-        println!("id:{} {:?}", ch_id, cmd);
+        let regex = RegexBuilder::new(r#"cl.*\s+(\w)$"#);
+        let re = regex.build().unwrap();
+        if re.is_match(command_line.as_str()) {
+            if let Some(c) = re.captures(command_line.as_str()) {
+                if let Some(Some(fname)) = c.iter().next() {
+                    term_progress.println(format!("Cl {}", fname.as_str()));
+                }
+            }
+        }
+        //term_progress.println(format!("{}", command_line));
+
     } else {
-        println!("{} {}", ch_id, rule_node.get_display_str());
+        term_progress.println(format!("{}",  rule_node.get_display_str()));
     }
     spawned_child_id_sender.send(ch_id)?;
 
-    children.push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned()))));
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    children.push(Arc::new(Mutex::new((ch, rule_node.get_name().to_owned(), Instant::now()))));
     Ok(())
 }
 
@@ -580,6 +635,7 @@ fn exec_nodes_to_run(
     let keep_going = exec_options.keep_going;
     let num_threads = exec_options.num_jobs;
     let term_progress = &exec_options.term_progress;
+    let timeout =  &exec_options.timeout;
     let conn = connection_pool.get()?;
     let target_ids = get_target_ids(&conn, root, target)?;
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
@@ -653,7 +709,7 @@ fn exec_nodes_to_run(
     let poisoned = PoisonedState::new(keep_going);
     let num_threads = std::cmp::min(connection_pool.max_size() as usize,
                                     std::cmp::min(num_threads, valid_rules.len()));
-    let mut pbars: Vec<ProgressBar> = Vec::new();
+    term_progress.set_main_len(valid_rules.len() as u64, "Executing rules");
     let _ = cancel_flag();
     valid_rules.sort_by(|x, y| {
         let xid = x.get_id() as i32;
@@ -683,10 +739,10 @@ fn exec_nodes_to_run(
     let mut tracker = DynDepTracker::build(std::process::id(), trace_sender);
     tracker.start_and_process()?;
     let thread_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
+        .num_threads(num_threads + 1)
         .build()
         .expect("Failed to build thread pool to execute rules");
-    let _ = thread_pool.scope(|s| -> Result<()> {
+    let res = thread_pool.scope(|s| -> Result<()> {
         {
             let poisoned = poisoned.clone();
             let proc_receivers = ProcReceivers::new(
@@ -715,78 +771,94 @@ fn exec_nodes_to_run(
             if min_idx == max_idx {
                 continue;
             }
-            let mut children = Vec::new();
-            (0..num_threads).for_each(|_| {
-                children.push(Vec::<Arc<Mutex<(Child, String)>>>::new());
-            });
-            for j in min_idx..max_idx {
+            let (child_to_wait_tx, child_to_wait_rx) = crossbeam::channel::unbounded::<Arc<Mutex<(Child, String, Instant)>>>();
+            let (slot_tx, slot_rx) = crossbeam::channel::bounded(num_threads);
+            for _ in 0..num_threads {
+                slot_tx.send(()).unwrap(); // initially we allow execution of num_threads rules,
+                // after that a thread will only send on slot_tx after it finishes executing a rule and is ready to execute another one
+            }
+
+            let wg = crossbeam::sync::WaitGroup::new();
+            let layer_pbar = term_progress.make_child_len_progress_bar("Current Layer", (max_idx - min_idx) as u64);
+            for _ in 0..num_threads {
+                let poisoned = poisoned.clone();
+                let child_to_wait_rx = child_to_wait_rx.clone();
+                let completed_child_id_sender = completed_child_id_sender.clone();
+                let rule_for_child_id = rule_for_child_id.clone();
+                let wg = wg.clone();
+                let pbar = layer_pbar.clone();
+                let term_progress = term_progress.clone();
+                let slot_tx = slot_tx.clone();
+                s.spawn(move |_| {
+                    while let Ok(child) = child_to_wait_rx.recv() {
+                        let (finished, failed) =
+                            wait_for_children(poisoned.clone(), vec![child], &pbar, &term_progress, &timeout);
+                        for (id, succeeded) in finished
+                            .iter()
+                            .map(|i| (*i, true))
+                            .chain(failed.iter().map(|j| (*j, false)))
+                        {
+                            let rule_for_child_id = rule_for_child_id.read();
+                            if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
+                                completed_child_id_sender
+                                    .send((id, (rule_id, rule_name, succeeded)))
+                                    .expect("Failed to send completed child id");
+                            }
+                        }
+                        slot_tx.send(()).ok();
+                    }
+                    drop(wg);
+                });
+            }
+            drop(child_to_wait_rx);
+
+            for (j, _) in (min_idx..max_idx).zip(&slot_rx) {
                 let rule_node = &valid_rules[j];
                 if poisoned.should_stop() {
                     let rule_id = rule_node.get_id();
                     let rule_name = rule_node.get_name();
                     completed_child_id_sender.send((0, (rule_id, rule_name.to_owned(), false)))?;
-                    for pb in pbars {
-                        pb.abandon();
-                    }
+                    term_progress.abandon_main("Aborted");
                     eyre::bail!("Aborted executing rule: \n{}", rule_name);
                 } else {
+                    let mut children = Vec::new();
                     execute_rule(
                         rule_node,
                         &dirpaths[j],
                         &spawned_child_id_sender,
-                        &mut children[j % num_threads],
+                        &mut children,
+                        term_progress,
                     )?;
+                    for child in children {
+                        let id = child.lock().0.id();
+                        rule_for_child_id.write().insert(id, (rule_node.get_id(), rule_node.get_name().to_owned()));
+                        child_to_wait_tx.send(child).unwrap();
+                    }
                 }
             }
+            drop(child_to_wait_tx);
 
-            let wg = crossbeam::sync::WaitGroup::new();
-            for i in 0..num_threads {
-                let poisoned = poisoned.clone();
-                let i = i.clone();
-                let children = children[i].clone();
-                // here we wait for tasks to finish
-                let completed_child_id_sender = completed_child_id_sender.clone();
-                let rule_for_child_id = rule_for_child_id.clone();
-                let wg = wg.clone();
-                let pbar = term_progress.make_len_progress_bar("..", children.len() as u64);
-                pbars.push(pbar.clone());
-                s.spawn(move |_| {
-                    let (finished, failed) =
-                        wait_for_children(poisoned, children, &pbar, &term_progress);
-                    for (id, succeeded) in finished
-                        .iter()
-                        .map(|i| (*i, true))
-                        .chain(failed.iter().map(|j| (*j, false)))
-                    {
-                        let rule_for_child_id = rule_for_child_id.read();
-                        if let Some((rule_id, rule_name)) = rule_for_child_id.get(&id).cloned() {
-                            completed_child_id_sender
-                                .send((id, (rule_id, rule_name, succeeded)))
-                                .expect("Failed to send completed child id");
-                        }
-                    }
-                    pbar.finish();
-                    drop(wg);
-                });
-            }
             wg.wait(); // wait for all processes to finish before next topo order rules are executed
+            layer_pbar.finish_and_clear();
             min_idx = max_idx;
 
             if poisoned.should_stop() {
-                for pb in pbars {
-                    pb.finish();
-                }
+                term_progress.abandon_main("Stopping further rule executions");
                 eyre::bail!("Stopping further rule executions");
             }
         } // min_topo_order..max topo order
         drop(completed_child_id_sender);
         drop(spawned_child_id_sender);
+        if let Some(err) = poisoned.take_errors() {
+            return Err(err);
+        }
         Ok(())
     });
+    res?;
     Ok(())
 }
 
-fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String)>>>) -> Vec<u32> {
+fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String, Instant)>>>) -> Vec<u32> {
     let mut failed_children = Vec::new();
     children.into_iter().for_each(|ch| {
         let ref mut ch = ch.lock().0;
@@ -800,9 +872,10 @@ fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String)>>>) -> Vec<u32> {
 
 fn wait_for_children(
     poisoned: PoisonedState,
-    mut children: Vec<Arc<Mutex<(Child, String)>>>,
+    mut children: Vec<Arc<Mutex<(Child, String, Instant)>>>,
     pbar: &ProgressBar,
     term_progress: &TermProgress,
+    timeout : &Duration
 ) -> (Vec<u32>, Vec<u32>) {
     let (mut finished, mut failed) = (Vec::new(), Vec::new());
     while !children.is_empty() {
@@ -814,22 +887,31 @@ fn wait_for_children(
             if let Ok(Some(ref exit_status)) = ch.0.try_wait() {
                 if !exit_status.success() {
                     failed.push(id);
-                    if poisoned.update_poisoned(2) {
-                        yield_now();
-                    }
+                    let err = eyre!("Rule failed: {}", ch.1);
+                    poisoned.record_error(err);
+                    yield_now();
                 } else {
                     debug!("finished executing rule: \n{:?}", ch.1);
                     finished.push(id);
                 }
                 term_progress.progress(pbar);
             } else {
-                tryagain.push(child.clone());
+                if ch.2.elapsed() > *timeout {
+                    failed.push(id);
+                    let err = eyre!("Rule timed out (15 mins): {}", ch.1);
+                    poisoned.record_error(err);
+                    ch.0.kill().ok();
+                    eprintln!("Killed child process {} due to timeout", id);
+                    term_progress.progress(pbar);
+                } else {
+                    tryagain.push(child.clone());
+                }
             }
         }
         children = tryagain;
         yield_now();
         if !children.is_empty() {
-            thread::sleep(std::time::Duration::from_nanos(100));
+            thread::sleep(std::time::Duration::from_millis(1));
             // kill the remaining children
             if poisoned.should_stop() {
                 failed.extend(kill_poisoned(&children).drain(..));
@@ -1035,8 +1117,8 @@ fn listen_to_processes(
                 let node = process_checker.fetch_node_by_id(*rule_id)?;
                 if let Err(e) = verify_node_io(*child_id, &node, &mut io_conn, &mut process_checker)
                 {
-                    eprintln!("Error verifying rule io {}\n{}", rule_name, e.to_string());
-                    poisoned.update_poisoned(2);
+                    let err = eyre!("Error verifying rule io {}\n{}", rule_name, e.to_string());
+                    poisoned.record_error(err);
                 } else {
                     process_checker
                         .mark_rule_succeeded(*rule_id as _)

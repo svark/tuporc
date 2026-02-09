@@ -8,7 +8,6 @@ extern crate execute as ex;
 extern crate eyre;
 extern crate fs4;
 extern crate ignore;
-extern crate incremental_topo;
 extern crate indicatif;
 extern crate num_cpus;
 extern crate parking_lot;
@@ -64,25 +63,12 @@ impl TermProgress {
         self.pb_main.clone()
     }
 
-    pub fn make_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
-        let pb = ProgressBar::new(len);
-        let sty_main = ProgressStyle::with_template(
-            "{bar:40.green/yellow} [{elapsed}<{eta}] {pos:>4}/{len:4} {msg}",
-        )
-        .unwrap();
-        pb.set_style(sty_main);
-        let pb = self.mb.add(pb);
-        pb.set_message(msg);
-        pb
-    }
     pub fn make_progress_bar(&self, msg: &'static str) -> ProgressBar {
         let pb = ProgressBar::new_spinner();
         pb.enable_steady_tick(Duration::from_millis(120));
         pb.set_style(
-            ProgressStyle::with_template("{spinner:.blue} [{elapsed}] {msg}")
+            ProgressStyle::with_template("{spinner:.blue} [{elapsed_precise}] {msg}")
                 .unwrap()
-                // For more spinners check out the cli-spinners project:
-                // https://github.com/sindresorhus/cli-spinners/blob/master/spinners.json
                 .tick_strings(&["⢹", "⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"]),
         );
         let pb = self.mb.add(pb);
@@ -93,20 +79,35 @@ impl TermProgress {
     pub fn make_child_len_progress_bar(&self, msg: &'static str, len: u64) -> ProgressBar {
         let pb = ProgressBar::new(len);
         pb.set_style(
-            ProgressStyle::with_template("{bar:40.cyan/blue} [{elapsed}] {pos:>4}/{len:4} {msg}")
-                .unwrap()
-                .progress_chars("##-"),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>4}/{len:4} {msg}",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
         );
         let pb = self.mb.add(pb);
         pb.set_message(msg);
         pb
     }
 
+    pub fn set_main_len(&self, len: u64, msg: &'static str) {
+        self.pb_main.set_length(len);
+        self.pb_main.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+        self.pb_main.set_message(msg);
+        self.pb_main.enable_steady_tick(Duration::from_millis(120));
+    }
+
     fn set_main_with_ticker(self, msg: &'static str) -> TermProgress {
         self.pb_main.reset();
         self.pb_main.enable_steady_tick(Duration::from_millis(120));
         self.pb_main.set_style(
-            ProgressStyle::with_template("{spinner:.green} [{elapsed}] {msg}")
+            ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
                 .unwrap()
                 .tick_strings(&["⢺", "⢼", "⣸", "⣇", "⡧", "⡗", "⡏"]),
         );
@@ -161,6 +162,10 @@ impl TermProgress {
     }
     pub fn abandon_main(&self, msg: impl Into<Cow<'static, str>>) {
         self.abandon(&self.pb_main, msg);
+    }
+
+    pub fn println<I: AsRef<str>>(&self, msg: I) {
+        self.pb_main.println(msg);
     }
 
     pub fn set_message(&self, msg: &str) {
@@ -241,6 +246,9 @@ enum Action {
         /// Skip scanning the filesystem before build
         #[clap(short = 's', long = "skip-scan", default_value = "false")]
         skip_scan: bool,
+        
+        #[clap(short = 't', long = "timeout", default_value = "3600")]
+        timeout: u64
     },
     #[clap(about = "Monitor the filesystem for changes")]
     Monitor {
@@ -267,10 +275,11 @@ fn main() -> Result<()> {
     let db_pool_size = args.db_pool_size;
     if let Some(act) = args.command.or_else(|| {
         Some(Action::Upd {
-            target: Vec::new(),
+            target: vec![".".to_string()],
             keep_going: false,
-            num_jobs: 0,
+            num_jobs: num_cpus::get(),
             skip_scan: false,
+            timeout: 3600,
         })
     }) {
         match act {
@@ -365,6 +374,7 @@ fn main() -> Result<()> {
                 keep_going,
                 num_jobs,
                 skip_scan,
+                timeout,
             } => {
                 #[cfg(windows)]
                 {
@@ -449,6 +459,7 @@ fn main() -> Result<()> {
                         verbose: args.verbose,
                         num_jobs,
                         term_progress: term_progress.clone(),
+                        timeout: Duration::from_secs(timeout)
                     };
                     let connection_pool = start_tup_connection(db_pool_size)?;
                     execute::execute_targets(&connection_pool, &target, root, &exec_options)?;
