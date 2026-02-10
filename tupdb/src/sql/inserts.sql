@@ -4,16 +4,19 @@
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype : u8 - type of the node to add
-INSERT or REPLACE into ChangeList(id, type, change)
-Values (:id, :rtype, 0);
+INSERT INTO ChangeList(id, type, change)
+Values (:id, :rtype, 0)
+ON CONFLICT(id) DO UPDATE SET change = 0
+WHERE ChangeList.change <> 2;
 -- <eos>
 
 -- name: add_to_unborn_list!
 -- Add a node to the unborn list
 -- # Parameters
 -- param: id : i64 - id of the node to add
+-- param: rtype : u8 - type of the node to add
 INSERT or REPLACE into ChangeList(id, type, change)
-Values (:id, 4, 2)
+Values (:id, :rtype, 2)
 ;
 -- <eos>
 
@@ -26,8 +29,8 @@ SELECT n.srcid,
        0  -- change type 0 - ModifyList
 from Node n
          join ChangeList c on n.id = c.id
-where n.type = (SELECT type_index from NodeType where NodeType.type = 'GenF');
-
+-- only consider rules with changed outputs (0=changed, 1=deleted and not 2=unborn)
+where n.type = (SELECT type_index from NodeType where NodeType.type = 'GenF') AND c.change <> 2;
 
 INSERT or
 REPLACE
@@ -230,55 +233,23 @@ VALUES (:dir_id, :glob_id, 0,  :srcid,9);
 -- # Parameters
 -- param: id : i64 - id of the node to add
 -- param: rtype: u8 - type of the node to add
-INSERT or
-REPLACE
-into ChangeList(id, type, change)
+INSERT INTO ChangeList(id, type, change)
 Values (:id, :rtype, 1)
-ON CONFLICT DO UPDATE SET change = 1
-where ChangeList.change = 0;
+ON CONFLICT(id) DO UPDATE SET change = 1
+where ChangeList.change <> 2;
 -- <eos>
 
 -- name: add_not_present_to_delete_list_inner!
 -- Add all deleted files and folders and env vars to the delete list
-INSERT OR
-REPLACE
-INTO ChangeList (id, type, change)
+INSERT INTO ChangeList (id, type, change)
 SELECT Node.id, Node.type, 1
 FROM Node
          LEFT JOIN PresentList ON Node.id = PresentList.id
          INNER JOIN NodeType ON Node.type = NodeType.type_index
 WHERE PresentList.id IS NULL
   AND (NodeType.class = 'FILE_SYS')
-  -- Only consider nodes directly in the current parse set
-  AND Node.id IN (SELECT id FROM TupfileEntities);
--- <eos>
-
--- name: add_rules_to_tupfile_entities!
--- Add all rules/tasks of parsed tupfiles and their outputs to CurrentTupfiles, Also add outputs of rules/tasks that are already in CurrentTupfiles
--- # Parameters
--- param: tupfile_id : i64- id of the tupfiles to add
-INSERT INTO TupfileEntities (id, type)
-SELECT id, type
-FROM Node
-WHERE srcid = :tupfile_id
-  AND type = (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task' or type='Glob' or type='Excl');
--- <eos>
-
--- name: add_outputs_to_tupfile_entities_inner!
--- Add all outputs of rules/tasks that are already in CurrentTupfiles
-WITH existing AS (
-    -- snapshot current TupfileEntities to avoid recursive self-reference
-    SELECT id FROM TupfileEntities
-)
-INSERT INTO TupfileEntities (id, type)
-SELECT DISTINCT  id, type
-FROM Node
-WHERE srcid IN existing
-  AND type IN (SELECT type_index FROM NodeType WHERE type IN ('GenF','DirGen'));
----- mark for delete until we verify they are present
-INSERT or REPLACE  into ChangeList (id, type, change)
-SELECT id, type, 1
-FROM TupfileEntities;
+ON CONFLICT(id) DO UPDATE SET change = 1
+WHERE ChangeList.change <> 2;
 -- <eos>
 
 
@@ -351,13 +322,6 @@ from ChangeList cl
 WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'Group')
   and nl2.to_type IN (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 -- <eos>
--- name: push_remaining_tupfile_entries_to_deletelist_inner!
--- Push the remaining tupfile entries to the delete list
--- # Parameters
-INSERT or IGNORE INTO ChangeList (id, type, change)
-SELECT id, type, 1
-from TupfileEntities;
--- <eos>
 
 -- name: insert_into_dirpathbuf_inner!
 -- Insert a directory path into the DirPathBuf table
@@ -380,11 +344,13 @@ VALUES (:name, :generation_id, :event);
 
 -- name: mark_missing_not_deleted_inner!
 -- Mark files that are missing but not marked as such
-INSERT OR REPLACE INTO ChangeList (id, type, change)
+INSERT INTO ChangeList (id, type, change)
 SELECT n.id, n.type, 1
 FROM Node n
          JOIN NodeType nt ON nt.type_index = n.type
          LEFT JOIN PresentList p ON p.id = n.id
 WHERE nt.class = 'FILE_SYS'
   AND p.id IS NULL
+ON CONFLICT(id) DO UPDATE SET change = 1
+WHERE ChangeList.change <> 2;
 -- <eos>

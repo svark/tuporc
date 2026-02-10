@@ -928,9 +928,6 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
             conn.prune_modify_list().context("Prune modify list")?;
             term_progress.update_main();
         }
-        let tupfile_ids = tupfiles.iter().map(|t| t.get_id());
-        conn.mark_tupfile_outputs(tupfile_ids)
-            .context("Mark tupfile outputs")?;
     }
     parse_and_add_rules_to_db(
         parser,

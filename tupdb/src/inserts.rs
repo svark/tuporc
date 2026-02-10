@@ -56,7 +56,7 @@ pub trait LibSqlInserts {
         compute_sha: impl FnMut() -> String,
     ) -> Result<Node, AnyError>;
     fn mark_modified(&self, id: i64, rtype: &RowType) -> Result<()>;
-    fn mark_unborn(&self, id: i64) -> Result<()>;
+    fn mark_unborn(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()>;
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()>;
     fn mark_link_present(&self, from_id: i64, to_id: i64, srcid: i64) -> Result<()>;
@@ -70,7 +70,6 @@ pub trait LibSqlInserts {
     fn insert_link(&self, src: i64, dst: i64, is_sticky: u8, tup_id: i64, dst_type: RowType) -> DbResult<()>;
 
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
-    fn mark_tupfile_outputs(&self, tupfile_ids: impl Iterator<Item = i64>) -> DbResult<()>;
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
     fn mark_rules_with_changed_io(&self) -> DbResult<()>;
     fn mark_group_deps(&self) -> DbResult<()>;
@@ -250,7 +249,7 @@ impl LibSqlInserts for Connection {
             if modify == 1 && allow_modify {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
             } else if modify == 2 && allow_modify {
-                self.mark_unborn(existing_node.get_id())?;
+                self.mark_unborn(existing_node.get_id(), existing_node.get_type())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
@@ -277,15 +276,15 @@ impl LibSqlInserts for Connection {
             if modify == 1 {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
             } else if modify == 2 {
-                self.mark_unborn(existing_node.get_id())?;
+                self.mark_unborn(existing_node.get_id(), existing_node.get_type())?;
             } else if !present {
                 self.mark_modified(existing_node.get_id(), existing_node.get_type())?;
             }
             Ok(Node::copy_from(existing_node.get_id(), node))
         } else {
             let node = self.insert_node(node).map(|i| Node::copy_from(i, node))?;
-            if node.get_type() == &RowType::GenF {
-                self.mark_unborn(node.get_id())?;
+            if node.get_type() == &RowType::GenF || node.get_type() == &RowType::DirGen {
+                self.mark_unborn(node.get_id(), node.get_type())?;
             } else {
                 self.mark_modified(node.get_id(), node.get_type())?;
             }
@@ -329,8 +328,8 @@ impl LibSqlInserts for Connection {
         self.add_to_modify_list(id, *rtype as u8)?;
         Ok(())
     }
-    fn mark_unborn(&self, id: i64) -> Result<()> {
-        self.add_to_unborn_list(id)?;
+    fn mark_unborn(&self, id: i64, rtype: &RowType) -> Result<()> {
+        self.add_to_unborn_list(id, *rtype as u8)?;
         Ok(())
     }
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()> {
@@ -383,15 +382,6 @@ impl LibSqlInserts for Connection {
 
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()> {
         self.insert_trace_inner(path, pid, gen, typ, childcnt)?;
-        Ok(())
-    }
-    fn mark_tupfile_outputs(&self, mut tupfile_ids: impl Iterator<Item=i64>) -> DbResult<()> {
-        tupfile_ids.try_for_each(|tupfile_id| -> DbResult<()> {
-            self.add_rules_to_tupfile_entities(tupfile_id)?;
-            Ok(())
-        })?;
-
-        self.add_outputs_to_tupfile_entities_inner()?;
         Ok(())
     }
 

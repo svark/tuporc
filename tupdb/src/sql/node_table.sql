@@ -119,7 +119,7 @@ from ChangeList
 where change = 1;
 --- Setup unborn list view
 CREATE VIEW UnbornList AS
-SELECT id
+SELECT id, type
 from ChangeList
 where change = 2; -- ouputs that are expected but not yet created
 

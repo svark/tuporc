@@ -86,11 +86,6 @@ CREATE TABLE SuccessList
 (
     id INTEGER PRIMARY KEY not NULL
 );
-CREATE TABLE TupfileEntities
-(
-    id   INTEGER PRIMARY KEY not NULL,
-    type INTEGER
-);
 -- LiveNode/LiveNormalLink filter out rows marked for deletion in ChangeList.
 CREATE VIEW LiveNode AS
 SELECT *

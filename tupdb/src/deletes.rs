@@ -12,7 +12,6 @@ pub trait LibSqlDeletes {
     fn delete_nodes(&self) -> Result<usize>;
     fn mark_orphan_dirgen_nodes(&self) -> Result<usize>;
 
-    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()>;
     fn delete_links_not_in_present_list(&self, tup_id: i64) -> Result<usize>;
 
     fn mark_orphans_to_delete(&self) -> Result<()>;
@@ -27,7 +26,6 @@ pub trait LibSqlDeletes {
     /// Enrich DeleteList by adding nodes whose parent directories are missing from Node (orphaned dirid)
     fn mark_missing_dirs_to_delete(&self) -> Result<usize>;
 
-    fn drop_tupfile_entries_table(&self) -> Result<()>;
 
     fn delete_orphaned_groups(&self) -> Result<()>;
     fn delete_orphaned_globs(&self) -> Result<()>;
@@ -76,11 +74,6 @@ impl LibSqlDeletes for Connection {
         Ok(sz)
     }
 
-    fn mark_absent_tupfile_entries_to_delete(&self) -> Result<()> {
-        self.delete_tupfile_entries_not_in_present_list_inner()?;
-        log::debug!("Deleted tupfile_entries not in PresentList table");
-        Ok(())
-    }
     fn delete_links_not_in_present_list(&self, tup_id: i64) -> Result<usize> {
         let sz = self.delete_links_not_in_present_list_inner(tup_id)?;
         log::debug!(
@@ -91,8 +84,9 @@ impl LibSqlDeletes for Connection {
         Ok(sz)
     }
     fn mark_orphans_to_delete(&self) -> Result<()> {
-        self.delete_orphaned_tupentries_inner()?;
-        log::debug!("Deleted orphaned tupfile_entries");
+        self.delete_orphaned_rules_inner()?;
+        self.delete_orphaned_genfiles_inner()?;
+        log::debug!("Deleted orphaned rules and genfiles");
         Ok(())
     }
 
@@ -124,11 +118,6 @@ impl LibSqlDeletes for Connection {
             sz
         );
         Ok(sz)
-    }
-    fn drop_tupfile_entries_table(&self) -> Result<()> {
-        let _ = self.drop_tupfile_entities_table_inner()?;
-        log::debug!("Dropped tupfile_entries table");
-        Ok(())
     }
 
     fn delete_orphaned_groups(&self) -> Result<()> {

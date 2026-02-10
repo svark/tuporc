@@ -21,9 +21,3 @@ Create Table SuccessList
     id INTEGER PRIMARY KEY not NULL
 );
 
-Drop TABLE IF EXISTS TupfileEntities;
-CREATE TABLE TupfileEntities
-(
-    id INTEGER PRIMARY KEY not NULL,
-    type INTEGER
-);

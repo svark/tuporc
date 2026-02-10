@@ -441,13 +441,6 @@ WHERE dir = :dir_id
   AND type = (SELECT type_index from NodeType where type = 'Rule');
 -- <eos>
     
--- name: check_is_in_update_universe_inner?
--- Check if the given id is in the update universe
--- # Parameters
--- param: id : i64 - id of the node
--- returns: bool
-SELECT EXISTS(SELECT 1 FROM TupfileEntities WHERE id = :id);
--- <eos>
 
 -- name: has_rules_tasks_or_globs_inner?
 -- Check if there are rules, tasks or globs in the database

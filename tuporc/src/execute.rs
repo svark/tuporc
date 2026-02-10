@@ -553,9 +553,9 @@ fn get_target_ids(conn: &TupConnection, root: &Path, targets: &Vec<String>) -> R
     for t in targets {
         let path_desc = dir_desc.join(t.as_str())?;
         let path = bo.get_path(&path_desc);
-        if let Some(id) = conn.fetch_dirid_by_path(path.as_path()).ok() {
-            dir_ids.push(id);
-        }
+        let id = conn.fetch_dirid_by_path(path.as_path())
+            .wrap_err_with(|| format!("Target not found: {}", t))?;
+        dir_ids.push(id);
     }
     let mut rule_ids = Vec::new();
     for dirid in dir_ids.iter() {
@@ -624,6 +624,9 @@ fn exec_nodes_to_run(
     let timeout =  &exec_options.timeout;
     let conn = connection_pool.get()?;
     let target_ids = get_target_ids(&conn, root, target)?;
+    if !target.is_empty() && target_ids.is_empty() {
+        return Err(eyre!("No rules found for targets: {:?}", target));
+    }
     let (trace_sender, trace_receiver) = crossbeam::channel::unbounded();
     let (completed_child_id_sender, completed_child_id_receiver) = crossbeam::channel::unbounded();
     let (spawned_child_id_sender, spawned_child_id_receiver) = crossbeam::channel::unbounded();
@@ -851,7 +854,7 @@ fn kill_poisoned(children: &Vec<Arc<Mutex<(Child, String, Instant)>>>) -> Vec<u3
         let id = ch.id();
         failed_children.push(id);
         ch.kill().ok();
-        eprintln!("Killed child process {}", id);
+        //eprintln!("Killed child process {}", id);
     });
     failed_children
 }

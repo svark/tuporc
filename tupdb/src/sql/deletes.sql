@@ -95,16 +95,6 @@ DELETE
 from ChangeList where change = 1;
 -- <eos>
 
--- name: delete_tupfile_entries_not_in_present_list_inner!
--- Delete all tupfile entries that are not in the present list
--- # Parameters
-INSERT OR REPLACE INTO ChangeList (id, type, change)
-SELECT t.id, t.type, 1
-FROM TupfileEntities t
-         LEFT JOIN PresentList p ON t.id = p.id
-WHERE p.id IS NULL;
--- <eos>
-
 -- name: delete_links_not_in_present_list_inner!
 -- Delete links for a tupfile that were not re-inserted during parse
 -- # Parameters
@@ -145,7 +135,7 @@ FROM Node n
          JOIN ChangeList d ON d.change = 1 AND n.dir = d.id;
 -- <eos>
     
--- name: delete_orphaned_tupentries_inner!
+-- name: delete_orphaned_rules_inner!
 -- Delete all nodes orphaned by deletion of their source tupfile or rule
 -- # Parameters
 insert or
@@ -156,8 +146,10 @@ from Node n
          JOIN ChangeList dl on dl.change = 1 AND n.srcid = dl.id
 where n.type = (SELECT type_index from NodeType where type = 'Rule')
   and dl.type = (SELECT type_index from NodeType where type = 'TupF');
-
 -- <eos>
+
+-- name: delete_orphaned_genfiles_inner!
+-- Delete all nodes orphaned by deletion of their source rule
 INSERT or
 REPLACE
 into ChangeList(id, type, change)
@@ -255,7 +247,3 @@ FROM ChangeList
 where type not in (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
 -- <eos>
 
--- name: drop_tupfile_entities_table_inner!
--- Drop the temporary table to store tupfile entities
-DROP TABLE TupfileEntities;
--- <eos>
