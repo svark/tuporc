@@ -67,6 +67,9 @@ fn parse_sql_file(content: &str) -> Vec<SqlQuery> {
         }
 
         if !name.is_empty() && !query.is_empty() {
+            query = query.replace("[:UnbornListChangeType:]", "2");
+            query = query.replace("[:DeleteListChangeType:]", "1");
+            query = query.replace("[:ModifyListChangeType:]", "0");
             let fn_type = if name.ends_with('?') {
                 SqlFunctionType::Query
             } else if name.ends_with("->") {

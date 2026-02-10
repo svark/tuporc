@@ -118,7 +118,7 @@ impl TermProgress {
 
     pub fn progress(&self, pb: &ProgressBar) {
         self.update_pb(pb);
-        self.update_main();
+        // self.update_main(); // Removed to avoid jumping bars if called frequently
     }
 
     pub(crate) fn update_pb(&self, pb: &ProgressBar) {
@@ -165,12 +165,14 @@ impl TermProgress {
         self.abandon(&self.pb_main, msg);
     }
 
-    pub fn println<I: AsRef<str>>(&self, msg: I) {
-        self.pb_main.println(msg);
+    pub fn set_message(&self, msg: impl Into<Cow<'static, str>>) {
+        // Update the main progress bar message without printing a new line,
+        // to avoid shifting the MultiProgress layout.
+        self.pb_main.set_message(msg);
     }
 
-    pub fn set_message(&self, msg: &str) {
-        self.mb.println(msg).expect("Failed to print message");
+    pub fn set_main_message(&self, msg: impl Into<Cow<'static, str>>) {
+        self.pb_main.set_message(msg);
     }
 
     pub fn suspend(&self) {

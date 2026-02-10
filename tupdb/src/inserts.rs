@@ -334,6 +334,7 @@ impl LibSqlInserts for Connection {
     }
     fn mark_rule_succeeded(&self, rule_id: i64) -> Result<()> {
         self.insert_or_ignore_into_success_list(rule_id)?;
+        self.mark_genfile_as_modified_inner(rule_id)?;
         Ok(())
     }
     fn mark_present(&self, id: i64, rtype: &RowType) -> Result<()> {

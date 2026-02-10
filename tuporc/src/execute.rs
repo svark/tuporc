@@ -593,14 +593,16 @@ fn execute_rule(
         if re.is_match(command_line.as_str()) {
             if let Some(c) = re.captures(command_line.as_str()) {
                 if let Some(Some(fname)) = c.iter().next() {
-                    term_progress.println(format!("Cl {}", fname.as_str()));
+                    let msg = format!("Cl {}", fname.as_str());
+                    term_progress.set_main_message(msg);
                 }
             }
         }
         //term_progress.println(format!("{}", command_line));
 
     } else {
-        term_progress.println(format!("{}",  rule_node.get_display_str()));
+        let msg = format!("{}",  rule_node.get_display_str());
+        term_progress.set_main_message(msg);
     }
     spawned_child_id_sender.send(ch_id)?;
 

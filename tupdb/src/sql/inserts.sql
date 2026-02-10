@@ -6,8 +6,8 @@
 -- param: rtype : u8 - type of the node to add
 INSERT INTO ChangeList(id, type, change)
 Values (:id, :rtype, 0)
-ON CONFLICT(id) DO UPDATE SET change = 0
-WHERE ChangeList.change <> 2;
+ON CONFLICT(id) DO UPDATE SET change = [:ModifyListChangeType:]
+WHERE ChangeList.change <> [:UnbornListChangeType:];
 -- <eos>
 
 -- name: add_to_unborn_list!
@@ -16,7 +16,7 @@ WHERE ChangeList.change <> 2;
 -- param: id : i64 - id of the node to add
 -- param: rtype : u8 - type of the node to add
 INSERT or REPLACE into ChangeList(id, type, change)
-Values (:id, :rtype, 2)
+Values (:id, :rtype, [:UnbornListChangeType:])
 ;
 -- <eos>
 
@@ -30,21 +30,21 @@ SELECT n.srcid,
 from Node n
          join ChangeList c on n.id = c.id
 -- only consider rules with changed outputs (0=changed, 1=deleted and not 2=unborn)
-where n.type = (SELECT type_index from NodeType where NodeType.type = 'GenF') AND c.change <> 2;
+where n.type = (SELECT type_index from NodeType where NodeType.type = 'GenF') AND c.change <> [:UnbornListChangeType:];
 
 INSERT or
 REPLACE
 into ChangeList
 SELECT nl.to_id,
        nl.to_type,
-       1 -- 1 indicates delete, sticky links trigger a delete on target rule if input to rule is in delete set
+       [:DeleteListChangeType:] -- 1 indicates delete, sticky links trigger a delete on target rule if input to rule is in delete set
 from NormalLink nl
          JOIN DeleteList dl on dl.id = nl.from_id
 WHERE nl.to_type IN (SELECT type_index from NodeType where type = 'Rule' or type = 'Task') -- rule or task
   and nl.is_sticky = 1;
 
 INSERT or ignore into ChangeList
-SELECT nl.to_id, nl.to_type, 0 -- ModifyList non-sticky links trigger only a modify on target rule
+SELECT nl.to_id, nl.to_type, [:ModifyListChangeType:] -- ModifyList non-sticky links trigger only a modify on target rule
 from NormalLink nl
          JOIN ModifyList cl on cl.id = nl.from_id
 WHERE nl.to_type IN (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task') -- rule or task type
@@ -210,12 +210,17 @@ where id = :id;
 -- param: rule_id : i64 - id of the rule to insert
 DELETE from ChangeList
 where id = :rule_id
-  and change = 0;
+  and change = [:ModifyListChangeType:];
+-- <eos>
 
+-- name: mark_genfile_as_modified_inner!
+-- Mark a generated file as modified
+-- # Parameters
+-- param: rule_id : i64 - id of the rule that generated the file
 INSERT or REPLACE into ChangeList (id, type, change)
-SELECT id, type, 0
-from Node n JOIN NormalLink nl on nl.to_id = n.id
-WHERE nl.from_id = :rule_id
+SELECT id, type, [:ModifyListChangeType:]
+from Node n
+WHERE n.srcid = :rule_id
   AND n.type = (SELECT type_index from NodeType where type = 'GenF');
 
 -- <eos>
@@ -235,21 +240,21 @@ VALUES (:dir_id, :glob_id, 0,  :srcid,9);
 -- param: rtype: u8 - type of the node to add
 INSERT INTO ChangeList(id, type, change)
 Values (:id, :rtype, 1)
-ON CONFLICT(id) DO UPDATE SET change = 1
-where ChangeList.change <> 2;
+ON CONFLICT(id) DO UPDATE SET change = [:DeleteListChangeType:]
+where ChangeList.change <> [:UnbornListChangeType:];
 -- <eos>
 
 -- name: add_not_present_to_delete_list_inner!
 -- Add all deleted files and folders and env vars to the delete list
 INSERT INTO ChangeList (id, type, change)
-SELECT Node.id, Node.type, 1
+SELECT Node.id, Node.type, [:DeleteListChangeType:]
 FROM Node
          LEFT JOIN PresentList ON Node.id = PresentList.id
          INNER JOIN NodeType ON Node.type = NodeType.type_index
 WHERE PresentList.id IS NULL
   AND (NodeType.class = 'FILE_SYS')
 ON CONFLICT(id) DO UPDATE SET change = 1
-WHERE ChangeList.change <> 2;
+WHERE ChangeList.change <> [:UnbornListChangeType:];
 -- <eos>
 
 
@@ -277,7 +282,7 @@ VALUES (:path, :pid, :gen, :typ, :childcnt);
 -- name: mark_dependent_tupfiles_inner!
 -- Enrich the modify list with tupfiles that use modified globs
 INSERT OR IGNORE INTO ChangeList (id, type, change)
-SELECT nl.to_id, nl.to_type, 0
+SELECT nl.to_id, nl.to_type, [:ModifyListChangeType:]
 from ChangeList cl
          INNER JOIN NormalLink nl on nl.from_id = cl.id
 WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
@@ -286,7 +291,7 @@ WHERE nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
 -- name: mark_dependent_tupfiles_of_tupfiles_inner!
 -- Enrich the modify list with all rules that have modified outputs
 INSERT OR IGNORE INTO ChangeList (id, type, change)
-SELECT nl.to_id, nl.to_type, 0
+SELECT nl.to_id, nl.to_type, [:ModifyListChangeType:]
 from NormalLink nl
 inner JOIN ChangeList cl on cl.id = nl.from_id
 WHERE cl.type = (SELECT type_index FROM NodeType WHERE type = 'File')
@@ -299,7 +304,7 @@ AND   nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
 -- # Parameters
 -- param: glob_id : i64 - id of the glob
 INSERT OR IGNORE INTO ChangeList (id, type, change)
-SELECT nl.to_id, nl.to_type, 0
+SELECT nl.to_id, nl.to_type, [:ModifyListChangeType:]
 from NormalLink nl
 where nl.from_id = :glob_id
   AND nl.to_type = (SELECT type_index FROM NodeType WHERE type = 'TupF');
@@ -315,7 +320,7 @@ WHERE type NOT IN
 -- name: mark_rules_depending_on_modified_groups_inner!
 -- Enrich the modify list with all rules that depend on modified groups
 INSERT OR IGNORE INTO ChangeList (id, type, change)
-SELECT nl.to_id, nl.to_type, 0
+SELECT nl.to_id, nl.to_type, [:ModifyListChangeType:]
 from ChangeList cl
          INNER JOIN NormalLink nl on nl.from_id = cl.id
          INNER JOIN NormalLink nl2 on nl.to_id = nl2.from_id
@@ -345,12 +350,12 @@ VALUES (:name, :generation_id, :event);
 -- name: mark_missing_not_deleted_inner!
 -- Mark files that are missing but not marked as such
 INSERT INTO ChangeList (id, type, change)
-SELECT n.id, n.type, 1
+SELECT n.id, n.type, [:DeleteListChangeType:]
 FROM Node n
          JOIN NodeType nt ON nt.type_index = n.type
          LEFT JOIN PresentList p ON p.id = n.id
 WHERE nt.class = 'FILE_SYS'
   AND p.id IS NULL
 ON CONFLICT(id) DO UPDATE SET change = 1
-WHERE ChangeList.change <> 2;
+WHERE ChangeList.change <> [:UnbornListChangeType:];
 -- <eos>

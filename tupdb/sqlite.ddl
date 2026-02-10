@@ -45,10 +45,10 @@ CREATE TABLE ChangeList
 (
     id        integer PRIMARY KEY not null,
     type      integer             not null,
-    change integer             not null,
+    change integer             not null, -- 0: Modify, 1: Delete, 2: Unborn
     UNIQUE (id),
     FOREIGN KEY (id) references Node (id) on DELETE CASCADE,
-    CHECK (change in (0, 1) )
+    CHECK (change in (0, 1, 2) )
 );
 CREATE UNIQUE INDEX idx_ChangeList_id ON ChangeList (id);
 CREATE TABLE NODESHA
@@ -86,14 +86,14 @@ CREATE TABLE SuccessList
 (
     id INTEGER PRIMARY KEY not NULL
 );
--- LiveNode/LiveNormalLink filter out rows marked for deletion in ChangeList.
+-- LiveNode/LiveNormalLink filter out rows marked for deletion or unborn in ChangeList.
 CREATE VIEW LiveNode AS
 SELECT *
 FROM Node n
-WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.change = 1);
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList dl WHERE dl.id = n.id AND dl.change in (1, 2));
 
 CREATE VIEW LiveNormalLink AS
 SELECT nl.from_id, nl.to_id, nl.is_sticky, nl.to_type, nl.srcid
 FROM NormalLink nl
-WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.change = 1)
-  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.change = 1);
+WHERE NOT EXISTS (SELECT 1 FROM ChangeList d1 WHERE d1.id = nl.from_id AND d1.change in (1, 2))
+  AND NOT EXISTS (SELECT 1 FROM ChangeList d2 WHERE d2.id = nl.to_id AND d2.change in (1, 2));

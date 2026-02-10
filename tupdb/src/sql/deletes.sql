@@ -52,7 +52,7 @@ where id = :dir_id;
 DELETE
 from ChangeList
 where id = :id
-  and change = 0;
+  and change = [:ModifyListChangeType:];
 -- <eos>
 
 -- name: delete_from_normal_link!
@@ -63,7 +63,7 @@ FROM NormalLink
 WHERE EXISTS (
     SELECT 1
     FROM ChangeList CL
-    WHERE CL.change = 1
+    WHERE CL.change = [:DeleteListChangeType:]
       AND (CL.id = NormalLink.from_id OR CL.id = NormalLink.to_id)
 );
 -- <eos>
@@ -75,7 +75,7 @@ WHERE EXISTS (
 DELETE
 from ChangeList
 where id = :id
-  and change = 1;
+  and change = [:DeleteListChangeType:];
 -- <eos>
 
 
@@ -85,14 +85,14 @@ where id = :id
 DELETE
 from ChangeList
 where EXISTS (SELECT 1 from PresentList as P where P.id = ChangeList.id)
-  and change = 1;
+  and change = [:DeleteListChangeType:];
 -- <eos>
 
 -- name: prune_delete_list_inner!
 -- Prune the delete list
 -- # Parameters
 DELETE
-from ChangeList where change = 1;
+from ChangeList where change = [:DeleteListChangeType:];
 -- <eos>
 
 -- name: delete_links_not_in_present_list_inner!
@@ -115,7 +115,7 @@ WHERE srcid = :tup_id
 -- Add all FILE_SYS nodes whose parent directory id does not exist to ChangeList (change=1)
 -- This captures orphans created when a directory row was deleted without cascading to children.
 INSERT OR REPLACE INTO ChangeList (id, type, change)
-SELECT n.id, n.type, 1
+SELECT n.id, n.type, [:DeleteListChangeType:]
 FROM Node n
          LEFT JOIN Node d ON d.id = n.dir
          JOIN NodeType nt ON nt.type_index = n.type
@@ -130,9 +130,9 @@ WHERE d.id IS NULL
 INSERT OR REPLACE INTO ChangeList(id, type, change)
 SELECT n.id,
        n.type,
-       1
+       [:DeleteListChangeType:]
 FROM Node n
-         JOIN ChangeList d ON d.change = 1 AND n.dir = d.id;
+         JOIN ChangeList d ON d.change = [:DeleteListChangeType:] AND n.dir = d.id;
 -- <eos>
     
 -- name: delete_orphaned_rules_inner!
@@ -141,9 +141,9 @@ FROM Node n
 insert or
 REPLACE
 into ChangeList(id, type, change)
-SELECT n.id, n.type, 1
+SELECT n.id, n.type, [:DeleteListChangeType:]
 from Node n
-         JOIN ChangeList dl on dl.change = 1 AND n.srcid = dl.id
+         JOIN ChangeList dl on dl.change = [:DeleteListChangeType:] AND n.srcid = dl.id
 where n.type = (SELECT type_index from NodeType where type = 'Rule')
   and dl.type = (SELECT type_index from NodeType where type = 'TupF');
 -- <eos>
@@ -153,9 +153,9 @@ where n.type = (SELECT type_index from NodeType where type = 'Rule')
 INSERT or
 REPLACE
 into ChangeList(id, type, change)
-SELECT n.id, n.type, 1
+SELECT n.id, n.type, [:DeleteListChangeType:]
 from Node n
-         JOIN ChangeList dl on dl.change = 1 AND dl.id = n.srcid
+         JOIN ChangeList dl on dl.change = [:DeleteListChangeType:] AND dl.id = n.srcid
 where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
   and dl.type = (SELECT type_index from NodeType where type = 'Rule');
 
@@ -165,7 +165,7 @@ where n.type = (SELECT type_index from NodeTYpe where type = 'GenF')
 -- Delete all nodes from the delete list
 DELETE
 from Node
-where id in (SELECT id from ChangeList where change = 1);
+where id in (SELECT id from ChangeList where change = [:DeleteListChangeType:]);
 
 -- <eos>
 -- name: unmark_modified_inner!
@@ -174,7 +174,7 @@ where id in (SELECT id from ChangeList where change = 1);
 -- param: id : i64 - id of the node to delete
 DELETE
 from ChangeList
-where change = 0
+where change = [:ModifyListChangeType:]
   and id = :id;
 
 -- <eos>
@@ -193,7 +193,7 @@ from Messages;
 -- name: delete_groups_with_no_ref_count_inner!
 -- If no rule found writing to or reading from a group then delete the group
 INSERT or REPLACE  INTO ChangeList (id, type, change)
-SELECT Node.id, Node.type, 1
+SELECT Node.id, Node.type, [:DeleteListChangeType:]
 FROM Node
 WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Group')
   AND NOT EXISTS (SELECT 1
@@ -205,7 +205,7 @@ WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Group')
 -- name: delete_glob_with_no_ref_count_inner!
 -- Count the number of tupfiles reading from a glob and delete the glob if the count is 0
 INSERT or REPLACE  INTO ChangeList (id, type, change)
-SELECT Node.id, Node.type, 1
+SELECT Node.id, Node.type, [:DeleteListChangeType:]
 FROM Node
 WHERE type = (SELECT type_index FROM NodeType WHERE type = 'Glob')
   AND NOT EXISTS (SELECT 1
@@ -236,7 +236,7 @@ WITH RECURSIVE
     )
 Insert or REPLACE
 into ChangeList(id, type, change)
-SELECT id, type, 1 from orphan_dirgens;
+SELECT id, type, [:DeleteListChangeType:] from orphan_dirgens;
 -- <eos>
 
 -- name: prune_modify_list_of_inputs_and_outputs_inner!

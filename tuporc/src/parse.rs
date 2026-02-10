@@ -921,12 +921,9 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         {
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
-            term_progress.update_main();
 
             conn.mark_group_deps().context("Mark group dependencies")?;
-            term_progress.update_main();
             conn.prune_modify_list().context("Prune modify list")?;
-            term_progress.update_main();
         }
     }
     parse_and_add_rules_to_db(
@@ -1230,7 +1227,13 @@ fn parse_and_add_rules_to_db(
     let pool_threads = {
         let pool_size = parser.get_searcher().conn.max_size() as usize;
         // leave a couple of connections for insert/other work, and cap to MAX_THRS_DIRS
-        std::cmp::max(1, std::cmp::min(MAX_THRS_DIRS, pool_size.saturating_sub(2)))
+        std::cmp::max(
+            1,
+            std::cmp::min(
+                MAX_THRS_DIRS,
+                std::cmp::min(tupfiles.len(), pool_size.saturating_sub(2)),
+            ),
+        )
     };
     let thread_pool = ThreadPoolBuilder::new()
         .thread_name(|i| format!("tup-parse-thread-{i}"))
