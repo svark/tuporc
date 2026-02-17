@@ -253,7 +253,7 @@ LIMIT 1;
 -- Fetch the io entries
 -- # Parameters
 -- param: pid : i32 - process id
-SELECT path, pid, gen, typ
+SELECT path, gen, typ
 from DynIO
 where pid = :pid;
 -- <eos>

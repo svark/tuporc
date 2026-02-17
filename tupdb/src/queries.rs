@@ -446,13 +446,15 @@ impl LibSqlQueries for rusqlite::Connection {
         let mut vs = Vec::new();
         self.fetch_io_entries(proc_id as _, |r| {
             let s: String = r.get(0)?;
-            let i: u8 = r.get(1)?;
-            let gen: u32 = r.get(2)?;
+            let gen: u32 = r.get(1)?;
+            let ty: u8 = r.get(2)?;
             if lgen != gen {
                 //  keep only the latest generation's io
                 vs.clear();
             }
-            vs.push((s, i));
+            if !s.is_empty() {
+                vs.push((s, ty));
+            }
             lgen = gen;
             Ok(())
         })?;
