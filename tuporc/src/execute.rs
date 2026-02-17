@@ -1026,6 +1026,9 @@ impl<'b> IoConn<'b> {
         let child_cnt = evt_header.get_child_cnt() as i32;
         match event_type {
             EventType::ProcessCreation | EventType::ProcessDeletion => {
+                if process_id == 0 || file_path.as_str().trim().is_empty() {
+                    return Ok(());
+                }
                 self.conn.insert_trace(
                     file_path.as_str(),
                     process_id as _,
