@@ -919,11 +919,13 @@ pub(crate) fn parse_tupfiles_in_db<P: AsRef<Path>>(
         let conn = dbref.conn.get()?;
         //conn.enrich_modify_list()?;
         {
+            // mark rules that depend on groups whose input has changed.
+            conn.mark_rules_with_changed_groups().context("Mark group dependencies")?;
+
             conn.mark_rules_with_changed_io()
                 .context("Mark rules with changed I/O")?;
 
-            conn.mark_group_deps().context("Mark group dependencies")?;
-            conn.prune_modify_list().context("Prune modify list")?;
+            conn.keep_only_rules_tasks_and_tupfs().context("Prune modify list")?;
         }
     }
     parse_and_add_rules_to_db(
@@ -1228,7 +1230,7 @@ fn parse_and_add_rules_to_db(
         let pool_size = parser.get_searcher().conn.max_size() as usize;
         // leave a couple of connections for insert/other work, and cap to MAX_THRS_DIRS
         std::cmp::max(
-            1,
+            4, // spawn at least 4 threads to avoid deadlocks
             std::cmp::min(
                 MAX_THRS_DIRS,
                 std::cmp::min(tupfiles.len(), pool_size.saturating_sub(2)),

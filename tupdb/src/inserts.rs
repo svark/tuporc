@@ -72,7 +72,7 @@ pub trait LibSqlInserts {
     fn insert_trace(&self, path: &str, pid: i64, gen: i64, typ: u8, childcnt: i64) -> DbResult<()>;
     fn mark_absent_nodes_to_delete(&self) -> DbResult<()>;
     fn mark_rules_with_changed_io(&self) -> DbResult<()>;
-    fn mark_group_deps(&self) -> DbResult<()>;
+    fn mark_rules_with_changed_groups(&self) -> DbResult<()>;
     fn mark_tupfile_deps(&self) -> DbResult<()>;
     fn mark_glob_deps(&self, glob_id: i64) -> DbResult<()>;
     fn replace_node_sha(&self, node_id: i64, sha: impl FnMut() -> String)
@@ -404,7 +404,7 @@ impl LibSqlInserts for Connection {
         self.add_rules_with_changed_io_to_modify_list_inner()?;
         Ok(())
     }
-    fn mark_group_deps(&self) -> DbResult<()> {
+    fn mark_rules_with_changed_groups(&self) -> DbResult<()> {
         self.mark_rules_depending_on_modified_groups_inner()?;
         Ok(())
     }

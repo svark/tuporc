@@ -140,7 +140,7 @@ impl<'a> From<&'a NormalPath> for &'a Path {
 }
 
 /// A Matching path id discovered using glob matcher along with captured groups
-#[derive(Debug, Default, Eq, PartialEq, Clone, Hash, Ord, PartialOrd)]
+#[derive(Debug, Default, Clone)]
 pub struct MatchingPath {
     /// path that matched a glob
     path_descriptor: PathDescriptor,
@@ -196,11 +196,11 @@ impl MatchingPath {
             parent_descriptor: self.parent_descriptor.clone(),
         })
     }
-    /// Get path descriptor represented by this entry
+    /// Get the path descriptor represented by this entry
     pub fn path_descriptor(&self) -> PathDescriptor {
         self.path_descriptor.clone()
     }
-    /// Get reference to path descriptor represented by this entry
+    /// Get reference to the path descriptor represented by this entry
     pub fn path_descriptor_ref(&self) -> &PathDescriptor {
         &self.path_descriptor
     }
