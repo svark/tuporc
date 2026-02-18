@@ -420,7 +420,7 @@ impl<'a> MiscStatements for TupConnectionRef<'a> {
         }
 
         self.mark_group_deps().wrap_error("Mark group dependencies")?;
-        self.prune_modify_list().map_err(AnyError::from).wrap_error("Keep only rules as modified")?;
+        self.keep_only_rules_tasks_and_tupfs().map_err(AnyError::from).wrap_error("Keep only rules as modified")?;
         self.delete_nodes().map_err(AnyError::from).wrap_error("Delete nodes")?;
 
         Ok(())

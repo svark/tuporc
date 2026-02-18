@@ -26,7 +26,7 @@ Values (:id, :rtype, [:UnbornListChangeType:])
 Insert or IGNORE into ChangeList
 SELECT n.srcid,
        (SELECT type FROM Node WHERE id = n.srcid),
-       0  -- change type 0 - ModifyList
+       [:ModifyListChangeType:]  -- change type 0 - ModifyList
 from Node n
          join ChangeList c on n.id = c.id
 -- only consider rules with changed outputs (0=changed, 1=deleted and not 2=unborn)

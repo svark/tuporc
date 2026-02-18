@@ -18,7 +18,7 @@ pub trait LibSqlDeletes {
 
     fn prune_delete_of_present_list(&self) -> Result<usize>;
     fn prune_delete_list(&self) -> Result<usize>;
-    fn prune_modify_list(&self) -> Result<usize>;
+    fn keep_only_rules_tasks_and_tupfs(&self) -> Result<usize>;
 
     /// Enrich DeleteList by adding nodes whose parent directory is already in DeleteList
     fn mark_dir_dependents_to_delete(&self) -> Result<usize>;
@@ -101,8 +101,8 @@ impl LibSqlDeletes for Connection {
         Ok(sz)
     }
 
-    fn prune_modify_list(&self) -> Result<usize> {
-        let sz = self.prune_modify_list_of_inputs_and_outputs_inner()?;
+    fn keep_only_rules_tasks_and_tupfs(&self) -> Result<usize> {
+        let sz = self.keep_only_rules_tasks_and_tupfs_inner()?;
         log::debug!("Deleted {} rows from modify_list_of_inputs_and_outputs", sz);
         Ok(sz)
     }

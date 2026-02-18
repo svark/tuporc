@@ -239,11 +239,11 @@ into ChangeList(id, type, change)
 SELECT id, type, [:DeleteListChangeType:] from orphan_dirgens;
 -- <eos>
 
--- name: prune_modify_list_of_inputs_and_outputs_inner!
+-- name: keep_only_rules_tasks_and_tupfs_inner!
 -- Prune the modify list of inputs and outputs of rules that are already in the modify list
 -- Call this after the dependent rules have been added to the modify list or delete list
 DELETE
 FROM ChangeList
-where type not in (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task');
+where type not in (SELECT type_index FROM NodeType WHERE type = 'Rule' or type = 'Task' or type = 'TupF');
 -- <eos>
 
